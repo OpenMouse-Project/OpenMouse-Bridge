@@ -84,8 +84,9 @@ cargo clippy --all-targets -- -D warnings
 ## Automated builds
 
 GitHub Actions tests and lints the service on both Windows and Linux. Every
-successful `main` or `dev` build retains a downloadable Windows x64 executable
-as a workflow artifact.
+successful push to `main` updates the rolling `dev-build` prerelease with a
+Windows x64 zip and checksum. The same files remain available as workflow
+artifacts for individual runs.
 
 Pushing a version tag such as `v0.1.0` creates a GitHub release containing a
 Windows zip and SHA-256 checksum. Release signing is automatic when the
