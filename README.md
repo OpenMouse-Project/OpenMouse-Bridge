@@ -56,7 +56,8 @@ explicit configuration file.
   threshold, and autostart state.
 - `PUT /v1/games` replaces the tracked game list and persists it.
 - `GET /v1/applications` lists visible Windows applications and identifies the
-  foreground application.
+  foreground application. Each item includes an `iconId`; requesting
+  `GET /v1/applications/{iconId}/icon` returns its extracted icon as a PNG.
 - `GET /v1/profiles` reads saved application profiles; `PUT /v1/profiles`
   replaces and persists them.
 - `PUT /v1/battery` accepts `{ deviceId, deviceName, percent, charging }` and

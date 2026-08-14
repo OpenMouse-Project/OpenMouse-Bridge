@@ -2,8 +2,9 @@ use std::time::Duration;
 
 use axum::{
     Json, Router,
-    extract::State,
-    http::{HeaderValue, Method, StatusCode},
+    body::Body,
+    extract::{Path, State},
+    http::{HeaderValue, Method, Response, StatusCode, header},
     routing::{get, put},
 };
 use serde::{Deserialize, Serialize};
@@ -53,6 +54,7 @@ pub fn router(service: BridgeService, origins: &[String]) -> Router {
         .route("/v1/status", get(status))
         .route("/v1/games", put(replace_games))
         .route("/v1/applications", get(applications))
+        .route("/v1/applications/{icon_id}/icon", get(application_icon))
         .route("/v1/profiles", get(profiles).put(replace_profiles))
         .route("/v1/battery", put(record_battery))
         .route("/v1/autostart", put(set_autostart))
@@ -73,6 +75,21 @@ async fn applications(
     State(service): State<BridgeService>,
 ) -> Json<Vec<crate::applications::ApplicationInfo>> {
     Json(service.applications().await)
+}
+
+async fn application_icon(
+    State(service): State<BridgeService>,
+    Path(icon_id): Path<String>,
+) -> Result<Response<Body>, StatusCode> {
+    let icon = service
+        .application_icon(&icon_id)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Response::builder()
+        .header(header::CONTENT_TYPE, "image/png")
+        .header(header::CACHE_CONTROL, "private, max-age=86400")
+        .body(Body::from(icon))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn profiles(State(service): State<BridgeService>) -> Json<Vec<ApplicationProfile>> {

@@ -26,6 +26,7 @@ struct BridgeState {
     config: BridgeConfig,
     active_games: Vec<String>,
     applications: Vec<ApplicationInfo>,
+    application_icons: HashMap<String, Option<Vec<u8>>>,
     battery: HashMap<String, BatteryState>,
     started_at: Instant,
 }
@@ -65,6 +66,7 @@ impl BridgeService {
                 config,
                 active_games: Vec::new(),
                 applications: Vec::new(),
+                application_icons: HashMap::new(),
                 battery: HashMap::new(),
                 started_at: Instant::now(),
             })),
@@ -97,6 +99,16 @@ impl BridgeService {
 
     pub async fn applications(&self) -> Vec<ApplicationInfo> {
         self.inner.read().await.applications.clone()
+    }
+
+    pub async fn application_icon(&self, icon_id: &str) -> Option<Vec<u8>> {
+        self.inner
+            .read()
+            .await
+            .application_icons
+            .get(icon_id)
+            .cloned()
+            .flatten()
     }
 
     pub async fn profiles(&self) -> Vec<ApplicationProfile> {
@@ -172,9 +184,24 @@ impl BridgeService {
                 let games = service.inner.read().await.config.games.clone();
                 let active = detector.detect(&games);
                 let applications = applications::visible_applications();
+                let missing_icons = {
+                    let state = service.inner.read().await;
+                    applications
+                        .iter()
+                        .filter(|application| {
+                            !state.application_icons.contains_key(&application.icon_id)
+                        })
+                        .map(|application| (application.icon_id.clone(), application.path.clone()))
+                        .collect::<Vec<_>>()
+                };
+                let icons = missing_icons
+                    .into_iter()
+                    .map(|(icon_id, path)| (icon_id, applications::application_icon(&path)))
+                    .collect::<Vec<_>>();
                 let mut state = service.inner.write().await;
                 state.active_games = active;
                 state.applications = applications;
+                state.application_icons.extend(icons);
             }
         });
     }
