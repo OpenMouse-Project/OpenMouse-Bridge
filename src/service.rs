@@ -1,0 +1,185 @@
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
+
+use crate::{
+    config::{self, BridgeConfig, GameConfig},
+    games::GameDetector,
+    platform,
+};
+
+#[derive(Clone)]
+pub struct BridgeService {
+    inner: Arc<RwLock<BridgeState>>,
+    config_path: Arc<PathBuf>,
+}
+
+struct BridgeState {
+    config: BridgeConfig,
+    active_games: Vec<String>,
+    battery: HashMap<String, BatteryState>,
+    started_at: Instant,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatteryReading {
+    pub device_id: String,
+    pub device_name: String,
+    pub percent: u8,
+    #[serde(default)]
+    pub charging: bool,
+}
+
+struct BatteryState {
+    last_alert: Option<Instant>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeSnapshot {
+    pub version: &'static str,
+    pub platform: &'static str,
+    pub uptime_seconds: u64,
+    pub active_games: Vec<String>,
+    pub tracked_game_count: usize,
+    pub battery_threshold_percent: u8,
+    pub autostart_enabled: bool,
+}
+
+impl BridgeService {
+    pub fn new(config: BridgeConfig, config_path: PathBuf) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(BridgeState {
+                config,
+                active_games: Vec::new(),
+                battery: HashMap::new(),
+                started_at: Instant::now(),
+            })),
+            config_path: Arc::new(config_path),
+        }
+    }
+
+    pub async fn snapshot(&self) -> BridgeSnapshot {
+        let state = self.inner.read().await;
+        BridgeSnapshot {
+            version: crate::BRIDGE_VERSION,
+            platform: platform::platform_name(),
+            uptime_seconds: state.started_at.elapsed().as_secs(),
+            active_games: state.active_games.clone(),
+            tracked_game_count: state.config.games.len(),
+            battery_threshold_percent: state.config.battery_threshold_percent,
+            autostart_enabled: platform::autostart_enabled(),
+        }
+    }
+
+    pub async fn config(&self) -> BridgeConfig {
+        self.inner.read().await.config.clone()
+    }
+
+    pub async fn replace_games(&self, games: Vec<GameConfig>) -> Result<()> {
+        let config = {
+            let mut state = self.inner.write().await;
+            state.config.games = games;
+            state.config = state.config.clone().normalized();
+            state.config.clone()
+        };
+        config::save(&self.config_path, &config)
+    }
+
+    pub async fn record_battery(&self, reading: BatteryReading) -> Result<bool> {
+        let percent = reading.percent.min(100);
+        let mut reading = reading;
+        reading.percent = percent;
+        let alert = {
+            let mut state = self.inner.write().await;
+            let threshold = state.config.battery_threshold_percent;
+            let cooldown = Duration::from_secs(state.config.alert_cooldown_minutes * 60);
+            let previous_alert = state
+                .battery
+                .get(&reading.device_id)
+                .and_then(|entry| entry.last_alert);
+            let should_alert = !reading.charging
+                && reading.percent <= threshold
+                && previous_alert.is_none_or(|last| last.elapsed() >= cooldown);
+            state.battery.insert(
+                reading.device_id.clone(),
+                BatteryState {
+                    last_alert: if should_alert {
+                        Some(Instant::now())
+                    } else {
+                        previous_alert
+                    },
+                },
+            );
+            should_alert
+        };
+        if alert {
+            platform::notify(
+                "Mouse battery is low",
+                &format!(
+                    "{} has {}% battery remaining.",
+                    reading.device_name, reading.percent
+                ),
+            )?;
+        }
+        Ok(alert)
+    }
+
+    pub fn start_game_monitor(&self) {
+        let service = self.clone();
+        tokio::spawn(async move {
+            let mut detector = GameDetector::default();
+            let mut interval = tokio::time::interval(Duration::from_secs(3));
+            loop {
+                interval.tick().await;
+                let games = service.inner.read().await.config.games.clone();
+                let active = detector.detect(&games);
+                service.inner.write().await.active_games = active;
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn service(config: BridgeConfig) -> BridgeService {
+        BridgeService::new(config, PathBuf::from("unused-test-config.json"))
+    }
+
+    #[tokio::test]
+    async fn charging_and_healthy_readings_do_not_alert() {
+        let bridge = service(BridgeConfig::default());
+        assert!(
+            !bridge
+                .record_battery(BatteryReading {
+                    device_id: "mouse".into(),
+                    device_name: "Mouse".into(),
+                    percent: 90,
+                    charging: false,
+                })
+                .await
+                .unwrap()
+        );
+        assert!(
+            !bridge
+                .record_battery(BatteryReading {
+                    device_id: "mouse".into(),
+                    device_name: "Mouse".into(),
+                    percent: 10,
+                    charging: true,
+                })
+                .await
+                .unwrap()
+        );
+    }
+}

@@ -1,0 +1,8 @@
+pub mod api;
+pub mod config;
+pub mod games;
+pub mod platform;
+pub mod service;
+
+pub const BRIDGE_PORT: u16 = 17_846;
+pub const BRIDGE_VERSION: &str = env!("CARGO_PKG_VERSION");
