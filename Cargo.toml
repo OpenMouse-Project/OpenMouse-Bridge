@@ -1,6 +1,6 @@
 [package]
 name = "openmouse-bridge"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Local companion service for OpenMouse game detection and battery alerts"
 license = "MIT"
@@ -17,3 +17,10 @@ tokio = { version = "1.47", features = ["macros", "net", "rt-multi-thread", "sig
 tower-http = { version = "0.6", features = ["cors", "set-header", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_Threading",
+  "Win32_UI_WindowsAndMessaging",
+] }

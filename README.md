@@ -7,6 +7,8 @@ portable so Linux and macOS adapters can follow without changing the web app.
 The initial service provides:
 
 - process-based detection for configured game executables;
+- discovery of visible Windows applications and the foreground application;
+- persistent application profiles tied to a specific mouse;
 - low-battery notifications with a configurable threshold and cooldown;
 - Windows startup-at-login registration under the current user;
 - a versioned HTTP API bound only to `127.0.0.1:17846`;
@@ -37,6 +39,7 @@ configuration directory. Add games there, for example:
       "executables": ["cs2.exe"]
     }
   ],
+  "profiles": [],
   "allowedOrigins": [
     "https://openmouse.io",
     "http://localhost:5173"
@@ -52,6 +55,10 @@ explicit configuration file.
 - `GET /v1/status` reports the Bridge version, platform, active games, battery
   threshold, and autostart state.
 - `PUT /v1/games` replaces the tracked game list and persists it.
+- `GET /v1/applications` lists visible Windows applications and identifies the
+  foreground application.
+- `GET /v1/profiles` reads saved application profiles; `PUT /v1/profiles`
+  replaces and persists them.
 - `PUT /v1/battery` accepts `{ deviceId, deviceName, percent, charging }` and
   applies the notification threshold and cooldown.
 - `PUT /v1/autostart` accepts `{ enabled }`. It is implemented on Windows.

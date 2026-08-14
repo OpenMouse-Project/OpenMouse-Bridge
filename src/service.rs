@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::{
-    config::{self, BridgeConfig, GameConfig},
+    applications::{self, ApplicationInfo},
+    config::{self, ApplicationProfile, BridgeConfig, GameConfig},
     games::GameDetector,
     platform,
 };
@@ -24,6 +25,7 @@ pub struct BridgeService {
 struct BridgeState {
     config: BridgeConfig,
     active_games: Vec<String>,
+    applications: Vec<ApplicationInfo>,
     battery: HashMap<String, BatteryState>,
     started_at: Instant,
 }
@@ -52,6 +54,8 @@ pub struct BridgeSnapshot {
     pub tracked_game_count: usize,
     pub battery_threshold_percent: u8,
     pub autostart_enabled: bool,
+    pub foreground_application: Option<ApplicationInfo>,
+    pub profile_count: usize,
 }
 
 impl BridgeService {
@@ -60,6 +64,7 @@ impl BridgeService {
             inner: Arc::new(RwLock::new(BridgeState {
                 config,
                 active_games: Vec::new(),
+                applications: Vec::new(),
                 battery: HashMap::new(),
                 started_at: Instant::now(),
             })),
@@ -77,11 +82,35 @@ impl BridgeService {
             tracked_game_count: state.config.games.len(),
             battery_threshold_percent: state.config.battery_threshold_percent,
             autostart_enabled: platform::autostart_enabled(),
+            foreground_application: state
+                .applications
+                .iter()
+                .find(|application| application.foreground)
+                .cloned(),
+            profile_count: state.config.profiles.len(),
         }
     }
 
     pub async fn config(&self) -> BridgeConfig {
         self.inner.read().await.config.clone()
+    }
+
+    pub async fn applications(&self) -> Vec<ApplicationInfo> {
+        self.inner.read().await.applications.clone()
+    }
+
+    pub async fn profiles(&self) -> Vec<ApplicationProfile> {
+        self.inner.read().await.config.profiles.clone()
+    }
+
+    pub async fn replace_profiles(&self, profiles: Vec<ApplicationProfile>) -> Result<()> {
+        let config = {
+            let mut state = self.inner.write().await;
+            state.config.profiles = profiles;
+            state.config = state.config.clone().normalized();
+            state.config.clone()
+        };
+        config::save(&self.config_path, &config)
     }
 
     pub async fn replace_games(&self, games: Vec<GameConfig>) -> Result<()> {
@@ -142,7 +171,10 @@ impl BridgeService {
                 interval.tick().await;
                 let games = service.inner.read().await.config.games.clone();
                 let active = detector.detect(&games);
-                service.inner.write().await.active_games = active;
+                let applications = applications::visible_applications();
+                let mut state = service.inner.write().await;
+                state.active_games = active;
+                state.applications = applications;
             }
         });
     }

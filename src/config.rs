@@ -16,6 +16,8 @@ pub struct BridgeConfig {
     pub alert_cooldown_minutes: u64,
     #[serde(default)]
     pub games: Vec<GameConfig>,
+    #[serde(default)]
+    pub profiles: Vec<ApplicationProfile>,
     #[serde(default = "default_origins")]
     pub allowed_origins: Vec<String>,
 }
@@ -27,12 +29,43 @@ pub struct GameConfig {
     pub executables: Vec<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplicationProfile {
+    pub application: ProfileApplication,
+    pub device: ProfileDevice,
+    pub settings: ProfileSettings,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileApplication {
+    pub name: String,
+    pub executable: String,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileDevice {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileSettings {
+    pub dpi: Option<u32>,
+    pub polling_rate_hz: Option<u32>,
+}
+
 impl Default for BridgeConfig {
     fn default() -> Self {
         Self {
             battery_threshold_percent: DEFAULT_BATTERY_THRESHOLD,
             alert_cooldown_minutes: DEFAULT_ALERT_COOLDOWN_MINUTES,
             games: Vec::new(),
+            profiles: Vec::new(),
             allowed_origins: default_origins(),
         }
     }
@@ -55,6 +88,28 @@ impl BridgeConfig {
         }
         self.games
             .retain(|game| !game.name.is_empty() && !game.executables.is_empty());
+        for profile in &mut self.profiles {
+            profile.application.name = profile.application.name.trim().to_owned();
+            profile.application.executable = profile.application.executable.trim().to_owned();
+            profile.application.path = profile.application.path.trim().to_owned();
+            profile.device.id = profile.device.id.trim().to_owned();
+            profile.device.name = profile.device.name.trim().to_owned();
+        }
+        self.profiles.retain(|profile| {
+            !profile.application.executable.is_empty()
+                && !profile.application.path.is_empty()
+                && !profile.device.id.is_empty()
+        });
+        self.profiles.sort_by(|left, right| {
+            (&left.application.path, &left.device.id)
+                .cmp(&(&right.application.path, &right.device.id))
+        });
+        self.profiles.dedup_by(|left, right| {
+            left.application
+                .path
+                .eq_ignore_ascii_case(&right.application.path)
+                && left.device.id == right.device.id
+        });
         self
     }
 }
@@ -122,6 +177,7 @@ mod tests {
                 name: " Valorant ".into(),
                 executables: vec![" VALORANT-Win64-Shipping.exe ".into(), "".into()],
             }],
+            profiles: Vec::new(),
             allowed_origins: Vec::new(),
         }
         .normalized();

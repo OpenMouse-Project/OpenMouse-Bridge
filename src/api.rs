@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tower_http::{cors::CorsLayer, set_header::SetResponseHeaderLayer, trace::TraceLayer};
 
 use crate::{
-    config::GameConfig,
+    config::{ApplicationProfile, GameConfig},
     platform,
     service::{BatteryReading, BridgeService},
 };
@@ -33,6 +33,12 @@ struct AutostartPayload {
     enabled: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfilesPayload {
+    profiles: Vec<ApplicationProfile>,
+}
+
 pub fn router(service: BridgeService, origins: &[String]) -> Router {
     let allowed: Vec<HeaderValue> = origins
         .iter()
@@ -46,6 +52,8 @@ pub fn router(service: BridgeService, origins: &[String]) -> Router {
     Router::new()
         .route("/v1/status", get(status))
         .route("/v1/games", put(replace_games))
+        .route("/v1/applications", get(applications))
+        .route("/v1/profiles", get(profiles).put(replace_profiles))
         .route("/v1/battery", put(record_battery))
         .route("/v1/autostart", put(set_autostart))
         .layer(SetResponseHeaderLayer::if_not_present(
@@ -59,6 +67,27 @@ pub fn router(service: BridgeService, origins: &[String]) -> Router {
 
 async fn status(State(service): State<BridgeService>) -> Json<crate::service::BridgeSnapshot> {
     Json(service.snapshot().await)
+}
+
+async fn applications(
+    State(service): State<BridgeService>,
+) -> Json<Vec<crate::applications::ApplicationInfo>> {
+    Json(service.applications().await)
+}
+
+async fn profiles(State(service): State<BridgeService>) -> Json<Vec<ApplicationProfile>> {
+    Json(service.profiles().await)
+}
+
+async fn replace_profiles(
+    State(service): State<BridgeService>,
+    Json(payload): Json<ProfilesPayload>,
+) -> Result<Json<ApiResult>, (StatusCode, String)> {
+    service
+        .replace_profiles(payload.profiles)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(ApiResult { ok: true }))
 }
 
 async fn replace_games(
