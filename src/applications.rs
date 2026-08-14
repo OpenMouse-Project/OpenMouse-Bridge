@@ -14,7 +14,7 @@ mod imp {
     use std::{collections::BTreeMap, ffi::OsString, os::windows::ffi::OsStringExt, path::Path};
 
     use windows_sys::Win32::{
-        Foundation::{BOOL, CloseHandle, HWND, LPARAM},
+        Foundation::{CloseHandle, HWND, LPARAM},
         System::Threading::{
             OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
         },
@@ -45,7 +45,7 @@ mod imp {
         collection.applications.into_values().collect()
     }
 
-    unsafe extern "system" fn collect_window(hwnd: HWND, state: LPARAM) -> BOOL {
+    unsafe extern "system" fn collect_window(hwnd: HWND, state: LPARAM) -> i32 {
         if unsafe { IsWindowVisible(hwnd) } == 0 {
             return 1;
         }
