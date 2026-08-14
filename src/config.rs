@@ -6,6 +6,11 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_BATTERY_THRESHOLD: u8 = 20;
 const DEFAULT_ALERT_COOLDOWN_MINUTES: u64 = 360;
+const OFFICIAL_ORIGINS: &[&str] = &[
+    "https://dev.openmouse.app",
+    "https://openmouse.app",
+    "https://www.openmouse.app",
+];
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -110,6 +115,13 @@ impl BridgeConfig {
                 .eq_ignore_ascii_case(&right.application.path)
                 && left.device.id == right.device.id
         });
+        for origin in OFFICIAL_ORIGINS {
+            if !self.allowed_origins.iter().any(|entry| entry == origin) {
+                self.allowed_origins.push((*origin).to_owned());
+            }
+        }
+        self.allowed_origins.sort();
+        self.allowed_origins.dedup();
         self
     }
 }
@@ -157,8 +169,9 @@ const fn default_alert_cooldown() -> u64 {
 
 fn default_origins() -> Vec<String> {
     vec![
-        "https://openmouse.io".to_owned(),
-        "https://www.openmouse.io".to_owned(),
+        "https://dev.openmouse.app".to_owned(),
+        "https://openmouse.app".to_owned(),
+        "https://www.openmouse.app".to_owned(),
         "http://localhost:5173".to_owned(),
         "http://127.0.0.1:5173".to_owned(),
     ]
@@ -185,5 +198,11 @@ mod tests {
         assert_eq!(config.alert_cooldown_minutes, 1);
         assert_eq!(config.games[0].name, "Valorant");
         assert_eq!(config.games[0].executables, ["valorant-win64-shipping.exe"]);
+        assert!(
+            config
+                .allowed_origins
+                .iter()
+                .any(|origin| origin == "https://dev.openmouse.app")
+        );
     }
 }

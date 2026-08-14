@@ -41,7 +41,7 @@ configuration directory. Add games there, for example:
   ],
   "profiles": [],
   "allowedOrigins": [
-    "https://openmouse.io",
+    "https://dev.openmouse.app",
     "http://localhost:5173"
   ]
 }
