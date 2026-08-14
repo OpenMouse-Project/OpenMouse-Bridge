@@ -168,7 +168,7 @@ mod imp {
         if dc.is_null() {
             return None;
         }
-        let mut info = BITMAPINFO {
+        let info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: size_of::<BITMAPINFOHEADER>() as u32,
                 biWidth: ICON_SIZE as i32,
@@ -182,7 +182,7 @@ mod imp {
         };
         let mut bits: *mut c_void = null_mut();
         let bitmap =
-            unsafe { CreateDIBSection(dc, &mut info, DIB_RGB_COLORS, &mut bits, null_mut(), 0) };
+            unsafe { CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0) };
         if bitmap.is_null() || bits.is_null() {
             unsafe { DeleteDC(dc) };
             return None;
