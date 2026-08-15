@@ -256,10 +256,7 @@ impl BridgeDesktop {
 
     fn settings(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if ui
-                .add(egui::Button::new(RichText::new("Back").color(MUTED).size(11.0)).frame(false))
-                .clicked()
-            {
+            if back_button(ui) {
                 self.page = DesktopPage::Home;
             }
             ui.label(RichText::new("SETTINGS").color(TEXT).strong().size(12.0));
@@ -292,7 +289,7 @@ impl BridgeDesktop {
                             .snapshot
                             .as_ref()
                             .is_some_and(|snapshot| snapshot.autostart_enabled);
-                        if ui.toggle_value(&mut enabled, "").changed() {
+                        if toggle_switch(ui, &mut enabled) {
                             match platform::set_autostart(enabled) {
                                 Ok(()) => {
                                     if let Some(snapshot) = &mut self.snapshot {
@@ -435,6 +432,70 @@ fn settings_button(ui: &mut egui::Ui) -> bool {
             .line_segment([center + direction * 7.0, center + direction * 9.0], stroke);
     }
     response.on_hover_text("Bridge settings").clicked()
+}
+
+fn back_button(ui: &mut egui::Ui) -> bool {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(62.0, 28.0), Sense::click());
+    let fill = if response.hovered() {
+        SURFACE_RAISED
+    } else {
+        SURFACE
+    };
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(6),
+        fill,
+        Stroke::new(1.0, BORDER),
+        egui::StrokeKind::Inside,
+    );
+    let color = if response.hovered() { TEXT } else { MUTED };
+    let arrow_center = egui::pos2(rect.left() + 14.0, rect.center().y);
+    let stroke = Stroke::new(1.5, color);
+    ui.painter().line_segment(
+        [
+            arrow_center + egui::vec2(3.0, -4.0),
+            arrow_center + egui::vec2(-1.0, 0.0),
+        ],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [
+            arrow_center + egui::vec2(-1.0, 0.0),
+            arrow_center + egui::vec2(3.0, 4.0),
+        ],
+        stroke,
+    );
+    ui.painter().text(
+        egui::pos2(rect.left() + 25.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        "Back",
+        egui::FontId::proportional(10.0),
+        color,
+    );
+    response.clicked()
+}
+
+fn toggle_switch(ui: &mut egui::Ui, enabled: &mut bool) -> bool {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(38.0, 22.0), Sense::click());
+    let clicked = response.clicked();
+    if clicked {
+        *enabled = !*enabled;
+    }
+    let track = if *enabled { ACCENT } else { BORDER };
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(11), track);
+    let knob_x = if *enabled {
+        rect.right() - 11.0
+    } else {
+        rect.left() + 11.0
+    };
+    ui.painter().circle_filled(
+        egui::pos2(knob_x, rect.center().y),
+        8.0,
+        if *enabled { BACKGROUND } else { MUTED },
+    );
+    response.on_hover_text("Start Bridge at login");
+    clicked
 }
 
 fn setting_row(ui: &mut egui::Ui, label: &str, value: &str) {
