@@ -70,9 +70,9 @@ pub fn run() -> Result<()> {
     let server = BackgroundServer::start(event_tx)?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([420.0, 360.0])
-            .with_min_inner_size([420.0, 360.0])
-            .with_max_inner_size([420.0, 360.0])
+            .with_inner_size([420.0, 330.0])
+            .with_min_inner_size([420.0, 330.0])
+            .with_max_inner_size([420.0, 330.0])
             .with_resizable(false)
             .with_decorations(false),
         centered: true,
@@ -194,25 +194,19 @@ impl BridgeDesktop {
                 ui.set_min_width(width - 24.0);
                 ui.horizontal(|ui| {
                     let (color, label) = if self.error.is_some() {
-                        (Color32::from_rgb(239, 112, 112), "NEEDS ATTENTION")
+                        (Color32::from_rgb(239, 112, 112), "BRIDGE ERROR")
                     } else if self.server_ready {
-                        (ACCENT, "RUNNING")
+                        (ACCENT, "BRIDGE CONNECTED")
                     } else {
-                        (Color32::from_rgb(232, 184, 93), "STARTING")
+                        (Color32::from_rgb(232, 184, 93), "CONNECTING")
                     };
                     let (dot, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
                     ui.painter().circle_filled(dot.center(), 4.0, color);
                     ui.label(RichText::new(label).color(color).strong().size(11.0));
                 });
-                ui.add_space(4.0);
                 if let Some(error) = &self.error {
+                    ui.add_space(4.0);
                     ui.label(RichText::new(error).color(TEXT).size(12.0));
-                } else {
-                    ui.label(
-                        RichText::new("Watching for configured games on this computer.")
-                            .color(MUTED)
-                            .size(12.0),
-                    );
                 }
             });
     }
@@ -230,11 +224,7 @@ impl BridgeDesktop {
                     valorant_icon(ui, &self.valorant_logo);
                     ui.vertical(|ui| {
                         ui.label(RichText::new("Valorant").color(TEXT).strong().size(12.0));
-                        ui.label(
-                            RichText::new("Application detected")
-                                .color(MUTED)
-                                .size(10.0),
-                        );
+                        ui.label(RichText::new("Active application").color(MUTED).size(10.0));
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(RichText::new("RUNNING").color(ACCENT).strong().size(10.0));
