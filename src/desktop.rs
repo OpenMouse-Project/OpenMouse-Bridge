@@ -69,9 +69,9 @@ pub fn run() -> Result<()> {
     let server = BackgroundServer::start(event_tx)?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([420.0, 390.0])
-            .with_min_inner_size([420.0, 390.0])
-            .with_max_inner_size([420.0, 390.0])
+            .with_inner_size([420.0, 340.0])
+            .with_min_inner_size([420.0, 340.0])
+            .with_max_inner_size([420.0, 340.0])
             .with_resizable(false)
             .with_decorations(false),
         centered: true,
@@ -175,13 +175,14 @@ impl BridgeDesktop {
     }
 
     fn status_card(&self, ui: &mut egui::Ui) {
+        let width = ui.available_width();
         egui::Frame::new()
             .fill(SURFACE)
             .stroke(Stroke::new(1.0, BORDER))
             .corner_radius(CornerRadius::same(8))
             .inner_margin(12.0)
             .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
+                ui.set_min_width(width - 24.0);
                 ui.horizontal(|ui| {
                     let (color, label) = if self.error.is_some() {
                         (Color32::from_rgb(239, 112, 112), "NEEDS ATTENTION")
@@ -199,7 +200,7 @@ impl BridgeDesktop {
                     ui.label(RichText::new(error).color(TEXT).size(12.0));
                 } else {
                     ui.label(
-                        RichText::new("Ready for profiles, game detection, and battery alerts.")
+                        RichText::new("Watching for configured games on this computer.")
                             .color(MUTED)
                             .size(12.0),
                     );
@@ -207,50 +208,96 @@ impl BridgeDesktop {
             });
     }
 
-    fn details(&self, ui: &mut egui::Ui) {
-        let (profiles, application_count, foreground, active_game) = self.snapshot.as_ref().map_or(
-            ("—".into(), "—".into(), "—".into(), "None".into()),
-            |snapshot| {
-                (
-                    snapshot.profile_count.to_string(),
-                    snapshot.visible_application_count.to_string(),
-                    snapshot
-                        .foreground_application
-                        .as_ref()
-                        .map_or_else(|| "None".into(), |application| application.name.clone()),
-                    snapshot
-                        .active_games
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| "None".into()),
-                )
-            },
-        );
+    fn games(&self, ui: &mut egui::Ui) {
+        let width = ui.available_width();
         egui::Frame::new()
             .fill(SURFACE_RAISED)
             .stroke(Stroke::new(1.0, BORDER))
             .corner_radius(CornerRadius::same(8))
-            .inner_margin(egui::Margin::symmetric(12, 5))
+            .inner_margin(12.0)
             .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                detail_row(ui, "Open applications", &application_count);
-                ui.separator();
-                detail_row(ui, "Application profiles", &profiles);
-                ui.separator();
-                detail_row(ui, "Foreground application", &foreground);
-                ui.separator();
-                detail_row(ui, "Active game", &active_game);
+                ui.set_min_width(width - 24.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("GAMES").color(MUTED).strong().size(10.0));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let count = self
+                            .snapshot
+                            .as_ref()
+                            .map_or(0, |snapshot| snapshot.games.len());
+                        ui.label(
+                            RichText::new(format!("{count} configured"))
+                                .color(MUTED)
+                                .size(10.0),
+                        );
+                    });
+                });
+                ui.add_space(6.0);
+
+                match &self.snapshot {
+                    Some(snapshot) if snapshot.games.is_empty() => {
+                        ui.label(
+                            RichText::new("No games configured")
+                                .color(TEXT)
+                                .strong()
+                                .size(12.0),
+                        );
+                        ui.label(
+                            RichText::new("Add a game in OpenMouse and it will appear here.")
+                                .color(MUTED)
+                                .size(11.0),
+                        );
+                    }
+                    Some(snapshot) => {
+                        egui::ScrollArea::vertical()
+                            .max_height(82.0)
+                            .show(ui, |ui| {
+                                for (index, game) in snapshot.games.iter().enumerate() {
+                                    if index > 0 {
+                                        ui.separator();
+                                    }
+                                    ui.horizontal(|ui| {
+                                        ui.set_min_height(24.0);
+                                        let color = if game.active { ACCENT } else { MUTED };
+                                        let (dot, _) = ui
+                                            .allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+                                        ui.painter().circle_filled(dot.center(), 3.5, color);
+                                        ui.label(RichText::new(&game.name).color(TEXT).size(11.0));
+                                        ui.with_layout(
+                                            Layout::right_to_left(Align::Center),
+                                            |ui| {
+                                                let status = if game.active {
+                                                    "Running"
+                                                } else {
+                                                    "Not running"
+                                                };
+                                                ui.label(
+                                                    RichText::new(status).color(color).size(10.0),
+                                                );
+                                            },
+                                        );
+                                    });
+                                }
+                            });
+                    }
+                    None => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(RichText::new("Loading games…").color(MUTED).size(11.0));
+                        });
+                    }
+                }
             });
     }
 
     fn title_bar(&self, ui: &mut egui::Ui) {
+        let width = ui.available_width();
         egui::Frame::new()
             .fill(SURFACE)
             .inner_margin(egui::Margin::symmetric(12, 6))
             .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
+                ui.set_min_width(width - 24.0);
                 ui.horizontal(|ui| {
-                    let drag_width = (ui.available_width() - 62.0).max(100.0);
+                    let drag_width = (width - 24.0 - 62.0).max(100.0);
                     let title = ui
                         .allocate_ui_with_layout(
                             Vec2::new(drag_width, 26.0),
@@ -301,7 +348,7 @@ impl eframe::App for BridgeDesktop {
             egui::Frame::new().inner_margin(20.0).show(ui, |ui| {
                 self.status_card(ui);
                 ui.add_space(10.0);
-                self.details(ui);
+                self.games(ui);
                 ui.add_space(12.0);
                 let button = egui::Button::new(
                     RichText::new("Open OpenMouse")
@@ -320,18 +367,6 @@ impl eframe::App for BridgeDesktop {
             });
         });
     }
-}
-
-fn detail_row(ui: &mut egui::Ui, label: &str, value: &str) {
-    ui.horizontal(|ui| {
-        ui.set_min_height(25.0);
-        ui.label(RichText::new(label).color(MUTED).size(11.0));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.add(
-                egui::Label::new(RichText::new(value).color(TEXT).strong().size(11.0)).truncate(),
-            );
-        });
-    });
 }
 
 #[cfg(target_os = "windows")]

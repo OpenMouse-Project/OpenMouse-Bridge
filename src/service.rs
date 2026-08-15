@@ -47,11 +47,19 @@ struct BatteryState {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GameActivity {
+    pub name: String,
+    pub active: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BridgeSnapshot {
     pub version: &'static str,
     pub platform: &'static str,
     pub uptime_seconds: u64,
     pub active_games: Vec<String>,
+    pub games: Vec<GameActivity>,
     pub tracked_game_count: usize,
     pub battery_threshold_percent: u8,
     pub autostart_enabled: bool,
@@ -82,6 +90,15 @@ impl BridgeService {
             platform: platform::platform_name(),
             uptime_seconds: state.started_at.elapsed().as_secs(),
             active_games: state.active_games.clone(),
+            games: state
+                .config
+                .games
+                .iter()
+                .map(|game| GameActivity {
+                    name: game.name.clone(),
+                    active: state.active_games.iter().any(|active| active == &game.name),
+                })
+                .collect(),
             tracked_game_count: state.config.games.len(),
             battery_threshold_percent: state.config.battery_threshold_percent,
             autostart_enabled: platform::autostart_enabled(),
