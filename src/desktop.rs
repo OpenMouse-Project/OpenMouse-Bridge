@@ -296,43 +296,42 @@ impl BridgeDesktop {
             .inner_margin(egui::Margin::symmetric(12, 6))
             .show(ui, |ui| {
                 ui.set_min_width(width - 24.0);
-                ui.horizontal(|ui| {
-                    let drag_width = (width - 24.0 - 62.0).max(100.0);
-                    let title = ui
-                        .allocate_ui_with_layout(
-                            Vec2::new(drag_width, 26.0),
-                            Layout::left_to_right(Align::Center),
-                            |ui| {
-                                ui.label(
-                                    RichText::new(format!(
-                                        "OPENMOUSE  /  BRIDGE  {BRIDGE_VERSION}"
-                                    ))
-                                    .color(TEXT)
-                                    .strong()
-                                    .size(11.0),
-                                );
-                            },
-                        )
-                        .response
-                        .interact(Sense::drag());
-                    if title.drag_started() {
-                        ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
-                    }
+                let (bar, drag) =
+                    ui.allocate_exact_size(Vec2::new(width - 24.0, 26.0), Sense::drag());
+                ui.painter().text(
+                    egui::pos2(bar.left(), bar.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    format!("OPENMOUSE  /  BRIDGE  {BRIDGE_VERSION}"),
+                    egui::FontId::proportional(11.0),
+                    TEXT,
+                );
+                if drag.drag_started() {
+                    ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+                }
 
-                    let minimize = egui::Button::new(RichText::new("−").color(MUTED).size(16.0))
-                        .frame(false)
-                        .min_size(Vec2::new(24.0, 24.0));
-                    if ui.add(minimize).on_hover_text("Minimize").clicked() {
-                        ui.ctx().send_viewport_cmd(ViewportCommand::Minimized(true));
-                    }
-
-                    let close = egui::Button::new(RichText::new("×").color(MUTED).size(16.0))
-                        .frame(false)
-                        .min_size(Vec2::new(24.0, 24.0));
-                    if ui.add(close).on_hover_text("Close Bridge").clicked() {
-                        ui.ctx().send_viewport_cmd(ViewportCommand::Close);
-                    }
-                });
+                let controls_rect = egui::Rect::from_min_max(
+                    egui::pos2(bar.right() - 56.0, bar.top()),
+                    bar.right_bottom(),
+                );
+                let mut controls = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(controls_rect)
+                        .layout(Layout::right_to_left(Align::Center)),
+                );
+                let close = egui::Button::new(RichText::new("×").color(MUTED).size(16.0))
+                    .frame(false)
+                    .min_size(Vec2::new(24.0, 24.0));
+                if controls.add(close).on_hover_text("Close Bridge").clicked() {
+                    controls.ctx().send_viewport_cmd(ViewportCommand::Close);
+                }
+                let minimize = egui::Button::new(RichText::new("−").color(MUTED).size(16.0))
+                    .frame(false)
+                    .min_size(Vec2::new(24.0, 24.0));
+                if controls.add(minimize).on_hover_text("Minimize").clicked() {
+                    controls
+                        .ctx()
+                        .send_viewport_cmd(ViewportCommand::Minimized(true));
+                }
             });
     }
 }
