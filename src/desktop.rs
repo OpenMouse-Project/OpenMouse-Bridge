@@ -336,10 +336,7 @@ impl eframe::App for BridgeDesktop {
 }
 
 fn valorant_icon(ui: &mut egui::Ui, texture: &egui::TextureHandle) {
-    ui.add_sized(
-        Vec2::splat(36.0),
-        egui::Image::new(texture).maintain_aspect_ratio(true),
-    );
+    ui.add(egui::Image::new(texture).fit_to_exact_size(Vec2::new(40.0, 24.0)));
 }
 
 fn decode_png(bytes: &[u8]) -> egui::ColorImage {
