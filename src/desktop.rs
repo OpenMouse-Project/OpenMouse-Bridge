@@ -1,4 +1,5 @@
 use std::{
+    io::Cursor,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::mpsc::{self, Receiver, Sender},
     thread,
@@ -136,6 +137,7 @@ fn run_server(events: Sender<DesktopEvent>, shutdown: oneshot::Receiver<()>) -> 
 
 struct BridgeDesktop {
     events: Receiver<DesktopEvent>,
+    valorant_logo: egui::TextureHandle,
     snapshot: Option<BridgeSnapshot>,
     server_ready: bool,
     error: Option<String>,
@@ -156,8 +158,15 @@ impl BridgeDesktop {
         style.spacing.button_padding = Vec2::new(14.0, 9.0);
         context.egui_ctx.set_style_of(egui::Theme::Dark, style);
 
+        let valorant_logo = context.egui_ctx.load_texture(
+            "valorant-logomark",
+            decode_png(include_bytes!("../assets/valorant-logomark.png")),
+            egui::TextureOptions::LINEAR,
+        );
+
         Self {
             events,
+            valorant_logo,
             snapshot: None,
             server_ready: false,
             error: None,
@@ -218,7 +227,7 @@ impl BridgeDesktop {
             .show(ui, |ui| {
                 ui.set_min_width(width - 24.0);
                 ui.horizontal(|ui| {
-                    valorant_icon(ui);
+                    valorant_icon(ui, &self.valorant_logo);
                     ui.vertical(|ui| {
                         ui.label(RichText::new("Valorant").color(TEXT).strong().size(12.0));
                         ui.label(
@@ -326,18 +335,31 @@ impl eframe::App for BridgeDesktop {
     }
 }
 
-fn valorant_icon(ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::hover());
-    ui.painter()
-        .rect_filled(rect, CornerRadius::same(7), Color32::from_rgb(255, 70, 85));
+fn valorant_icon(ui: &mut egui::Ui, texture: &egui::TextureHandle) {
+    ui.add_sized(
+        Vec2::splat(36.0),
+        egui::Image::new(texture).maintain_aspect_ratio(true),
+    );
+}
 
-    let left = egui::pos2(rect.left() + 8.0, rect.top() + 10.0);
-    let bottom = egui::pos2(rect.center().x - 1.0, rect.bottom() - 8.0);
-    let middle = egui::pos2(rect.center().x + 3.0, rect.bottom() - 13.0);
-    let right = egui::pos2(rect.right() - 7.0, rect.top() + 8.0);
-    let stroke = Stroke::new(3.0, Color32::WHITE);
-    ui.painter().line_segment([left, bottom], stroke);
-    ui.painter().line_segment([middle, right], stroke);
+fn decode_png(bytes: &[u8]) -> egui::ColorImage {
+    let decoder = png::Decoder::new(Cursor::new(bytes));
+    let mut reader = decoder
+        .read_info()
+        .expect("embedded logo must be valid PNG");
+    let mut pixels = vec![
+        0;
+        reader
+            .output_buffer_size()
+            .expect("logo is within PNG limits")
+    ];
+    let info = reader
+        .next_frame(&mut pixels)
+        .expect("embedded logo must decode");
+    egui::ColorImage::from_rgba_unmultiplied(
+        [info.width as usize, info.height as usize],
+        &pixels[..info.buffer_size()],
+    )
 }
 
 fn settings_button(ui: &mut egui::Ui) {
