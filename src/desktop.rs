@@ -77,9 +77,9 @@ pub fn run() -> Result<()> {
     let server = BackgroundServer::start(event_tx)?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([420.0, 330.0])
-            .with_min_inner_size([420.0, 330.0])
-            .with_max_inner_size([420.0, 330.0])
+            .with_inner_size([420.0, 350.0])
+            .with_min_inner_size([420.0, 350.0])
+            .with_max_inner_size([420.0, 350.0])
             .with_resizable(false)
             .with_decorations(false),
         centered: true,
@@ -274,6 +274,12 @@ impl BridgeDesktop {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(RichText::new("Valorant").color(TEXT).strong().size(11.0));
                     });
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let metric_width = (ui.available_width() - 8.0) / 2.0;
+                    profile_metric(ui, metric_width, "DPI", "800");
+                    profile_metric(ui, metric_width, "POLLING", "4000 Hz");
                 });
             });
     }
@@ -550,6 +556,22 @@ fn setting_row(ui: &mut egui::Ui, label: &str, value: &str) {
             ui.label(RichText::new(value).color(TEXT).size(10.0));
         });
     });
+}
+
+fn profile_metric(ui: &mut egui::Ui, width: f32, label: &str, value: &str) {
+    egui::Frame::new()
+        .fill(SURFACE)
+        .corner_radius(CornerRadius::same(5))
+        .inner_margin(egui::Margin::symmetric(8, 5))
+        .show(ui, |ui| {
+            ui.set_min_width(width - 16.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(label).color(MUTED).strong().size(9.0));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(RichText::new(value).color(TEXT).strong().size(10.0));
+                });
+            });
+        });
 }
 
 #[cfg(target_os = "windows")]
