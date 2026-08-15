@@ -247,7 +247,7 @@ impl BridgeDesktop {
             });
     }
 
-    fn activity(&mut self, ui: &mut egui::Ui) {
+    fn activity(&self, ui: &mut egui::Ui) {
         let width = ui.available_width();
         egui::Frame::new()
             .fill(SURFACE_RAISED)
@@ -272,9 +272,6 @@ impl BridgeDesktop {
                     ui.set_min_height(28.0);
                     ui.label(RichText::new("Active profile").color(MUTED).size(11.0));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if settings_button(ui) {
-                            self.page = DesktopPage::Settings;
-                        }
                         ui.label(RichText::new("Valorant").color(TEXT).strong().size(11.0));
                     });
                 });
@@ -354,7 +351,7 @@ impl BridgeDesktop {
             });
     }
 
-    fn title_bar(&self, ui: &mut egui::Ui) {
+    fn title_bar(&mut self, ui: &mut egui::Ui) {
         let width = ui.available_width();
         egui::Frame::new()
             .fill(SURFACE)
@@ -375,7 +372,7 @@ impl BridgeDesktop {
                 }
 
                 let controls_rect = egui::Rect::from_min_max(
-                    egui::pos2(bar.right() - 56.0, bar.top()),
+                    egui::pos2(bar.right() - 88.0, bar.top()),
                     bar.right_bottom(),
                 );
                 let mut controls = ui.new_child(
@@ -396,6 +393,9 @@ impl BridgeDesktop {
                     controls
                         .ctx()
                         .send_viewport_cmd(ViewportCommand::Minimized(true));
+                }
+                if settings_button(&mut controls) {
+                    self.page = DesktopPage::Settings;
                 }
             });
     }
