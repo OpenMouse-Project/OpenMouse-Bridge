@@ -222,10 +222,7 @@ impl BridgeDesktop {
                 ui.set_min_width(width - 24.0);
                 ui.horizontal(|ui| {
                     valorant_icon(ui, &self.valorant_logo);
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new("Valorant").color(TEXT).strong().size(12.0));
-                        ui.label(RichText::new("Active application").color(MUTED).size(10.0));
-                    });
+                    ui.label(RichText::new("Valorant").color(TEXT).strong().size(12.0));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(RichText::new("RUNNING").color(ACCENT).strong().size(10.0));
                         let (dot, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
@@ -240,7 +237,7 @@ impl BridgeDesktop {
                     ui.label(RichText::new("Active profile").color(MUTED).size(11.0));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         settings_button(ui);
-                        ui.label(RichText::new("Default").color(TEXT).strong().size(11.0));
+                        ui.label(RichText::new("Valorant").color(TEXT).strong().size(11.0));
                     });
                 });
             });
