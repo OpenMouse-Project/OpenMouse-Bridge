@@ -276,11 +276,7 @@ impl BridgeDesktop {
                     });
                 });
                 ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    let metric_width = (ui.available_width() - 8.0) / 2.0;
-                    profile_metric(ui, metric_width, "DPI", "800");
-                    profile_metric(ui, metric_width, "POLLING", "4000 Hz");
-                });
+                profile_metrics(ui);
             });
     }
 
@@ -558,18 +554,26 @@ fn setting_row(ui: &mut egui::Ui, label: &str, value: &str) {
     });
 }
 
-fn profile_metric(ui: &mut egui::Ui, width: f32, label: &str, value: &str) {
+fn profile_metrics(ui: &mut egui::Ui) {
+    let width = ui.available_width();
     egui::Frame::new()
         .fill(SURFACE)
         .corner_radius(CornerRadius::same(5))
         .inner_margin(egui::Margin::symmetric(8, 5))
         .show(ui, |ui| {
             ui.set_min_width(width - 16.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(label).color(MUTED).strong().size(9.0));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new(value).color(TEXT).strong().size(10.0));
-                });
+            ui.columns(2, |columns| {
+                for (column, (label, value)) in columns
+                    .iter_mut()
+                    .zip([("DPI", "800"), ("POLLING", "4000 Hz")])
+                {
+                    column.horizontal(|ui| {
+                        ui.label(RichText::new(label).color(MUTED).strong().size(9.0));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(RichText::new(value).color(TEXT).strong().size(10.0));
+                        });
+                    });
+                }
             });
         });
 }
