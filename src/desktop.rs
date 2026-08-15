@@ -69,9 +69,9 @@ pub fn run() -> Result<()> {
     let server = BackgroundServer::start(event_tx)?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([420.0, 410.0])
-            .with_min_inner_size([420.0, 410.0])
-            .with_max_inner_size([420.0, 410.0])
+            .with_inner_size([420.0, 360.0])
+            .with_min_inner_size([420.0, 360.0])
+            .with_max_inner_size([420.0, 360.0])
             .with_resizable(false)
             .with_decorations(false),
         centered: true,
@@ -181,6 +181,7 @@ impl BridgeDesktop {
             .corner_radius(CornerRadius::same(8))
             .inner_margin(12.0)
             .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
                 ui.horizontal(|ui| {
                     let (color, label) = if self.error.is_some() {
                         (Color32::from_rgb(239, 112, 112), "NEEDS ATTENTION")
@@ -224,10 +225,21 @@ impl BridgeDesktop {
                             .unwrap_or_else(|| "None".into()),
                     )
                 });
-        detail_row(ui, "Version", BRIDGE_VERSION);
-        detail_row(ui, "Application profiles", &profiles);
-        detail_row(ui, "Foreground application", &applications);
-        detail_row(ui, "Active game", &active_game);
+        egui::Frame::new()
+            .fill(SURFACE_RAISED)
+            .stroke(Stroke::new(1.0, BORDER))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(egui::Margin::symmetric(12, 5))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                detail_row(ui, "Version", BRIDGE_VERSION);
+                ui.separator();
+                detail_row(ui, "Application profiles", &profiles);
+                ui.separator();
+                detail_row(ui, "Foreground application", &applications);
+                ui.separator();
+                detail_row(ui, "Active game", &active_game);
+            });
     }
 
     fn title_bar(&self, ui: &mut egui::Ui) {
@@ -245,7 +257,8 @@ impl BridgeDesktop {
                                     .color(TEXT)
                                     .strong()
                                     .size(11.0),
-                            ),
+                            )
+                            .halign(Align::Min),
                         )
                         .interact(Sense::drag());
                     if title.drag_started() {
@@ -283,48 +296,35 @@ impl eframe::App for BridgeDesktop {
                 ui.add_space(10.0);
                 self.details(ui);
                 ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    let button = egui::Button::new(
-                        RichText::new("Open OpenMouse")
-                            .color(BACKGROUND)
-                            .strong()
-                            .size(12.0),
-                    )
-                    .fill(ACCENT)
-                    .stroke(Stroke::NONE)
-                    .corner_radius(CornerRadius::same(6));
-                    if ui.add(button).clicked()
-                        && let Err(error) = open_openmouse()
-                    {
-                        self.error = Some(error.to_string());
-                    }
-                    ui.label(
-                        RichText::new("Closing the window stops Bridge.")
-                            .color(MUTED)
-                            .size(10.0),
-                    );
-                });
+                let button = egui::Button::new(
+                    RichText::new("Open OpenMouse  →")
+                        .color(BACKGROUND)
+                        .strong()
+                        .size(12.0),
+                )
+                .fill(ACCENT)
+                .stroke(Stroke::NONE)
+                .corner_radius(CornerRadius::same(6));
+                if ui.add_sized([ui.available_width(), 34.0], button).clicked()
+                    && let Err(error) = open_openmouse()
+                {
+                    self.error = Some(error.to_string());
+                }
             });
         });
     }
 }
 
 fn detail_row(ui: &mut egui::Ui, label: &str, value: &str) {
-    egui::Frame::new()
-        .fill(SURFACE_RAISED)
-        .corner_radius(CornerRadius::same(6))
-        .inner_margin(egui::Margin::symmetric(10, 6))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(label).color(MUTED).size(12.0));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.add(
-                        egui::Label::new(RichText::new(value).color(TEXT).strong().size(12.0))
-                            .truncate(),
-                    );
-                });
-            });
+    ui.horizontal(|ui| {
+        ui.set_min_height(25.0);
+        ui.label(RichText::new(label).color(MUTED).size(11.0));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.add(
+                egui::Label::new(RichText::new(value).color(TEXT).strong().size(11.0)).truncate(),
+            );
         });
+    });
 }
 
 #[cfg(target_os = "windows")]
