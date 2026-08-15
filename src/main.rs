@@ -3,28 +3,41 @@
     windows_subsystem = "windows"
 )]
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+mod desktop;
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 use anyhow::{Context, Result};
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 use openmouse_bridge::{BRIDGE_PORT, api, config, service::BridgeService};
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn main() {
+    init_tracing();
+    if let Err(error) = desktop::run() {
+        tracing::error!(%error, "OpenMouse Bridge failed");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 #[tokio::main]
 async fn main() {
+    init_tracing();
     if let Err(error) = run().await {
         eprintln!("OpenMouse Bridge failed: {error:#}");
         std::process::exit(1);
     }
 }
 
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 async fn run() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "openmouse_bridge=info,tower_http=info".into()),
-        )
-        .init();
     let (config, path) = config::load_or_create()?;
     let origins = config.allowed_origins.clone();
     let service = BridgeService::new(config, path.clone());
@@ -40,6 +53,16 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
+fn init_tracing() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "openmouse_bridge=info,tower_http=info".into()),
+        )
+        .init();
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }

@@ -6,6 +6,7 @@ portable so Linux and macOS adapters can follow without changing the web app.
 
 The initial service provides:
 
+- a minimal native Windows and macOS status window with a shortcut to OpenMouse;
 - process-based detection for configured game executables;
 - discovery of visible Windows applications and the foreground application;
 - persistent application profiles tied to a specific mouse;
@@ -16,7 +17,8 @@ The initial service provides:
 
 It does not run as an elevated Windows Service. It runs in the signed-in user's
 session, which is required for desktop notifications and avoids administrator
-permissions.
+permissions. Closing the status window currently stops Bridge; tray/background
+window behavior will follow with the desktop controls.
 
 ## Run locally
 
@@ -84,7 +86,7 @@ cargo clippy --all-targets -- -D warnings
 
 ## Automated builds
 
-GitHub Actions tests and lints the service on both Windows and Linux. Every
+GitHub Actions tests and lints the service on Windows, macOS, and Linux. Every
 successful push to `main` updates the rolling `dev-build` prerelease with a
 Windows x64 zip and checksum. The same files remain available as workflow
 artifacts for individual runs.
