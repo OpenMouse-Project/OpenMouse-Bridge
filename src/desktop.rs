@@ -77,9 +77,9 @@ pub fn run() -> Result<()> {
     let server = BackgroundServer::start(event_tx)?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([420.0, 350.0])
-            .with_min_inner_size([420.0, 350.0])
-            .with_max_inner_size([420.0, 350.0])
+            .with_inner_size([420.0, 340.0])
+            .with_min_inner_size([420.0, 340.0])
+            .with_max_inner_size([420.0, 340.0])
             .with_resizable(false)
             .with_decorations(false),
         centered: true,
@@ -268,15 +268,7 @@ impl BridgeDesktop {
                 ui.add_space(4.0);
                 ui.separator();
                 ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.set_min_height(28.0);
-                    ui.label(RichText::new("Active profile").color(MUTED).size(11.0));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new("Valorant").color(TEXT).strong().size(11.0));
-                    });
-                });
-                ui.add_space(4.0);
-                profile_metrics(ui);
+                profile_summary(ui);
             });
     }
 
@@ -554,28 +546,60 @@ fn setting_row(ui: &mut egui::Ui, label: &str, value: &str) {
     });
 }
 
-fn profile_metrics(ui: &mut egui::Ui) {
+fn profile_summary(ui: &mut egui::Ui) {
     let width = ui.available_width();
-    egui::Frame::new()
-        .fill(SURFACE)
-        .corner_radius(CornerRadius::same(5))
-        .inner_margin(egui::Margin::symmetric(8, 5))
-        .show(ui, |ui| {
-            ui.set_min_width(width - 16.0);
-            ui.columns(2, |columns| {
-                for (column, (label, value)) in columns
-                    .iter_mut()
-                    .zip([("DPI", "800"), ("POLLING", "4000 Hz")])
-                {
-                    column.horizontal(|ui| {
-                        ui.label(RichText::new(label).color(MUTED).strong().size(9.0));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(RichText::new(value).color(TEXT).strong().size(10.0));
-                        });
-                    });
-                }
-            });
-        });
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 38.0), Sense::hover());
+    let painter = ui.painter();
+    let label_font = egui::FontId::proportional(8.5);
+    let value_font = egui::FontId::proportional(11.0);
+    let label_y = rect.top() + 3.0;
+    let value_y = rect.bottom() - 3.0;
+
+    painter.text(
+        egui::pos2(rect.left(), label_y),
+        egui::Align2::LEFT_TOP,
+        "ACTIVE PROFILE",
+        label_font.clone(),
+        MUTED,
+    );
+    painter.text(
+        egui::pos2(rect.left(), value_y),
+        egui::Align2::LEFT_BOTTOM,
+        "Valorant",
+        value_font.clone(),
+        TEXT,
+    );
+
+    let dpi_x = rect.left() + width * 0.6;
+    painter.text(
+        egui::pos2(dpi_x, label_y),
+        egui::Align2::CENTER_TOP,
+        "DPI",
+        label_font.clone(),
+        MUTED,
+    );
+    painter.text(
+        egui::pos2(dpi_x, value_y),
+        egui::Align2::CENTER_BOTTOM,
+        "800",
+        value_font.clone(),
+        TEXT,
+    );
+
+    painter.text(
+        egui::pos2(rect.right(), label_y),
+        egui::Align2::RIGHT_TOP,
+        "POLLING RATE",
+        label_font,
+        MUTED,
+    );
+    painter.text(
+        egui::pos2(rect.right(), value_y),
+        egui::Align2::RIGHT_BOTTOM,
+        "4000 Hz",
+        value_font,
+        TEXT,
+    );
 }
 
 #[cfg(target_os = "windows")]
