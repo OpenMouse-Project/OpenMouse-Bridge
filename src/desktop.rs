@@ -154,6 +154,19 @@ struct BridgeDesktop {
 
 impl BridgeDesktop {
     fn new(context: &eframe::CreationContext<'_>, events: Receiver<DesktopEvent>) -> Self {
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "inter".into(),
+            egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-Variable.ttf"))
+                .into(),
+        );
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, "inter".into());
+        context.egui_ctx.set_fonts(fonts);
+
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = BACKGROUND;
         visuals.window_fill = BACKGROUND;
@@ -165,6 +178,18 @@ impl BridgeDesktop {
         let mut style = (*context.egui_ctx.style_of(egui::Theme::Dark)).clone();
         style.spacing.item_spacing = Vec2::new(8.0, 8.0);
         style.spacing.button_padding = Vec2::new(14.0, 9.0);
+        style.text_styles.insert(
+            egui::TextStyle::Body,
+            egui::FontId::new(12.0, egui::FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Button,
+            egui::FontId::new(11.0, egui::FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Small,
+            egui::FontId::new(10.0, egui::FontFamily::Proportional),
+        );
         context.egui_ctx.set_style_of(egui::Theme::Dark, style);
 
         let valorant_logo = context.egui_ctx.load_texture(
