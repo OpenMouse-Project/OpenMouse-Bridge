@@ -81,7 +81,8 @@ pub fn run() -> Result<()> {
             .with_min_inner_size([420.0, 300.0])
             .with_max_inner_size([420.0, 300.0])
             .with_resizable(false)
-            .with_decorations(false),
+            .with_decorations(false)
+            .with_transparent(true),
         centered: true,
         renderer: eframe::Renderer::Glow,
         ..Default::default()
@@ -340,6 +341,12 @@ impl BridgeDesktop {
         let width = ui.available_width();
         egui::Frame::new()
             .fill(SURFACE)
+            .corner_radius(CornerRadius {
+                nw: 10,
+                ne: 10,
+                sw: 0,
+                se: 0,
+            })
             .inner_margin(egui::Margin::symmetric(12, 6))
             .show(ui, |ui| {
                 ui.set_min_width(width - 24.0);
@@ -387,39 +394,47 @@ impl BridgeDesktop {
 }
 
 impl eframe::App for BridgeDesktop {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        Color32::TRANSPARENT.to_normalized_gamma_f32()
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.receive_events();
         ui.ctx().request_repaint_after(Duration::from_millis(500));
 
-        egui::Frame::new().fill(BACKGROUND).show(ui, |ui| {
-            ui.set_min_size(ui.available_size());
-            self.title_bar(ui);
-            egui::Frame::new()
-                .inner_margin(20.0)
-                .show(ui, |ui| match self.page {
-                    DesktopPage::Home => {
-                        self.status_card(ui);
-                        ui.add_space(8.0);
-                        self.activity(ui);
-                        ui.add_space(12.0);
-                        let button = egui::Button::new(
-                            RichText::new("Open OpenMouse")
-                                .color(BACKGROUND)
-                                .strong()
-                                .size(12.0),
-                        )
-                        .fill(ACCENT)
-                        .stroke(Stroke::NONE)
-                        .corner_radius(CornerRadius::same(6));
-                        if ui.add_sized([ui.available_width(), 34.0], button).clicked()
-                            && let Err(error) = open_openmouse()
-                        {
-                            self.error = Some(error.to_string());
+        egui::Frame::new()
+            .fill(BACKGROUND)
+            .stroke(Stroke::new(1.0, BORDER))
+            .corner_radius(CornerRadius::same(10))
+            .show(ui, |ui| {
+                ui.set_min_size(ui.available_size());
+                self.title_bar(ui);
+                egui::Frame::new()
+                    .inner_margin(20.0)
+                    .show(ui, |ui| match self.page {
+                        DesktopPage::Home => {
+                            self.status_card(ui);
+                            ui.add_space(8.0);
+                            self.activity(ui);
+                            ui.add_space(12.0);
+                            let button = egui::Button::new(
+                                RichText::new("Open OpenMouse")
+                                    .color(BACKGROUND)
+                                    .strong()
+                                    .size(12.0),
+                            )
+                            .fill(ACCENT)
+                            .stroke(Stroke::NONE)
+                            .corner_radius(CornerRadius::same(6));
+                            if ui.add_sized([ui.available_width(), 34.0], button).clicked()
+                                && let Err(error) = open_openmouse()
+                            {
+                                self.error = Some(error.to_string());
+                            }
                         }
-                    }
-                    DesktopPage::Settings => self.settings(ui),
-                });
-        });
+                        DesktopPage::Settings => self.settings(ui),
+                    });
+            });
     }
 }
 
