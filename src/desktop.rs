@@ -6,7 +6,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use eframe::egui::{self, Align, Color32, CornerRadius, Layout, RichText, Stroke, Vec2};
+use eframe::egui::{
+    self, Align, Color32, CornerRadius, Layout, RichText, Sense, Stroke, Vec2, ViewportCommand,
+};
 use openmouse_bridge::{
     BRIDGE_PORT, BRIDGE_VERSION, api, config,
     service::{BridgeService, BridgeSnapshot},
@@ -67,10 +69,11 @@ pub fn run() -> Result<()> {
     let server = BackgroundServer::start(event_tx)?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([420.0, 390.0])
-            .with_min_inner_size([420.0, 390.0])
-            .with_max_inner_size([420.0, 390.0])
-            .with_resizable(false),
+            .with_inner_size([420.0, 410.0])
+            .with_min_inner_size([420.0, 410.0])
+            .with_max_inner_size([420.0, 410.0])
+            .with_resizable(false)
+            .with_decorations(false),
         centered: true,
         renderer: eframe::Renderer::Glow,
         ..Default::default()
@@ -175,8 +178,8 @@ impl BridgeDesktop {
         egui::Frame::new()
             .fill(SURFACE)
             .stroke(Stroke::new(1.0, BORDER))
-            .corner_radius(CornerRadius::same(10))
-            .inner_margin(16.0)
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(12.0)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let (color, label) = if self.error.is_some() {
@@ -186,20 +189,16 @@ impl BridgeDesktop {
                     } else {
                         (Color32::from_rgb(232, 184, 93), "STARTING")
                     };
-                    ui.label(RichText::new("●").color(color).size(15.0));
-                    ui.label(RichText::new(label).color(color).strong().size(12.0));
+                    let (dot, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 4.0, color);
+                    ui.label(RichText::new(label).color(color).strong().size(11.0));
                 });
-                ui.add_space(8.0);
+                ui.add_space(4.0);
                 if let Some(error) = &self.error {
-                    ui.label(RichText::new(error).color(TEXT).size(14.0));
+                    ui.label(RichText::new(error).color(TEXT).size(12.0));
                 } else {
                     ui.label(
-                        RichText::new("OpenMouse can connect to this computer.")
-                            .color(TEXT)
-                            .size(14.0),
-                    );
-                    ui.label(
-                        RichText::new("Keep Bridge open for profiles and battery alerts.")
+                        RichText::new("Ready for profiles, game detection, and battery alerts.")
                             .color(MUTED)
                             .size(12.0),
                     );
@@ -230,6 +229,45 @@ impl BridgeDesktop {
         detail_row(ui, "Foreground application", &applications);
         detail_row(ui, "Active game", &active_game);
     }
+
+    fn title_bar(&self, ui: &mut egui::Ui) {
+        egui::Frame::new()
+            .fill(SURFACE)
+            .inner_margin(egui::Margin::symmetric(12, 6))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let drag_width = (ui.available_width() - 62.0).max(100.0);
+                    let title = ui
+                        .add_sized(
+                            [drag_width, 26.0],
+                            egui::Label::new(
+                                RichText::new("OPENMOUSE  /  BRIDGE")
+                                    .color(TEXT)
+                                    .strong()
+                                    .size(11.0),
+                            ),
+                        )
+                        .interact(Sense::drag());
+                    if title.drag_started() {
+                        ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+                    }
+
+                    let minimize = egui::Button::new(RichText::new("−").color(MUTED).size(16.0))
+                        .frame(false)
+                        .min_size(Vec2::new(24.0, 24.0));
+                    if ui.add(minimize).on_hover_text("Minimize").clicked() {
+                        ui.ctx().send_viewport_cmd(ViewportCommand::Minimized(true));
+                    }
+
+                    let close = egui::Button::new(RichText::new("×").color(MUTED).size(16.0))
+                        .frame(false)
+                        .min_size(Vec2::new(24.0, 24.0));
+                    if ui.add(close).on_hover_text("Close Bridge").clicked() {
+                        ui.ctx().send_viewport_cmd(ViewportCommand::Close);
+                    }
+                });
+            });
+    }
 }
 
 impl eframe::App for BridgeDesktop {
@@ -237,65 +275,45 @@ impl eframe::App for BridgeDesktop {
         self.receive_events();
         ui.ctx().request_repaint_after(Duration::from_millis(500));
 
-        egui::Frame::new()
-            .fill(BACKGROUND)
-            .inner_margin(24.0)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new("OPENMOUSE").color(ACCENT).strong().size(11.0));
-                        ui.label(RichText::new("Bridge").color(TEXT).strong().size(25.0));
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new("LOCAL COMPANION").color(MUTED).size(10.0));
-                    });
-                });
-                ui.add_space(14.0);
+        egui::Frame::new().fill(BACKGROUND).show(ui, |ui| {
+            ui.set_min_size(ui.available_size());
+            self.title_bar(ui);
+            egui::Frame::new().inner_margin(20.0).show(ui, |ui| {
                 self.status_card(ui);
-                ui.add_space(14.0);
-                self.details(ui);
                 ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(8.0);
+                self.details(ui);
+                ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    let mut autostart = false;
-                    ui.add_enabled(
-                        false,
-                        egui::Checkbox::new(&mut autostart, "Start with Windows"),
-                    );
+                    let button = egui::Button::new(
+                        RichText::new("Open OpenMouse")
+                            .color(BACKGROUND)
+                            .strong()
+                            .size(12.0),
+                    )
+                    .fill(ACCENT)
+                    .stroke(Stroke::NONE)
+                    .corner_radius(CornerRadius::same(6));
+                    if ui.add(button).clicked()
+                        && let Err(error) = open_openmouse()
+                    {
+                        self.error = Some(error.to_string());
+                    }
                     ui.label(
-                        RichText::new("Available with tray controls")
+                        RichText::new("Closing the window stops Bridge.")
                             .color(MUTED)
-                            .size(11.0),
+                            .size(10.0),
                     );
-                });
-                ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-                    ui.horizontal(|ui| {
-                        let button = egui::Button::new(RichText::new("Open OpenMouse").strong())
-                            .fill(ACCENT)
-                            .stroke(Stroke::NONE)
-                            .corner_radius(CornerRadius::same(7));
-                        if ui.add(button).clicked()
-                            && let Err(error) = open_openmouse()
-                        {
-                            self.error = Some(error.to_string());
-                        }
-                        ui.label(
-                            RichText::new("Closing this window stops Bridge.")
-                                .color(MUTED)
-                                .size(11.0),
-                        );
-                    });
                 });
             });
+        });
     }
 }
 
 fn detail_row(ui: &mut egui::Ui, label: &str, value: &str) {
     egui::Frame::new()
         .fill(SURFACE_RAISED)
-        .corner_radius(CornerRadius::same(7))
-        .inner_margin(egui::Margin::symmetric(12, 8))
+        .corner_radius(CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(10, 6))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(label).color(MUTED).size(12.0));
