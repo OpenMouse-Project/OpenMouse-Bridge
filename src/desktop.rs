@@ -11,7 +11,7 @@ use eframe::egui::{
     self, Align, Color32, CornerRadius, Layout, RichText, Sense, Stroke, Vec2, ViewportCommand,
 };
 use openmouse_bridge::{
-    BRIDGE_PORT, BRIDGE_VERSION, api, config,
+    BRIDGE_PORT, BRIDGE_VERSION, api, config, platform,
     service::{BridgeService, BridgeSnapshot},
 };
 #[cfg(target_os = "windows")]
@@ -33,6 +33,13 @@ enum DesktopEvent {
     Ready,
     Snapshot(BridgeSnapshot),
     ServerError(String),
+}
+
+#[derive(Clone, Copy, Default)]
+enum DesktopPage {
+    #[default]
+    Home,
+    Settings,
 }
 
 struct BackgroundServer {
@@ -138,6 +145,7 @@ fn run_server(events: Sender<DesktopEvent>, shutdown: oneshot::Receiver<()>) -> 
 struct BridgeDesktop {
     events: Receiver<DesktopEvent>,
     valorant_logo: egui::TextureHandle,
+    page: DesktopPage,
     snapshot: Option<BridgeSnapshot>,
     server_ready: bool,
     error: Option<String>,
@@ -167,6 +175,7 @@ impl BridgeDesktop {
         Self {
             events,
             valorant_logo,
+            page: DesktopPage::default(),
             snapshot: None,
             server_ready: false,
             error: None,
@@ -211,7 +220,7 @@ impl BridgeDesktop {
             });
     }
 
-    fn activity(&self, ui: &mut egui::Ui) {
+    fn activity(&mut self, ui: &mut egui::Ui) {
         let width = ui.available_width();
         egui::Frame::new()
             .fill(SURFACE_RAISED)
@@ -236,10 +245,71 @@ impl BridgeDesktop {
                     ui.set_min_height(28.0);
                     ui.label(RichText::new("Active profile").color(MUTED).size(11.0));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        settings_button(ui);
+                        if settings_button(ui) {
+                            self.page = DesktopPage::Settings;
+                        }
                         ui.label(RichText::new("Valorant").color(TEXT).strong().size(11.0));
                     });
                 });
+            });
+    }
+
+    fn settings(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui
+                .add(egui::Button::new(RichText::new("Back").color(MUTED).size(11.0)).frame(false))
+                .clicked()
+            {
+                self.page = DesktopPage::Home;
+            }
+            ui.label(RichText::new("SETTINGS").color(TEXT).strong().size(12.0));
+        });
+        ui.add_space(10.0);
+
+        let width = ui.available_width();
+        egui::Frame::new()
+            .fill(SURFACE_RAISED)
+            .stroke(Stroke::new(1.0, BORDER))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(12.0)
+            .show(ui, |ui| {
+                ui.set_min_width(width - 24.0);
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("Start Bridge at login")
+                                .color(TEXT)
+                                .size(11.0),
+                        );
+                        ui.label(
+                            RichText::new("Keep OpenMouse ready after restart")
+                                .color(MUTED)
+                                .size(9.0),
+                        );
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let mut enabled = self
+                            .snapshot
+                            .as_ref()
+                            .is_some_and(|snapshot| snapshot.autostart_enabled);
+                        if ui.toggle_value(&mut enabled, "").changed() {
+                            match platform::set_autostart(enabled) {
+                                Ok(()) => {
+                                    if let Some(snapshot) = &mut self.snapshot {
+                                        snapshot.autostart_enabled = enabled;
+                                    }
+                                }
+                                Err(error) => self.error = Some(error.to_string()),
+                            }
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
+                setting_row(ui, "Connection", &format!("127.0.0.1:{BRIDGE_PORT}"));
+                ui.separator();
+                setting_row(ui, "Version", BRIDGE_VERSION);
             });
     }
 
@@ -298,26 +368,31 @@ impl eframe::App for BridgeDesktop {
         egui::Frame::new().fill(BACKGROUND).show(ui, |ui| {
             ui.set_min_size(ui.available_size());
             self.title_bar(ui);
-            egui::Frame::new().inner_margin(20.0).show(ui, |ui| {
-                self.status_card(ui);
-                ui.add_space(10.0);
-                self.activity(ui);
-                ui.add_space(12.0);
-                let button = egui::Button::new(
-                    RichText::new("Open OpenMouse")
-                        .color(BACKGROUND)
-                        .strong()
-                        .size(12.0),
-                )
-                .fill(ACCENT)
-                .stroke(Stroke::NONE)
-                .corner_radius(CornerRadius::same(6));
-                if ui.add_sized([ui.available_width(), 34.0], button).clicked()
-                    && let Err(error) = open_openmouse()
-                {
-                    self.error = Some(error.to_string());
-                }
-            });
+            egui::Frame::new()
+                .inner_margin(20.0)
+                .show(ui, |ui| match self.page {
+                    DesktopPage::Home => {
+                        self.status_card(ui);
+                        ui.add_space(10.0);
+                        self.activity(ui);
+                        ui.add_space(12.0);
+                        let button = egui::Button::new(
+                            RichText::new("Open OpenMouse")
+                                .color(BACKGROUND)
+                                .strong()
+                                .size(12.0),
+                        )
+                        .fill(ACCENT)
+                        .stroke(Stroke::NONE)
+                        .corner_radius(CornerRadius::same(6));
+                        if ui.add_sized([ui.available_width(), 34.0], button).clicked()
+                            && let Err(error) = open_openmouse()
+                        {
+                            self.error = Some(error.to_string());
+                        }
+                    }
+                    DesktopPage::Settings => self.settings(ui),
+                });
         });
     }
 }
@@ -346,7 +421,7 @@ fn decode_png(bytes: &[u8]) -> egui::ColorImage {
     )
 }
 
-fn settings_button(ui: &mut egui::Ui) {
+fn settings_button(ui: &mut egui::Ui) -> bool {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(26.0), Sense::click());
     let color = if response.hovered() { TEXT } else { MUTED };
     let center = rect.center();
@@ -359,7 +434,17 @@ fn settings_button(ui: &mut egui::Ui) {
         ui.painter()
             .line_segment([center + direction * 7.0, center + direction * 9.0], stroke);
     }
-    response.on_hover_text("Profile settings");
+    response.on_hover_text("Bridge settings").clicked()
+}
+
+fn setting_row(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.set_min_height(26.0);
+        ui.label(RichText::new(label).color(MUTED).size(10.0));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.label(RichText::new(value).color(TEXT).size(10.0));
+        });
+    });
 }
 
 #[cfg(target_os = "windows")]

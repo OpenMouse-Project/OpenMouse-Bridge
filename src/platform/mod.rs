@@ -3,13 +3,19 @@ use anyhow::Result;
 #[cfg(target_os = "windows")]
 mod windows;
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+mod macos;
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 mod portable;
 
 #[cfg(target_os = "windows")]
 pub use windows::{autostart_enabled, platform_name, set_autostart};
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+pub use macos::{autostart_enabled, platform_name, set_autostart};
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub use portable::{autostart_enabled, platform_name, set_autostart};
 
 pub fn notify(summary: &str, body: &str) -> Result<()> {
