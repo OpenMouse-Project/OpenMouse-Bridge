@@ -69,9 +69,9 @@ pub fn run() -> Result<()> {
     let server = BackgroundServer::start(event_tx)?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([420.0, 360.0])
-            .with_min_inner_size([420.0, 360.0])
-            .with_max_inner_size([420.0, 360.0])
+            .with_inner_size([420.0, 390.0])
+            .with_min_inner_size([420.0, 390.0])
+            .with_max_inner_size([420.0, 390.0])
             .with_resizable(false)
             .with_decorations(false),
         centered: true,
@@ -250,16 +250,19 @@ impl BridgeDesktop {
                 ui.horizontal(|ui| {
                     let drag_width = (ui.available_width() - 62.0).max(100.0);
                     let title = ui
-                        .add_sized(
-                            [drag_width, 26.0],
-                            egui::Label::new(
-                                RichText::new("OPENMOUSE  /  BRIDGE")
-                                    .color(TEXT)
-                                    .strong()
-                                    .size(11.0),
-                            )
-                            .halign(Align::Min),
+                        .allocate_ui_with_layout(
+                            Vec2::new(drag_width, 26.0),
+                            Layout::left_to_right(Align::Center),
+                            |ui| {
+                                ui.label(
+                                    RichText::new("OPENMOUSE  /  BRIDGE")
+                                        .color(TEXT)
+                                        .strong()
+                                        .size(11.0),
+                                );
+                            },
                         )
+                        .response
                         .interact(Sense::drag());
                     if title.drag_started() {
                         ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
