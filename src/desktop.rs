@@ -146,6 +146,7 @@ struct BridgeDesktop {
     events: Receiver<DesktopEvent>,
     valorant_logo: egui::TextureHandle,
     page: DesktopPage,
+    discord_rpc_enabled: bool,
     snapshot: Option<BridgeSnapshot>,
     server_ready: bool,
     error: Option<String>,
@@ -176,6 +177,7 @@ impl BridgeDesktop {
             events,
             valorant_logo,
             page: DesktopPage::default(),
+            discord_rpc_enabled: false,
             snapshot: None,
             server_ready: false,
             error: None,
@@ -289,7 +291,7 @@ impl BridgeDesktop {
                             .snapshot
                             .as_ref()
                             .is_some_and(|snapshot| snapshot.autostart_enabled);
-                        if toggle_switch(ui, &mut enabled) {
+                        if toggle_switch(ui, &mut enabled, "Start Bridge at login") {
                             match platform::set_autostart(enabled) {
                                 Ok(()) => {
                                     if let Some(snapshot) = &mut self.snapshot {
@@ -304,7 +306,24 @@ impl BridgeDesktop {
                 ui.add_space(4.0);
                 ui.separator();
                 ui.add_space(4.0);
-                setting_row(ui, "Connection", &format!("127.0.0.1:{BRIDGE_PORT}"));
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("Discord Rich Presence")
+                                .color(TEXT)
+                                .size(11.0),
+                        );
+                        ui.label(
+                            RichText::new("Show your active game and profile")
+                                .color(MUTED)
+                                .size(9.0),
+                        );
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        toggle_switch(ui, &mut self.discord_rpc_enabled, "Discord Rich Presence");
+                    });
+                });
+                ui.add_space(4.0);
                 ui.separator();
                 setting_row(ui, "Version", BRIDGE_VERSION);
             });
@@ -475,7 +494,7 @@ fn back_button(ui: &mut egui::Ui) -> bool {
     response.clicked()
 }
 
-fn toggle_switch(ui: &mut egui::Ui, enabled: &mut bool) -> bool {
+fn toggle_switch(ui: &mut egui::Ui, enabled: &mut bool, tooltip: &str) -> bool {
     let (rect, response) = ui.allocate_exact_size(Vec2::new(38.0, 22.0), Sense::click());
     let clicked = response.clicked();
     if clicked {
@@ -494,7 +513,7 @@ fn toggle_switch(ui: &mut egui::Ui, enabled: &mut bool) -> bool {
         8.0,
         if *enabled { BACKGROUND } else { MUTED },
     );
-    response.on_hover_text("Start Bridge at login");
+    response.on_hover_text(tooltip);
     clicked
 }
 
