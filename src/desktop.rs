@@ -77,9 +77,9 @@ pub fn run() -> Result<()> {
     let server = BackgroundServer::start(event_tx)?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([420.0, 340.0])
-            .with_min_inner_size([420.0, 340.0])
-            .with_max_inner_size([420.0, 340.0])
+            .with_inner_size([420.0, 300.0])
+            .with_min_inner_size([420.0, 300.0])
+            .with_max_inner_size([420.0, 300.0])
             .with_resizable(false)
             .with_decorations(false),
         centered: true,
@@ -220,31 +220,22 @@ impl BridgeDesktop {
     }
 
     fn status_card(&self, ui: &mut egui::Ui) {
-        let width = ui.available_width();
-        egui::Frame::new()
-            .fill(SURFACE)
-            .stroke(Stroke::new(1.0, BORDER))
-            .corner_radius(CornerRadius::same(8))
-            .inner_margin(12.0)
-            .show(ui, |ui| {
-                ui.set_min_width(width - 24.0);
-                ui.horizontal(|ui| {
-                    let (color, label) = if self.error.is_some() {
-                        (Color32::from_rgb(239, 112, 112), "BRIDGE ERROR")
-                    } else if self.server_ready {
-                        (ACCENT, "BRIDGE CONNECTED")
-                    } else {
-                        (Color32::from_rgb(232, 184, 93), "CONNECTING")
-                    };
-                    let (dot, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
-                    ui.painter().circle_filled(dot.center(), 4.0, color);
-                    ui.label(RichText::new(label).color(color).strong().size(11.0));
-                });
-                if let Some(error) = &self.error {
-                    ui.add_space(4.0);
-                    ui.label(RichText::new(error).color(TEXT).size(12.0));
-                }
-            });
+        ui.horizontal(|ui| {
+            ui.set_min_height(24.0);
+            let (color, label) = if self.error.is_some() {
+                (Color32::from_rgb(239, 112, 112), "Bridge error")
+            } else if self.server_ready {
+                (ACCENT, "Bridge connected")
+            } else {
+                (Color32::from_rgb(232, 184, 93), "Connecting to Bridge")
+            };
+            let (dot, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+            ui.painter().circle_filled(dot.center(), 4.0, color);
+            ui.label(RichText::new(label).color(color).strong().size(10.5));
+            if let Some(error) = &self.error {
+                ui.label(RichText::new(error).color(MUTED).size(9.5));
+            }
+        });
     }
 
     fn activity(&self, ui: &mut egui::Ui) {
@@ -408,7 +399,7 @@ impl eframe::App for BridgeDesktop {
                 .show(ui, |ui| match self.page {
                     DesktopPage::Home => {
                         self.status_card(ui);
-                        ui.add_space(10.0);
+                        ui.add_space(8.0);
                         self.activity(ui);
                         ui.add_space(12.0);
                         let button = egui::Button::new(
