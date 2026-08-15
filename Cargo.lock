@@ -2151,6 +2151,7 @@ dependencies = [
  "directories",
  "eframe",
  "notify-rust",
+ "objc2-app-kit 0.3.2",
  "png",
  "serde",
  "serde_json",

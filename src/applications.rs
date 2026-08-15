@@ -15,7 +15,7 @@ pub struct ApplicationInfo {
     pub icon_id: String,
 }
 
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
 fn icon_id(path: &str) -> String {
     let mut hasher = DefaultHasher::new();
     path.to_ascii_lowercase().hash(&mut hasher);
@@ -236,7 +236,58 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+mod imp {
+    use std::{collections::BTreeMap, path::Path};
+
+    use objc2_app_kit::{NSApplicationActivationPolicy, NSWorkspace};
+
+    use super::{ApplicationInfo, icon_id};
+
+    pub fn visible_applications() -> Vec<ApplicationInfo> {
+        let workspace = NSWorkspace::sharedWorkspace();
+        let mut applications = BTreeMap::new();
+        for application in workspace.runningApplications().iter() {
+            if application.isTerminated()
+                || application.activationPolicy() != NSApplicationActivationPolicy::Regular
+            {
+                continue;
+            }
+            let Some(name) = application.localizedName().map(|name| name.to_string()) else {
+                continue;
+            };
+            let Some(path) = application
+                .executableURL()
+                .and_then(|url| url.path())
+                .map(|path| path.to_string())
+            else {
+                continue;
+            };
+            let executable = Path::new(&path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if name.is_empty() || executable.is_empty() {
+                continue;
+            }
+            let key = path.to_lowercase();
+            applications.entry(key).or_insert(ApplicationInfo {
+                name,
+                executable,
+                icon_id: icon_id(&path),
+                path,
+                foreground: application.isActive(),
+            });
+        }
+        applications.into_values().collect()
+    }
+
+    pub fn application_icon(_path: &str) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 mod imp {
     use super::ApplicationInfo;
 

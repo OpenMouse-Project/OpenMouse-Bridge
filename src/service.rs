@@ -56,6 +56,7 @@ pub struct BridgeSnapshot {
     pub battery_threshold_percent: u8,
     pub autostart_enabled: bool,
     pub foreground_application: Option<ApplicationInfo>,
+    pub visible_application_count: usize,
     pub profile_count: usize,
 }
 
@@ -89,6 +90,7 @@ impl BridgeService {
                 .iter()
                 .find(|application| application.foreground)
                 .cloned(),
+            visible_application_count: state.applications.len(),
             profile_count: state.config.profiles.len(),
         }
     }

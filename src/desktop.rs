@@ -208,23 +208,24 @@ impl BridgeDesktop {
     }
 
     fn details(&self, ui: &mut egui::Ui) {
-        let (profiles, applications, active_game) =
-            self.snapshot
-                .as_ref()
-                .map_or(("—".into(), "—".into(), "None".into()), |snapshot| {
-                    (
-                        snapshot.profile_count.to_string(),
-                        snapshot
-                            .foreground_application
-                            .as_ref()
-                            .map_or_else(|| "None".into(), |application| application.name.clone()),
-                        snapshot
-                            .active_games
-                            .first()
-                            .cloned()
-                            .unwrap_or_else(|| "None".into()),
-                    )
-                });
+        let (profiles, application_count, foreground, active_game) = self.snapshot.as_ref().map_or(
+            ("—".into(), "—".into(), "—".into(), "None".into()),
+            |snapshot| {
+                (
+                    snapshot.profile_count.to_string(),
+                    snapshot.visible_application_count.to_string(),
+                    snapshot
+                        .foreground_application
+                        .as_ref()
+                        .map_or_else(|| "None".into(), |application| application.name.clone()),
+                    snapshot
+                        .active_games
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "None".into()),
+                )
+            },
+        );
         egui::Frame::new()
             .fill(SURFACE_RAISED)
             .stroke(Stroke::new(1.0, BORDER))
@@ -232,11 +233,11 @@ impl BridgeDesktop {
             .inner_margin(egui::Margin::symmetric(12, 5))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
-                detail_row(ui, "Version", BRIDGE_VERSION);
+                detail_row(ui, "Open applications", &application_count);
                 ui.separator();
                 detail_row(ui, "Application profiles", &profiles);
                 ui.separator();
-                detail_row(ui, "Foreground application", &applications);
+                detail_row(ui, "Foreground application", &foreground);
                 ui.separator();
                 detail_row(ui, "Active game", &active_game);
             });
@@ -247,6 +248,7 @@ impl BridgeDesktop {
             .fill(SURFACE)
             .inner_margin(egui::Margin::symmetric(12, 6))
             .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
                 ui.horizontal(|ui| {
                     let drag_width = (ui.available_width() - 62.0).max(100.0);
                     let title = ui
@@ -255,10 +257,12 @@ impl BridgeDesktop {
                             Layout::left_to_right(Align::Center),
                             |ui| {
                                 ui.label(
-                                    RichText::new("OPENMOUSE  /  BRIDGE")
-                                        .color(TEXT)
-                                        .strong()
-                                        .size(11.0),
+                                    RichText::new(format!(
+                                        "OPENMOUSE  /  BRIDGE  {BRIDGE_VERSION}"
+                                    ))
+                                    .color(TEXT)
+                                    .strong()
+                                    .size(11.0),
                                 );
                             },
                         )
@@ -300,7 +304,7 @@ impl eframe::App for BridgeDesktop {
                 self.details(ui);
                 ui.add_space(12.0);
                 let button = egui::Button::new(
-                    RichText::new("Open OpenMouse  →")
+                    RichText::new("Open OpenMouse")
                         .color(BACKGROUND)
                         .strong()
                         .size(12.0),

@@ -8,7 +8,7 @@ The initial service provides:
 
 - a minimal native Windows and macOS status window with a shortcut to OpenMouse;
 - process-based detection for configured game executables;
-- discovery of visible Windows applications and the foreground application;
+- discovery of visible Windows and macOS applications and the foreground application;
 - persistent application profiles tied to a specific mouse;
 - low-battery notifications with a configurable threshold and cooldown;
 - Windows startup-at-login registration under the current user;
