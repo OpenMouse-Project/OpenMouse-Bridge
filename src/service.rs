@@ -51,6 +51,7 @@ struct BridgeState {
     application_icons: HashMap<String, Option<Vec<u8>>>,
     battery: HashMap<String, BatteryState>,
     started_at: Instant,
+    last_client_heartbeat: Option<Instant>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -89,6 +90,7 @@ pub struct BridgeSnapshot {
     pub active_profile: Option<ApplicationProfile>,
     pub visible_application_count: usize,
     pub profile_count: usize,
+    pub client_connected: bool,
 }
 
 impl BridgeService {
@@ -101,6 +103,7 @@ impl BridgeService {
                 application_icons: HashMap::new(),
                 battery: HashMap::new(),
                 started_at: Instant::now(),
+                last_client_heartbeat: None,
             })),
             config_path: Arc::new(config_path),
         }
@@ -108,6 +111,9 @@ impl BridgeService {
 
     pub async fn snapshot(&self) -> BridgeSnapshot {
         let state = self.inner.read().await;
+        let client_connected = state
+            .last_client_heartbeat
+            .is_some_and(|heartbeat| heartbeat.elapsed() < Duration::from_secs(12));
         let foreground_application = state
             .applications
             .iter()
@@ -154,7 +160,12 @@ impl BridgeService {
             active_profile,
             visible_application_count: state.applications.len(),
             profile_count: state.config.profiles.len(),
+            client_connected,
         }
+    }
+
+    pub async fn record_client_heartbeat(&self) {
+        self.inner.write().await.last_client_heartbeat = Some(Instant::now());
     }
 
     pub async fn config(&self) -> BridgeConfig {
@@ -349,5 +360,15 @@ mod tests {
             &application("Google Chrome", "chrome.exe"),
             &games
         ));
+    }
+
+    #[tokio::test]
+    async fn client_is_connected_only_after_a_heartbeat() {
+        let bridge = service(BridgeConfig::default());
+        assert!(!bridge.snapshot().await.client_connected);
+
+        bridge.record_client_heartbeat().await;
+
+        assert!(bridge.snapshot().await.client_connected);
     }
 }

@@ -60,7 +60,10 @@ explicit configuration file.
 ## Loopback API
 
 - `GET /v1/status` reports the Bridge version, platform, active games, battery
-  threshold, and autostart state.
+  threshold, autostart state, and whether an OpenMouse client has completed a
+  recent handshake.
+- `PUT /v1/handshake` renews OpenMouse's 12-second connection lease. The client
+  sends this heartbeat every five seconds while connected.
 - `GET /v1/games` returns the full executable catalog currently being tracked.
 - `PUT /v1/games` adds or updates custom tracked games and persists them. Bundled
   catalog entries are retained so a client cannot accidentally disable detection.

@@ -293,10 +293,16 @@ impl BridgeDesktop {
             ui.set_min_height(24.0);
             let (color, label) = if self.error.is_some() {
                 (Color32::from_rgb(239, 112, 112), "Bridge error")
-            } else if self.server_ready {
+            } else if self
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.client_connected)
+            {
                 (ACCENT, "Bridge connected")
+            } else if self.server_ready {
+                (Color32::from_rgb(232, 184, 93), "Waiting for OpenMouse")
             } else {
-                (Color32::from_rgb(232, 184, 93), "Connecting to Bridge")
+                (Color32::from_rgb(232, 184, 93), "Starting Bridge")
             };
             let (dot, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
             ui.painter().circle_filled(dot.center(), 4.0, color);

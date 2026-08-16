@@ -52,6 +52,7 @@ pub fn router(service: BridgeService, origins: &[String]) -> Router {
         .max_age(Duration::from_secs(3600));
     Router::new()
         .route("/v1/status", get(status))
+        .route("/v1/handshake", put(handshake))
         .route("/v1/games", get(games).put(replace_games))
         .route("/v1/applications", get(applications))
         .route("/v1/applications/{icon_id}/icon", get(application_icon))
@@ -70,6 +71,11 @@ pub fn router(service: BridgeService, origins: &[String]) -> Router {
 
 async fn status(State(service): State<BridgeService>) -> Json<crate::service::BridgeSnapshot> {
     Json(service.snapshot().await)
+}
+
+async fn handshake(State(service): State<BridgeService>) -> Json<ApiResult> {
+    service.record_client_heartbeat().await;
+    Json(ApiResult { ok: true })
 }
 
 async fn applications(
