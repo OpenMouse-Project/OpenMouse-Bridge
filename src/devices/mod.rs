@@ -22,11 +22,14 @@ pub mod attackshark;
 use std::{collections::HashSet, time::Duration};
 
 use anyhow::{Result, anyhow};
-use nusb::transfer::{ControlOut, ControlType, Recipient, RequestBuffer};
+use nusb::transfer::{ControlIn, ControlOut, ControlType, Recipient, RequestBuffer};
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::service::{BatteryReading, BridgeService};
+use crate::{
+    config::DeviceSettings,
+    service::{BatteryReading, BridgeService},
+};
 
 /// How often the worker re-enumerates and samples battery.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -150,7 +153,7 @@ struct OpenDevice {
 
 async fn worker(mut commands: mpsc::Receiver<Command>, service: BridgeService) {
     let mut devices: Vec<OpenDevice> = Vec::new();
-    refresh(&mut devices);
+    refresh(&mut devices, &service).await;
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -161,23 +164,81 @@ async fn worker(mut commands: mpsc::Receiver<Command>, service: BridgeService) {
                     let _ = reply.send(devices.iter().map(|device| device.info.clone()).collect());
                 }
                 Some(Command::SetPolling { id, hz, reply }) => {
-                    let _ = reply.send(set_polling(&mut devices, &id, hz).await);
+                    let _ = reply.send(set_polling(&mut devices, &id, hz, &service).await);
                 }
                 Some(Command::SetDpi { id, stages, active_stage, reply }) => {
-                    let _ = reply.send(set_dpi(&mut devices, &id, &stages, active_stage).await);
+                    let _ = reply.send(set_dpi(&mut devices, &id, &stages, active_stage, &service).await);
                 }
                 None => break,
             },
             _ = ticker.tick() => {
                 poll_battery(&mut devices, &service).await;
-                refresh(&mut devices);
+                refresh(&mut devices, &service).await;
             }
         }
     }
 }
 
+/// Read the DPI stages and active stage directly from the mouse over raw USB
+/// (HID GET_REPORT for the DPI feature report). Best-effort — many units may
+/// not answer, in which case we fall back to remembered settings.
+async fn read_dpi(
+    interface: &nusb::Interface,
+) -> Option<([u16; attackshark::DPI_STAGE_COUNT], u8)> {
+    let transfer = interface.control_in(ControlIn {
+        control_type: ControlType::Class,
+        recipient: Recipient::Interface,
+        request: attackshark::GET_REPORT_REQUEST,
+        value: attackshark::DPI_WVALUE,
+        index: u16::from(attackshark::CONTROL_INTERFACE),
+        length: 64,
+    });
+    let completion = tokio::time::timeout(CONTROL_TIMEOUT, transfer).await.ok()?;
+    completion.status.ok()?;
+    attackshark::decode_dpi_packet(&completion.data)
+}
+
+/// Decide a freshly-claimed device's starting DPI/polling: read from the mouse
+/// if it answers, else the settings we persisted, else defaults.
+async fn resolve_settings(
+    interface: &nusb::Interface,
+    id: &str,
+    service: &BridgeService,
+) -> (Vec<u16>, u8, Option<u16>) {
+    let persisted = service.device_settings(id).await;
+    let (stages, active) = match read_dpi(interface).await {
+        Some((stages, active)) => {
+            tracing::info!(device = %id, "read DPI from the mouse");
+            (stages.to_vec(), active)
+        }
+        None => match &persisted {
+            Some(saved) if !saved.dpi_stages.is_empty() => {
+                (saved.dpi_stages.clone(), saved.active_dpi_stage)
+            }
+            _ => (DEFAULT_DPI_STAGES.to_vec(), 2),
+        },
+    };
+    let polling = persisted.and_then(|saved| saved.polling_rate_hz);
+    (stages, active, polling)
+}
+
+/// Persist a device's current DPI/polling so they survive a Bridge restart.
+async fn persist(device: &OpenDevice, service: &BridgeService) {
+    let settings = DeviceSettings {
+        dpi_stages: device.info.dpi_stages.clone(),
+        active_dpi_stage: device.info.active_dpi_stage,
+        polling_rate_hz: device.info.polling_rate_hz,
+    };
+    if let Err(error) = service
+        .save_device_settings(device.info.id.clone(), settings)
+        .await
+    {
+        tracing::debug!(%error, "could not persist device settings");
+    }
+}
+
 /// Re-enumerate and reconcile the open-device list with what is attached now.
-fn refresh(devices: &mut Vec<OpenDevice>) {
+async fn refresh(devices: &mut Vec<OpenDevice>, service: &BridgeService) {
     let list = match nusb::list_devices() {
         Ok(list) => list,
         Err(error) => {
@@ -226,6 +287,13 @@ fn refresh(devices: &mut Vec<OpenDevice>) {
             }
         };
 
+        // Start DPI/polling from the mouse (if it answers), else remembered
+        // settings, else defaults — so values are not lost across restarts.
+        let (dpi_stages, active_dpi_stage, polling_rate_hz) = match &interface {
+            Some(interface) => resolve_settings(interface, &id, service).await,
+            None => (DEFAULT_DPI_STAGES.to_vec(), 2, None),
+        };
+
         devices.push(OpenDevice {
             info: DeviceInfo {
                 id,
@@ -239,12 +307,10 @@ fn refresh(devices: &mut Vec<OpenDevice>) {
                 },
                 controllable,
                 battery_percent: None,
-                polling_rate_hz: None,
+                polling_rate_hz,
                 supported_polling_rates: attackshark::supported_polling_rates(),
-                // The mouse does not report its stages, so start from sensible
-                // defaults; they update as the user writes new ones.
-                dpi_stages: DEFAULT_DPI_STAGES.to_vec(),
-                active_dpi_stage: 2,
+                dpi_stages,
+                active_dpi_stage,
                 dpi_min: attackshark::DPI_MIN,
                 dpi_max: attackshark::DPI_MAX,
                 dpi_step: attackshark::DPI_STEP,
@@ -266,7 +332,12 @@ fn claim(entry: &nusb::DeviceInfo) -> Result<nusb::Interface> {
 /// Send the polling-rate command as a HID SET_REPORT control transfer, exactly
 /// as the reference driver does (bmRequestType 0x21, bRequest 0x09, wValue
 /// 0x0306, wIndex 2). A completed transfer is the mouse acknowledging it.
-async fn set_polling(devices: &mut [OpenDevice], id: &str, hz: u16) -> Result<u16> {
+async fn set_polling(
+    devices: &mut [OpenDevice],
+    id: &str,
+    hz: u16,
+    service: &BridgeService,
+) -> Result<u16> {
     let device = devices
         .iter_mut()
         .find(|device| device.info.id == id)
@@ -297,6 +368,7 @@ async fn set_polling(devices: &mut [OpenDevice], id: &str, hz: u16) -> Result<u1
 
     device.info.polling_rate_hz = Some(hz);
     tracing::info!(device = %device.info.id, hz, "set polling rate over USB");
+    persist(device, service).await;
     Ok(hz)
 }
 
@@ -308,6 +380,7 @@ async fn set_dpi(
     id: &str,
     stages: &[u16],
     active_stage: u8,
+    service: &BridgeService,
 ) -> Result<()> {
     let device = devices
         .iter_mut()
@@ -357,6 +430,7 @@ async fn set_dpi(
     device.info.dpi_stages = stage_array.to_vec();
     device.info.active_dpi_stage = active_stage;
     tracing::info!(device = %device.info.id, ?stage_array, active_stage, "set DPI over USB");
+    persist(device, service).await;
     Ok(())
 }
 
@@ -400,12 +474,13 @@ async fn poll_battery(devices: &mut [OpenDevice], service: &BridgeService) {
             }
         }
 
-        // The physical DPI button changed the active stage; reflect it.
+        // The physical DPI button changed the active stage; reflect and remember it.
         if let Some(stage) = latest_stage
             && device.info.active_dpi_stage != stage
         {
             device.info.active_dpi_stage = stage;
             tracing::info!(device = %device.info.id, stage, "DPI stage changed on the mouse");
+            persist(device, service).await;
         }
 
         if let Some(percent) = latest_battery

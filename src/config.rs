@@ -1,4 +1,4 @@
-use std::{env, fs, path::PathBuf};
+use std::{collections::HashMap, env, fs, path::PathBuf};
 
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
@@ -28,6 +28,19 @@ pub struct BridgeConfig {
     pub default_profile: Option<ApplicationProfile>,
     #[serde(default = "default_origins")]
     pub allowed_origins: Vec<String>,
+    /// Persisted per-device settings (e.g. Attack Shark DPI/polling), keyed by
+    /// device id like `"1d57:fa60"`, so they survive Bridge restarts.
+    #[serde(default)]
+    pub device_settings: HashMap<String, DeviceSettings>,
+}
+
+/// Native device settings the Bridge remembers across restarts.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceSettings {
+    pub dpi_stages: Vec<u16>,
+    pub active_dpi_stage: u8,
+    pub polling_rate_hz: Option<u16>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -76,6 +89,7 @@ impl Default for BridgeConfig {
             profiles: Vec::new(),
             default_profile: None,
             allowed_origins: default_origins(),
+            device_settings: HashMap::new(),
         }
     }
 }
@@ -213,6 +227,7 @@ mod tests {
             profiles: Vec::new(),
             default_profile: None,
             allowed_origins: Vec::new(),
+            device_settings: HashMap::new(),
         }
         .normalized();
         assert_eq!(config.battery_threshold_percent, 100);

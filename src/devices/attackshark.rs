@@ -36,6 +36,8 @@ pub const CONTROL_INTERFACE: u8 = 2;
 ///
 /// bmRequestType 0x21 = Host->Device | Class | Interface.
 pub const SET_REPORT_REQUEST: u8 = 0x09;
+/// HID GET_REPORT (bRequest 0x01), to read a feature report back over raw USB.
+pub const GET_REPORT_REQUEST: u8 = 0x01;
 /// wValue high byte: HID report type 0x03 = Feature.
 pub const FEATURE_REPORT_TYPE: u16 = 0x03;
 /// Feature report id the polling-rate command is written on.
@@ -177,6 +179,44 @@ pub fn dpi_packet(
     buf[50] = (checksum >> 8) as u8;
     buf[51] = (checksum & 0xff) as u8;
     Some(buf)
+}
+
+/// Decode one stage's DPI byte back to a DPI value. Codes repeat across the
+/// sensor's register pages, so the stage-mask bit (DPI > 12000) and the
+/// high-stage flag (upper page) select which page to look in.
+fn decode_dpi(code: u8, mask_bit: bool, high_flag: bool) -> Option<u16> {
+    let (lo, hi) = match (mask_bit, high_flag) {
+        (false, false) => (DPI_MIN, 10_000),
+        (false, true) => (10_100, 12_000),
+        (true, false) => (12_100, 20_000),
+        (true, true) => (20_100, DPI_MAX),
+    };
+    DPI_STEP_MAP
+        .iter()
+        .find(|&&(dpi, c)| c == code && (lo..=hi).contains(&dpi))
+        .map(|&(dpi, _)| dpi)
+}
+
+/// Decode a DPI feature report read back from the mouse into the six stage
+/// values and the active stage (1-based). Returns `None` if the report does not
+/// look like the DPI packet (`04 38 01 …`) or any stage byte fails to decode —
+/// so a garbled or unsupported read is rejected rather than trusted.
+pub fn decode_dpi_packet(report: &[u8]) -> Option<([u16; DPI_STAGE_COUNT], u8)> {
+    if report.len() < 25 || report[0] != DPI_REPORT_ID || report[1] != 0x38 || report[2] != 0x01 {
+        return None;
+    }
+    let active = report[24];
+    if !(1..=DPI_STAGE_COUNT as u8).contains(&active) {
+        return None;
+    }
+    let mut stages = [0u16; DPI_STAGE_COUNT];
+    for (i, stage) in stages.iter_mut().enumerate() {
+        let code = report[8 + i];
+        let mask_bit = report[6] & (1 << i) != 0;
+        let high_flag = report[16 + i] != 0;
+        *stage = decode_dpi(code, mask_bit, high_flag)?;
+    }
+    Some((stages, active))
 }
 
 /// Decode a battery input report. `report` includes the leading report id, so
@@ -622,6 +662,22 @@ mod tests {
     #[test]
     fn dpi_control_transfer_wvalue_matches_reference() {
         assert_eq!(DPI_WVALUE, 0x0304);
+    }
+
+    #[test]
+    fn dpi_packet_round_trips_through_decode() {
+        // What we write, we can read back — including upper-register-page stages
+        // whose codes collide with lower ones.
+        let stages = [800u16, 1600, 2400, 3200, 5000, 22000];
+        let packet = dpi_packet(stages, 2, false, true).unwrap();
+        assert_eq!(decode_dpi_packet(&packet), Some((stages, 2)));
+
+        let paged = [400u16, 12000, 16000, 20000, 22000, 800];
+        let packet = dpi_packet(paged, 4, false, true).unwrap();
+        assert_eq!(decode_dpi_packet(&packet), Some((paged, 4)));
+
+        // A non-DPI report is rejected.
+        assert_eq!(decode_dpi_packet(&[0x03, 0x55, 0x40, 0x01, 0x64]), None);
     }
 
     #[test]
