@@ -1,6 +1,6 @@
 [package]
 name = "openmouse-bridge"
-version = "0.2.0"
+version = "1.0.0"
 edition = "2024"
 description = "Local companion service for OpenMouse game detection and battery alerts"
 license = "MIT"

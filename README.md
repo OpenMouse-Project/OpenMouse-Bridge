@@ -105,8 +105,9 @@ successful push to `main` updates the rolling `dev-build` prerelease with a
 Windows x64 zip and checksum. The same files remain available as workflow
 artifacts for individual runs.
 
-Pushing a version tag such as `v0.1.0` creates a GitHub release containing a
-Windows zip and SHA-256 checksum. Release signing is automatic when the
+Pushing a stable version tag such as `v1.0.0` publishes it as the latest GitHub
+release with generated changelog notes, Windows x64 and universal macOS
+archives, and SHA-256 checksums. Windows signing is automatic when the
 repository has `WINDOWS_CERTIFICATE_BASE64` and
 `WINDOWS_CERTIFICATE_PASSWORD` secrets; unsigned development builds continue
 to work without those secrets.
