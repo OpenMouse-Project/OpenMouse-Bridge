@@ -390,7 +390,11 @@ async fn poll_battery(devices: &mut [OpenDevice], service: &BridgeService) {
             // Diagnostic: log the raw packet so DPI-button (and other) reports
             // can be identified. `battery` is set when it matches the known
             // battery signature; anything else is a candidate to decode.
-            let hex: String = completion.data.iter().map(|byte| format!("{byte:02x}")).collect();
+            let hex: String = completion
+                .data
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
             let battery = attackshark::parse_battery(&completion.data);
             tracing::info!(device = %device.info.id, packet = %hex, ?battery, "interrupt IN packet");
 
@@ -399,7 +403,9 @@ async fn poll_battery(devices: &mut [OpenDevice], service: &BridgeService) {
             }
         }
 
-        let Some(percent) = latest_battery else { continue };
+        let Some(percent) = latest_battery else {
+            continue;
+        };
         if device.info.battery_percent == Some(percent) {
             continue;
         }
