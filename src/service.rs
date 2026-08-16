@@ -113,7 +113,7 @@ impl BridgeService {
         let state = self.inner.read().await;
         let client_connected = state
             .last_client_heartbeat
-            .is_some_and(|heartbeat| heartbeat.elapsed() < Duration::from_secs(12));
+            .is_some_and(|heartbeat| heartbeat.elapsed() < Duration::from_secs(20));
         let foreground_application = state
             .applications
             .iter()
