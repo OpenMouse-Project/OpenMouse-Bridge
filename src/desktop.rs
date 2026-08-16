@@ -15,7 +15,7 @@ use eframe::egui::{
     self, Align, Color32, CornerRadius, Layout, RichText, Sense, Stroke, Vec2, ViewportCommand,
 };
 use openmouse_bridge::{
-    BRIDGE_PORT, BRIDGE_VERSION, api, config, platform,
+    BRIDGE_PORT, BRIDGE_VERSION, api, config, devices::DeviceManager, platform,
     service::{BridgeService, BridgeSnapshot},
 };
 #[cfg(target_os = "windows")]
@@ -160,6 +160,7 @@ fn run_server(events: Sender<DesktopEvent>, shutdown: oneshot::Receiver<()>) -> 
         let origins = bridge_config.allowed_origins.clone();
         let service = BridgeService::new(bridge_config, path.clone());
         service.start_game_monitor();
+        let devices = DeviceManager::start(service.clone());
 
         let snapshot_service = service.clone();
         let snapshot_events = events.clone();
@@ -189,7 +190,7 @@ fn run_server(events: Sender<DesktopEvent>, shutdown: oneshot::Receiver<()>) -> 
         };
         tracing::info!(%address, config = %path.display(), "OpenMouse Bridge is ready");
         let _ = events.send(DesktopEvent::Ready);
-        axum::serve(listener, api::router(service, &origins))
+        axum::serve(listener, api::router(service, devices, &origins))
             .with_graceful_shutdown(async {
                 let _ = shutdown.await;
             })

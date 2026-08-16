@@ -9,6 +9,7 @@ const DEFAULT_ALERT_COOLDOWN_MINUTES: u64 = 360;
 const OFFICIAL_ORIGINS: &[&str] = &[
     "https://dev.openmouse.app",
     "https://openmouse.app",
+    "https://openmouse-sable.vercel.app", // Debuging by viix0dev
     "https://www.openmouse.app",
 ];
 

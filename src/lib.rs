@@ -1,6 +1,7 @@
 pub mod api;
 pub mod applications;
 pub mod config;
+pub mod devices;
 pub mod games;
 pub mod platform;
 pub mod service;

@@ -3,7 +3,7 @@ use std::time::Duration;
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, State},
+    extract::{FromRef, Path, State},
     http::{HeaderValue, Method, Response, StatusCode, header},
     routing::{get, put},
 };
@@ -12,9 +12,25 @@ use tower_http::{cors::CorsLayer, set_header::SetResponseHeaderLayer, trace::Tra
 
 use crate::{
     config::{ApplicationProfile, GameConfig},
+    devices::{DeviceInfo, DeviceManager},
     platform,
     service::{BatteryReading, BridgeService},
 };
+
+/// Everything the HTTP handlers share. `FromRef` lets existing handlers keep
+/// extracting `State<BridgeService>` unchanged while new ones reach the
+/// device manager.
+#[derive(Clone)]
+pub struct AppState {
+    service: BridgeService,
+    devices: Option<DeviceManager>,
+}
+
+impl FromRef<AppState> for BridgeService {
+    fn from_ref(state: &AppState) -> Self {
+        state.service.clone()
+    }
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,7 +56,24 @@ struct ProfilesPayload {
     profiles: Vec<ApplicationProfile>,
 }
 
-pub fn router(service: BridgeService, origins: &[String]) -> Router {
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PollingPayload {
+    hz: u16,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PollingResult {
+    ok: bool,
+    polling_rate_hz: u16,
+}
+
+pub fn router(
+    service: BridgeService,
+    devices: Option<DeviceManager>,
+    origins: &[String],
+) -> Router {
     let allowed: Vec<HeaderValue> = origins
         .iter()
         .filter_map(|origin| origin.parse().ok())
@@ -60,13 +93,40 @@ pub fn router(service: BridgeService, origins: &[String]) -> Router {
         .route("/v1/default-profile", put(set_default_profile))
         .route("/v1/battery", put(record_battery))
         .route("/v1/autostart", put(set_autostart))
+        .route("/v1/devices", get(list_devices))
+        .route("/v1/devices/{id}/polling", put(set_device_polling))
         .layer(SetResponseHeaderLayer::if_not_present(
             axum::http::HeaderName::from_static("access-control-allow-private-network"),
             HeaderValue::from_static("true"),
         ))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
-        .with_state(service)
+        .with_state(AppState { service, devices })
+}
+
+async fn list_devices(State(state): State<AppState>) -> Json<Vec<DeviceInfo>> {
+    match state.devices {
+        Some(manager) => Json(manager.list().await),
+        None => Json(Vec::new()),
+    }
+}
+
+async fn set_device_polling(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<PollingPayload>,
+) -> Result<Json<PollingResult>, (StatusCode, String)> {
+    let manager = state
+        .devices
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "native device support is unavailable".to_owned()))?;
+    let confirmed = manager
+        .set_polling(id, payload.hz)
+        .await
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    Ok(Json(PollingResult {
+        ok: true,
+        polling_rate_hz: confirmed,
+    }))
 }
 
 async fn status(State(service): State<BridgeService>) -> Json<crate::service::BridgeSnapshot> {
