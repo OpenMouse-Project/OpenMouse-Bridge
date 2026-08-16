@@ -9,6 +9,10 @@ pub const fn platform_name() -> &'static str {
     "macos"
 }
 
+pub fn linux_distribution() -> Option<String> {
+    None
+}
+
 pub fn autostart_enabled() -> bool {
     launch_agent_path().is_ok_and(|path| path.exists())
 }

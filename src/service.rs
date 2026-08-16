@@ -80,6 +80,7 @@ pub struct GameActivity {
 pub struct BridgeSnapshot {
     pub version: &'static str,
     pub platform: &'static str,
+    pub linux_distribution: Option<String>,
     pub uptime_seconds: u64,
     pub active_games: Vec<String>,
     pub games: Vec<GameActivity>,
@@ -133,6 +134,10 @@ impl BridgeService {
                             .eq_ignore_ascii_case(&application.path)
                             || profile
                                 .application
+                                .name
+                                .eq_ignore_ascii_case(&application.name)
+                            || profile
+                                .application
                                 .executable
                                 .eq_ignore_ascii_case(&application.executable)
                     })
@@ -142,6 +147,7 @@ impl BridgeService {
         BridgeSnapshot {
             version: crate::BRIDGE_VERSION,
             platform: platform::platform_name(),
+            linux_distribution: platform::linux_distribution(),
             uptime_seconds: state.started_at.elapsed().as_secs(),
             active_games: state.active_games.clone(),
             games: state

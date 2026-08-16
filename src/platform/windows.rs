@@ -15,6 +15,10 @@ pub const fn platform_name() -> &'static str {
     "windows"
 }
 
+pub fn linux_distribution() -> Option<String> {
+    None
+}
+
 pub fn autostart_enabled() -> bool {
     let subkey = wide(RUN_SUBKEY);
     let value_name = wide(VALUE_NAME);
