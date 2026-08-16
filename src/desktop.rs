@@ -610,9 +610,8 @@ fn openmouse_icon_rgba() -> Result<(Vec<u8>, u32, u32)> {
 }
 
 fn openmouse_app_icon() -> Result<egui::IconData> {
-    let (mut rgba, width, height) =
-        decode_icon_rgba(include_bytes!("../assets/openmouse-macos-icon.png"))?;
-    apply_rounded_icon_mask(&mut rgba, width, height);
+    let (rgba, width, height) =
+        decode_icon_rgba(include_bytes!("../assets/openmouse-app-icon.png"))?;
     Ok(egui::IconData {
         rgba,
         width,
@@ -643,26 +642,6 @@ fn decode_icon_rgba(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
         _ => return Err(anyhow!("the icon must decode as RGB or RGBA")),
     };
     Ok((rgba, info.width, info.height))
-}
-
-fn apply_rounded_icon_mask(rgba: &mut [u8], width: u32, height: u32) {
-    let size = width.min(height) as f32;
-    let inset = size * 0.055;
-    let radius = size * 0.15;
-    let right = width as f32 - inset;
-    let bottom = height as f32 - inset;
-    for (index, pixel) in rgba.chunks_exact_mut(4).enumerate() {
-        let x = (index as u32 % width) as f32 + 0.5;
-        let y = (index as u32 / width) as f32 + 0.5;
-        let nearest_x = x.clamp(inset + radius, right - radius);
-        let nearest_y = y.clamp(inset + radius, bottom - radius);
-        let dx = x - nearest_x;
-        let dy = y - nearest_y;
-        if x < inset || x > right || y < inset || y > bottom || dx * dx + dy * dy > radius * radius
-        {
-            pixel[3] = 0;
-        }
-    }
 }
 
 fn tray_icon() -> Result<Icon> {
