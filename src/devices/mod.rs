@@ -106,7 +106,8 @@ impl DeviceManager {
         self.commands
             .send(Command::SetPolling { id, hz, reply: tx })
             .map_err(|_| anyhow!("the device worker is not running"))?;
-        rx.await.map_err(|_| anyhow!("the device worker dropped the request"))?
+        rx.await
+            .map_err(|_| anyhow!("the device worker dropped the request"))?
     }
 }
 
@@ -166,9 +167,7 @@ fn refresh(api: &mut HidApi, devices: &mut Vec<OpenDevice>) {
         .filter(|entry| attackshark::is_x11(entry.vendor_id(), entry.product_id()))
         .map(|entry| (entry.vendor_id(), entry.product_id()))
         .collect();
-    devices.retain(|device| {
-        present.contains(&(device.info.vendor_id, device.info.product_id))
-    });
+    devices.retain(|device| present.contains(&(device.info.vendor_id, device.info.product_id)));
 
     for entry in api.device_list() {
         let (vid, pid) = (entry.vendor_id(), entry.product_id());
@@ -183,7 +182,10 @@ fn refresh(api: &mut HidApi, devices: &mut Vec<OpenDevice>) {
         if !is_control {
             continue;
         }
-        if devices.iter().any(|device| device.info.vendor_id == vid && device.info.product_id == pid) {
+        if devices
+            .iter()
+            .any(|device| device.info.vendor_id == vid && device.info.product_id == pid)
+        {
             continue;
         }
         match entry.open_device(api) {
@@ -195,7 +197,11 @@ fn refresh(api: &mut HidApi, devices: &mut Vec<OpenDevice>) {
                     name: attackshark::model_name(pid).to_owned(),
                     vendor_id: vid,
                     product_id: pid,
-                    connection: if attackshark::is_wireless(pid) { "wireless" } else { "wired" },
+                    connection: if attackshark::is_wireless(pid) {
+                        "wireless"
+                    } else {
+                        "wired"
+                    },
                     battery_percent: None,
                     polling_rate_hz: read_polling(&handle),
                     supported_polling_rates: attackshark::supported_polling_rates(),
@@ -213,7 +219,9 @@ fn refresh(api: &mut HidApi, devices: &mut Vec<OpenDevice>) {
 
 /// Ask the mouse for its polling rate and decode the reply. Best-effort.
 fn read_polling(handle: &HidDevice) -> Option<u16> {
-    handle.send_feature_report(&attackshark::polling_read_request()).ok()?;
+    handle
+        .send_feature_report(&attackshark::polling_read_request())
+        .ok()?;
     let mut buffer = [0u8; REPORT_BUFFER];
     buffer[0] = attackshark::POLLING_REPORT_ID;
     let read = handle.get_feature_report(&mut buffer).ok()?;

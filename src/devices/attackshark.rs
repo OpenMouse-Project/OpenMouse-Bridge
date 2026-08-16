@@ -40,17 +40,11 @@ const BATTERY_SIGNATURE: [u8; 4] = [0x03, 0x55, 0x40, 0x01];
 
 /// Supported polling rates as (hz, wire code). The code is the value written
 /// at byte 3; the checksum byte is `0xff - code`.
-pub const POLLING_RATES: [(u16, u8); 4] = [
-    (125, 0x08),
-    (250, 0x04),
-    (500, 0x02),
-    (1000, 0x01),
-];
+pub const POLLING_RATES: [(u16, u8); 4] = [(125, 0x08), (250, 0x04), (500, 0x02), (1000, 0x01)];
 
 /// True when a VID/PID pair is an X11-family unit this module understands.
 pub fn is_x11(vendor_id: u16, product_id: u16) -> bool {
-    vendor_id == X11_VID
-        && matches!(product_id, X11_WIRED_PID | X11_WIRELESS_PID | R1_PID)
+    vendor_id == X11_VID && matches!(product_id, X11_WIRED_PID | X11_WIRELESS_PID | R1_PID)
 }
 
 /// Human model name for a product id.
@@ -96,7 +90,16 @@ pub fn polling_packet(hz: u16) -> Option<[u8; 9]> {
 /// Encode the read-request that asks the mouse to publish its current polling
 /// rate on `POLLING_REPORT_ID`. Byte 0 is the `READ_REQUEST_REPORT_ID`.
 pub fn polling_read_request() -> [u8; 8] {
-    [READ_REQUEST_REPORT_ID, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]
+    [
+        READ_REQUEST_REPORT_ID,
+        0x00,
+        0x01,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+    ]
 }
 
 /// Decode a polling-rate feature report read back from the mouse. `report`

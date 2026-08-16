@@ -119,9 +119,10 @@ async fn set_device_polling(
     Path(id): Path<String>,
     Json(payload): Json<PollingPayload>,
 ) -> Result<Json<PollingResult>, (StatusCode, String)> {
-    let manager = state
-        .devices
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "native device support is unavailable".to_owned()))?;
+    let manager = state.devices.ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "native device support is unavailable".to_owned(),
+    ))?;
     let confirmed = manager
         .set_polling(id, payload.hz)
         .await

@@ -15,7 +15,9 @@ use eframe::egui::{
     self, Align, Color32, CornerRadius, Layout, RichText, Sense, Stroke, Vec2, ViewportCommand,
 };
 use openmouse_bridge::{
-    BRIDGE_PORT, BRIDGE_VERSION, api, config, devices::DeviceManager, platform,
+    BRIDGE_PORT, BRIDGE_VERSION, api, config,
+    devices::DeviceManager,
+    platform,
     service::{BridgeService, BridgeSnapshot},
 };
 #[cfg(target_os = "windows")]
