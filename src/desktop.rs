@@ -823,6 +823,7 @@ fn profile_summary(
         egui::Align2::CENTER_BOTTOM,
         profile
             .and_then(|profile| profile.settings.dpi)
+            .filter(|&dpi| dpi > 0)
             .map_or_else(|| "—".to_owned(), |dpi| dpi.to_string()),
         value_font.clone(),
         TEXT,
@@ -840,6 +841,7 @@ fn profile_summary(
         egui::Align2::RIGHT_BOTTOM,
         profile
             .and_then(|profile| profile.settings.polling_rate_hz)
+            .filter(|&rate| rate > 0)
             .map_or_else(|| "—".to_owned(), |rate| format!("{rate} Hz")),
         value_font,
         TEXT,
