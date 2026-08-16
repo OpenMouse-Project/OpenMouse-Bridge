@@ -50,13 +50,79 @@ jobs:
             openmouse-bridge-windows-x64.zip
             openmouse-bridge-windows-x64.zip.sha256
           if-no-files-found: error
-      - name: Publish rolling development release
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+  linux-build:
+    name: Linux release artifact
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --locked
+      # The WinUSB driver folder is Windows-only, so it is not bundled here.
+      - name: Package
+        run: |
+          tar -czf openmouse-bridge-linux-x64.tar.gz README.md -C target/release openmouse-bridge
+          sha256sum openmouse-bridge-linux-x64.tar.gz > openmouse-bridge-linux-x64.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openmouse-bridge-linux-x64
+          path: |
+            openmouse-bridge-linux-x64.tar.gz
+            openmouse-bridge-linux-x64.tar.gz.sha256
+          if-no-files-found: error
+
+  macos-build:
+    name: macOS release artifact
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Build universal binary
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          lipo -create \
+            target/aarch64-apple-darwin/release/openmouse-bridge \
+            target/x86_64-apple-darwin/release/openmouse-bridge \
+            -output openmouse-bridge
+          chmod +x openmouse-bridge
+      # The WinUSB driver folder is Windows-only, so it is not bundled here.
+      - name: Package
+        run: |
+          zip openmouse-bridge-macos-universal.zip openmouse-bridge README.md
+          shasum -a 256 openmouse-bridge-macos-universal.zip > openmouse-bridge-macos-universal.zip.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openmouse-bridge-macos-universal
+          path: |
+            openmouse-bridge-macos-universal.zip
+            openmouse-bridge-macos-universal.zip.sha256
+          if-no-files-found: error
+
+  dev-release:
+    name: Publish rolling development release
+    needs: [windows-build, linux-build, macos-build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Publish dev-build
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: pwsh
         run: |
-          if (gh release view dev-build 2>$null) {
-            gh release delete dev-build --cleanup-tag --yes
-          }
-          gh release create dev-build --target $env:GITHUB_SHA --prerelease --title "Development build" --notes "Automatic Windows build from main at $env:GITHUB_SHA." openmouse-bridge-windows-x64.zip openmouse-bridge-windows-x64.zip.sha256
+          if gh release view dev-build --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete dev-build --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+          fi
+          gh release create dev-build \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "Development build" \
+            --notes "Automatic Windows, Linux, and macOS build from main at $GITHUB_SHA." \
+            artifacts/*

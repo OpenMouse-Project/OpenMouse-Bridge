@@ -38,6 +38,26 @@ jobs:
             openmouse-bridge-windows-x64.zip
             openmouse-bridge-windows-x64.zip.sha256
 
+  linux:
+    name: Linux x64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      # The WinUSB driver folder is Windows-only, so it is not bundled here.
+      - name: Package
+        run: |
+          tar -czf openmouse-bridge-linux-x64.tar.gz README.md -C target/release openmouse-bridge
+          sha256sum openmouse-bridge-linux-x64.tar.gz > openmouse-bridge-linux-x64.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bridge-linux
+          path: |
+            openmouse-bridge-linux-x64.tar.gz
+            openmouse-bridge-linux-x64.tar.gz.sha256
+
   macos:
     name: macOS universal
     runs-on: macos-14
@@ -67,7 +87,7 @@ jobs:
 
   release:
     name: Publish stable release
-    needs: [windows, macos]
+    needs: [windows, linux, macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -83,16 +83,95 @@ explicit configuration file.
 Only configured web origins receive CORS access. The listener never binds to a
 LAN or public interface.
 
-## Attack Shark - Beta Bridge (Under Testing)
-- `GET /v1/devices` returns the devices
-- `PUT /v1/devices/{id}/polling` changes polling rate
+## Attack Shark — Beta Bridge (Under Testing)
+
+> ⚠️ **Beta.** Native device control is new and still being validated on
+> hardware. It changes DPI and polling rate only, never touches firmware, and is
+> fully reversible — but treat it as experimental.
+
+Some mice keep their configuration channel on a USB interface the browser is not
+allowed to reach. The **Attack Shark X11** is the hard case: its HID descriptor
+declares no feature reports, so neither WebHID nor the OS HID API can configure
+it (on Windows, `HidD_SetFeature` returns `ERROR_INVALID_FUNCTION`). Bridge
+solves this the same way the reference driver does — it claims **USB interface
+2** and sends raw control transfers with [`nusb`](https://crates.io/crates/nusb),
+bypassing HID entirely.
+
+**Supported devices** (VID `0x1d57`): Attack Shark X11 wireless receiver
+(`0xfa60`) and wired (`0xfa55`), and the Attack Shark R1 (`0xfa61`).
+
+**What works today:** six-stage DPI (50–22000, in 50 steps), polling rate
+(125/250/500/1000 Hz), and battery on the wireless receiver. Lighting and macros
+are not implemented yet.
+
+### Setup is required per platform
+
+Reaching interface 2 raw needs a suitable driver bound to it. This is a one-time
+step; the mouse keeps working as a normal mouse throughout (pointing and
+clicking are on a different interface and are never touched).
+
+#### Windows — bind interface 2 to WinUSB
+
+Windows must hand interface 2 to the **WinUSB** driver. The easiest path is in
+OpenMouse itself: open **Interface settings → Bridge → Native devices** and
+click **“Enable native control”**. Bridge installs a small, scoped WinUSB driver
+package for interface 2 of the Attack Shark (self-signed and trusted on your
+machine, behind one Windows admin prompt). **Remove driver** in the same place
+reverts it.
+
+The driver package and its scripts live in [`driver/`](driver). To install it
+manually instead, run [`driver/sign-and-install.ps1`](driver/sign-and-install.ps1)
+from an **administrator** PowerShell, or use [Zadig](https://zadig.akeo.ie) to
+assign **WinUSB** to the device's **Interface 2**. See
+[`driver/README.md`](driver/README.md) for details, safety notes, and how to
+sign for distribution. Nothing here writes firmware, and only interface 2 of the
+three known product IDs is ever affected.
+
+#### Linux — add a udev rule
+
+`nusb` detaches the kernel HID driver from interface 2 automatically; it only
+needs permission to open the device. Create a udev rule granting the logged-in
+user access to the Attack Shark:
+
+```sh
+sudo tee /etc/udev/rules.d/70-openmouse-attackshark.rules >/dev/null <<'RULE'
+# Attack Shark X11 / R1 (VID 1d57) — allow the local user to configure it.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1d57", MODE="0660", TAG+="uaccess"
+RULE
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+Then unplug and replug the mouse. No Zadig or driver swap is needed on Linux.
+
+#### macOS
+
+Untested. `nusb` can claim interfaces on macOS, but the Attack Shark path has not
+been validated there yet.
+
+### Device API
+
+- `GET /v1/devices` — list attached Attack Shark devices with their current
+  state: `id` (`"1d57:fa60"`), `name`, `connection` (`"wired"`/`"wireless"`),
+  `controllable` (true once the driver is bound), `batteryPercent`,
+  `pollingRateHz`, `supportedPollingRates`, `dpiStages`, `activeDpiStage`, and
+  the DPI range (`dpiMin`/`dpiMax`/`dpiStep`).
+- `PUT /v1/devices/{id}/polling` — `{ hz }`. Set the polling rate.
+- `PUT /v1/devices/{id}/dpi` — `{ stages, activeStage }`. Write all six DPI
+  stages (an array) and the active stage (1-based).
+- `PUT /v1/driver` — `{ action: "install" | "uninstall" }` (Windows only). Runs
+  the WinUSB driver install/removal behind a UAC prompt.
+
+A device is only `controllable` after its interface 2 is bound (WinUSB on
+Windows, or the udev rule on Linux); until then it is still listed so the UI can
+explain what is needed.
 
 ## Current boundary
 
-Battery readings initially come from the connected OpenMouse control panel.
-True alerts while the browser is closed require native HID/protocol support in
-Bridge and are a later milestone. Game detection already runs independently in
-the background.
+For most mice, battery readings come from the connected OpenMouse control panel
+via `PUT /v1/battery`. Natively supported devices (currently the Attack Shark,
+see above) are read directly over USB, so their low-battery alerts fire even
+while the browser is closed. Extending native battery and control to more mice
+is ongoing. Game detection already runs independently in the background.
 
 ## Verify
 
