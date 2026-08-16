@@ -206,9 +206,10 @@ fn refresh(devices: &mut Vec<OpenDevice>) {
             continue;
         }
 
+        let id = format!("{vid:04x}:{pid:04x}");
         let (interface, controllable, note) = match claim(&entry) {
             Ok(interface) => {
-                tracing::info!(device = %format!("{vid:04x}:{pid:04x}"), "claimed Attack Shark interface 2 for native control");
+                tracing::info!(device = %id, "claimed Attack Shark interface 2 for native control");
                 (
                     Some(interface),
                     true,
@@ -227,7 +228,7 @@ fn refresh(devices: &mut Vec<OpenDevice>) {
 
         devices.push(OpenDevice {
             info: DeviceInfo {
-                id: format!("{vid:04x}:{pid:04x}"),
+                id,
                 name: attackshark::model_name(pid).to_owned(),
                 vendor_id: vid,
                 product_id: pid,
