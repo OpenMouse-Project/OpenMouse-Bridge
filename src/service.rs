@@ -178,6 +178,31 @@ impl BridgeService {
         self.inner.read().await.config.clone()
     }
 
+    /// Persisted settings for one native device, if any.
+    pub async fn device_settings(&self, id: &str) -> Option<config::DeviceSettings> {
+        self.inner
+            .read()
+            .await
+            .config
+            .device_settings
+            .get(id)
+            .cloned()
+    }
+
+    /// Remember a native device's settings across restarts.
+    pub async fn save_device_settings(
+        &self,
+        id: String,
+        settings: config::DeviceSettings,
+    ) -> Result<()> {
+        let config = {
+            let mut state = self.inner.write().await;
+            state.config.device_settings.insert(id, settings);
+            state.config.clone()
+        };
+        config::save(&self.config_path, &config)
+    }
+
     pub async fn applications(&self) -> Vec<ApplicationInfo> {
         self.inner.read().await.applications.clone()
     }

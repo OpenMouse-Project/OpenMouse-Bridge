@@ -1,4 +1,4 @@
-use std::{env, fs, path::PathBuf};
+use std::{collections::HashMap, env, fs, path::PathBuf};
 
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
@@ -9,6 +9,7 @@ const DEFAULT_ALERT_COOLDOWN_MINUTES: u64 = 360;
 const OFFICIAL_ORIGINS: &[&str] = &[
     "https://dev.openmouse.app",
     "https://openmouse.app",
+    "https://openmouse-sable.vercel.app", // Debuging by viix0dev
     "https://www.openmouse.app",
 ];
 
@@ -27,6 +28,19 @@ pub struct BridgeConfig {
     pub default_profile: Option<ApplicationProfile>,
     #[serde(default = "default_origins")]
     pub allowed_origins: Vec<String>,
+    /// Persisted per-device settings (e.g. Attack Shark DPI/polling), keyed by
+    /// device id like `"1d57:fa60"`, so they survive Bridge restarts.
+    #[serde(default)]
+    pub device_settings: HashMap<String, DeviceSettings>,
+}
+
+/// Native device settings the Bridge remembers across restarts.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceSettings {
+    pub dpi_stages: Vec<u16>,
+    pub active_dpi_stage: u8,
+    pub polling_rate_hz: Option<u16>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -75,6 +89,7 @@ impl Default for BridgeConfig {
             profiles: Vec::new(),
             default_profile: None,
             allowed_origins: default_origins(),
+            device_settings: HashMap::new(),
         }
     }
 }
@@ -190,6 +205,7 @@ fn default_origins() -> Vec<String> {
         "https://dev.openmouse.app".to_owned(),
         "https://openmouse.app".to_owned(),
         "https://www.openmouse.app".to_owned(),
+        "https://openmouse-sable.vercel.app".to_owned(), // Debuging by viix0dev
         "http://localhost:5173".to_owned(),
         "http://127.0.0.1:5173".to_owned(),
     ]
@@ -211,6 +227,7 @@ mod tests {
             profiles: Vec::new(),
             default_profile: None,
             allowed_origins: Vec::new(),
+            device_settings: HashMap::new(),
         }
         .normalized();
         assert_eq!(config.battery_threshold_percent, 100);

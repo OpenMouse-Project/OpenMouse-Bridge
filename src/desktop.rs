@@ -15,9 +15,12 @@ use eframe::egui::{
     self, Align, Color32, CornerRadius, Layout, RichText, Sense, Stroke, Vec2, ViewportCommand,
 };
 use openmouse_bridge::{
-    BRIDGE_PORT, BRIDGE_VERSION, api, config, platform,
+    BRIDGE_PORT, BRIDGE_VERSION, api, config,
+    devices::DeviceManager,
+    logging, platform,
     service::{BridgeService, BridgeSnapshot},
 };
+use std::path::Path;
 #[cfg(target_os = "windows")]
 use std::ptr::null_mut;
 use tokio::{net::TcpListener, sync::oneshot};
@@ -129,10 +132,10 @@ pub fn run() -> Result<()> {
     let app_icon = Arc::new(openmouse_app_icon()?);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([420.0, 300.0])
+            .with_inner_size([420.0, 380.0])
             .with_min_inner_size([420.0, 300.0])
-            .with_max_inner_size([420.0, 300.0])
-            .with_resizable(false)
+            .with_max_inner_size([420.0, 720.0])
+            .with_resizable(true)
             .with_decorations(false)
             .with_icon(app_icon)
             .with_transparent(true),
@@ -160,6 +163,7 @@ fn run_server(events: Sender<DesktopEvent>, shutdown: oneshot::Receiver<()>) -> 
         let origins = bridge_config.allowed_origins.clone();
         let service = BridgeService::new(bridge_config, path.clone());
         service.start_game_monitor();
+        let devices = DeviceManager::start(service.clone());
 
         let snapshot_service = service.clone();
         let snapshot_events = events.clone();
@@ -189,7 +193,7 @@ fn run_server(events: Sender<DesktopEvent>, shutdown: oneshot::Receiver<()>) -> 
         };
         tracing::info!(%address, config = %path.display(), "OpenMouse Bridge is ready");
         let _ = events.send(DesktopEvent::Ready);
-        axum::serve(listener, api::router(service, &origins))
+        axum::serve(listener, api::router(service, devices, &origins))
             .with_graceful_shutdown(async {
                 let _ = shutdown.await;
             })
@@ -435,6 +439,32 @@ impl BridgeDesktop {
                 });
                 ui.add_space(4.0);
                 ui.separator();
+                ui.horizontal(|ui| {
+                    ui.set_min_height(26.0);
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("Diagnostic log").color(TEXT).size(11.0));
+                        ui.label(
+                            RichText::new("Share this file when reporting a device issue")
+                                .color(MUTED)
+                                .size(9.0),
+                        );
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let open = egui::Button::new(
+                            RichText::new("Open logs folder").color(TEXT).size(10.0),
+                        )
+                        .fill(SURFACE)
+                        .stroke(Stroke::new(1.0, BORDER))
+                        .corner_radius(CornerRadius::same(6));
+                        if ui.add(open).clicked()
+                            && let Err(error) = open_path(&logging::log_dir())
+                        {
+                            self.error = Some(error.to_string());
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                ui.separator();
                 setting_row(ui, "Version", BRIDGE_VERSION);
             });
     }
@@ -519,30 +549,36 @@ impl eframe::App for BridgeDesktop {
             .show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
                 self.title_bar(ui);
-                egui::Frame::new()
-                    .inner_margin(20.0)
-                    .show(ui, |ui| match self.page {
-                        DesktopPage::Home => {
-                            self.status_card(ui);
-                            ui.add_space(8.0);
-                            self.activity(ui);
-                            ui.add_space(12.0);
-                            let button = egui::Button::new(
-                                RichText::new("Open OpenMouse")
-                                    .color(BACKGROUND)
-                                    .strong()
-                                    .size(12.0),
-                            )
-                            .fill(ACCENT)
-                            .stroke(Stroke::NONE)
-                            .corner_radius(CornerRadius::same(6));
-                            if ui.add_sized([ui.available_width(), 34.0], button).clicked()
-                                && let Err(error) = open_openmouse()
-                            {
-                                self.error = Some(error.to_string());
-                            }
-                        }
-                        DesktopPage::Settings => self.settings(ui),
+                // The Settings page can grow taller than the fixed window, so
+                // let the body scroll instead of clipping.
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        egui::Frame::new()
+                            .inner_margin(20.0)
+                            .show(ui, |ui| match self.page {
+                                DesktopPage::Home => {
+                                    self.status_card(ui);
+                                    ui.add_space(8.0);
+                                    self.activity(ui);
+                                    ui.add_space(12.0);
+                                    let button = egui::Button::new(
+                                        RichText::new("Open OpenMouse")
+                                            .color(BACKGROUND)
+                                            .strong()
+                                            .size(12.0),
+                                    )
+                                    .fill(ACCENT)
+                                    .stroke(Stroke::NONE)
+                                    .corner_radius(CornerRadius::same(6));
+                                    if ui.add_sized([ui.available_width(), 34.0], button).clicked()
+                                        && let Err(error) = open_openmouse()
+                                    {
+                                        self.error = Some(error.to_string());
+                                    }
+                                }
+                                DesktopPage::Settings => self.settings(ui),
+                            });
                     });
             });
     }
@@ -787,6 +823,7 @@ fn profile_summary(
         egui::Align2::CENTER_BOTTOM,
         profile
             .and_then(|profile| profile.settings.dpi)
+            .filter(|&dpi| dpi > 0)
             .map_or_else(|| "—".to_owned(), |dpi| dpi.to_string()),
         value_font.clone(),
         TEXT,
@@ -804,6 +841,7 @@ fn profile_summary(
         egui::Align2::RIGHT_BOTTOM,
         profile
             .and_then(|profile| profile.settings.polling_rate_hz)
+            .filter(|&rate| rate > 0)
             .map_or_else(|| "—".to_owned(), |rate| format!("{rate} Hz")),
         value_font,
         TEXT,
@@ -838,6 +876,44 @@ fn open_openmouse() -> Result<()> {
         .context("macOS could not open OpenMouse")?;
     if !status.success() {
         return Err(anyhow!("macOS could not open OpenMouse"));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn open_path(path: &Path) -> Result<()> {
+    // Ensure the folder exists so Explorer has somewhere to open.
+    let _ = std::fs::create_dir_all(path);
+    let operation = wide("open");
+    let target = wide(&path.to_string_lossy());
+    let result = unsafe {
+        ShellExecuteW(
+            null_mut(),
+            operation.as_ptr(),
+            target.as_ptr(),
+            null_mut(),
+            null_mut(),
+            SW_SHOWNORMAL,
+        )
+    } as isize;
+    if result <= 32 {
+        return Err(anyhow!(
+            "Windows could not open {} (code {result})",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn open_path(path: &Path) -> Result<()> {
+    let _ = std::fs::create_dir_all(path);
+    let status = std::process::Command::new("open")
+        .arg(path)
+        .status()
+        .context("macOS could not open the logs folder")?;
+    if !status.success() {
+        return Err(anyhow!("macOS could not open {}", path.display()));
     }
     Ok(())
 }

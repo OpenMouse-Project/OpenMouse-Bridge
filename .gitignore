@@ -1,1 +1,5 @@
 /target
+
+# The driver catalog is generated and signed per-machine by the install script;
+# it must never be committed or shipped (a self-signed .cat is useless elsewhere).
+*.cat

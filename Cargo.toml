@@ -12,13 +12,15 @@ winresource = "0.1"
 anyhow = "1.0"
 axum = "0.8"
 directories = "6.0"
+nusb = "0.1"
 notify-rust = "4.11"
 png = "0.18"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sysinfo = "0.37"
+tracing-appender = "0.2"
 tokio = { version = "1.47", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
-tower-http = { version = "0.6", features = ["cors", "set-header", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

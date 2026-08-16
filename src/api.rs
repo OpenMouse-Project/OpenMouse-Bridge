@@ -3,18 +3,34 @@ use std::time::Duration;
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, State},
+    extract::{FromRef, Path, State},
     http::{HeaderValue, Method, Response, StatusCode, header},
     routing::{get, put},
 };
 use serde::{Deserialize, Serialize};
-use tower_http::{cors::CorsLayer, set_header::SetResponseHeaderLayer, trace::TraceLayer};
+use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 use crate::{
     config::{ApplicationProfile, GameConfig},
+    devices::{DeviceInfo, DeviceManager},
     platform,
     service::{BatteryReading, BridgeService},
 };
+
+/// Everything the HTTP handlers share. `FromRef` lets existing handlers keep
+/// extracting `State<BridgeService>` unchanged while new ones reach the
+/// device manager.
+#[derive(Clone)]
+pub struct AppState {
+    service: BridgeService,
+    devices: Option<DeviceManager>,
+}
+
+impl FromRef<AppState> for BridgeService {
+    fn from_ref(state: &AppState) -> Self {
+        state.service.clone()
+    }
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,15 +56,53 @@ struct ProfilesPayload {
     profiles: Vec<ApplicationProfile>,
 }
 
-pub fn router(service: BridgeService, origins: &[String]) -> Router {
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PollingPayload {
+    hz: u16,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PollingResult {
+    ok: bool,
+    polling_rate_hz: u16,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DpiPayload {
+    stages: Vec<u16>,
+    active_stage: u8,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DriverPayload {
+    /// "install" or "uninstall".
+    action: String,
+}
+
+pub fn router(
+    service: BridgeService,
+    devices: Option<DeviceManager>,
+    origins: &[String],
+) -> Router {
     let allowed: Vec<HeaderValue> = origins
         .iter()
         .filter_map(|origin| origin.parse().ok())
         .collect();
+    // allow_private_network puts `Access-Control-Allow-Private-Network: true`
+    // on the CORS preflight itself. A public HTTPS origin (the deployed site)
+    // reaching this loopback server is a private-network request, and the
+    // browser only accepts it when that header is on the *preflight* response.
+    // A separate response-header layer cannot do this: CorsLayer answers the
+    // preflight OPTIONS directly and never calls inner layers.
     let cors = CorsLayer::new()
         .allow_origin(allowed)
         .allow_methods([Method::GET, Method::PUT])
         .allow_headers([axum::http::header::CONTENT_TYPE])
+        .allow_private_network(true)
         .max_age(Duration::from_secs(3600));
     Router::new()
         .route("/v1/status", get(status))
@@ -60,13 +114,72 @@ pub fn router(service: BridgeService, origins: &[String]) -> Router {
         .route("/v1/default-profile", put(set_default_profile))
         .route("/v1/battery", put(record_battery))
         .route("/v1/autostart", put(set_autostart))
-        .layer(SetResponseHeaderLayer::if_not_present(
-            axum::http::HeaderName::from_static("access-control-allow-private-network"),
-            HeaderValue::from_static("true"),
-        ))
+        .route("/v1/devices", get(list_devices))
+        .route("/v1/devices/{id}/polling", put(set_device_polling))
+        .route("/v1/devices/{id}/dpi", put(set_device_dpi))
+        .route("/v1/driver", put(driver_action))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
-        .with_state(service)
+        .with_state(AppState { service, devices })
+}
+
+async fn list_devices(State(state): State<AppState>) -> Json<Vec<DeviceInfo>> {
+    match state.devices {
+        Some(manager) => Json(manager.list().await),
+        None => Json(Vec::new()),
+    }
+}
+
+async fn set_device_polling(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<PollingPayload>,
+) -> Result<Json<PollingResult>, (StatusCode, String)> {
+    let manager = state.devices.ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "native device support is unavailable".to_owned(),
+    ))?;
+    let confirmed = manager
+        .set_polling(id, payload.hz)
+        .await
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    Ok(Json(PollingResult {
+        ok: true,
+        polling_rate_hz: confirmed,
+    }))
+}
+
+async fn set_device_dpi(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<DpiPayload>,
+) -> Result<Json<ApiResult>, (StatusCode, String)> {
+    let manager = state.devices.ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "native device support is unavailable".to_owned(),
+    ))?;
+    manager
+        .set_dpi(id, payload.stages, payload.active_stage)
+        .await
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    Ok(Json(ApiResult { ok: true }))
+}
+
+/// Install or remove the WinUSB driver package so the config interface becomes
+/// reachable (Windows only). Runs behind a UAC prompt and may block, so it hops
+/// to a blocking thread.
+async fn driver_action(
+    Json(payload): Json<DriverPayload>,
+) -> Result<Json<ApiResult>, (StatusCode, String)> {
+    let outcome = tokio::task::spawn_blocking(move || match payload.action.as_str() {
+        "install" => crate::driver::install(),
+        "uninstall" => crate::driver::uninstall(),
+        other => Err(anyhow::anyhow!("unknown driver action: {other}")),
+    })
+    .await
+    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    outcome.map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    Ok(Json(ApiResult { ok: true }))
 }
 
 async fn status(State(service): State<BridgeService>) -> Json<crate::service::BridgeSnapshot> {
