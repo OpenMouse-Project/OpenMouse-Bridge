@@ -16,6 +16,28 @@ use crate::{
     platform,
 };
 
+fn normalized_name(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn is_registered_game(application: &ApplicationInfo, games: &[GameConfig]) -> bool {
+    let application_name = normalized_name(&application.name);
+    let executable = application.executable.to_ascii_lowercase();
+    let executable_stem = executable.strip_suffix(".exe").unwrap_or(&executable);
+    games.iter().any(|game| {
+        normalized_name(&game.name) == application_name
+            || normalized_name(&game.name) == normalized_name(executable_stem)
+            || game
+                .executables
+                .iter()
+                .any(|registered| registered.eq_ignore_ascii_case(&application.executable))
+    })
+}
+
 #[derive(Clone)]
 pub struct BridgeService {
     inner: Arc<RwLock<BridgeState>>,
@@ -91,23 +113,26 @@ impl BridgeService {
             .iter()
             .find(|application| application.foreground)
             .cloned();
-        let active_profile = foreground_application.as_ref().and_then(|application| {
-            state
-                .config
-                .profiles
-                .iter()
-                .find(|profile| {
-                    profile
-                        .application
-                        .path
-                        .eq_ignore_ascii_case(&application.path)
-                        || profile
+        let active_profile = foreground_application
+            .as_ref()
+            .and_then(|application| {
+                state
+                    .config
+                    .profiles
+                    .iter()
+                    .find(|profile| {
+                        profile
                             .application
-                            .executable
-                            .eq_ignore_ascii_case(&application.executable)
-                })
-                .cloned()
-        });
+                            .path
+                            .eq_ignore_ascii_case(&application.path)
+                            || profile
+                                .application
+                                .executable
+                                .eq_ignore_ascii_case(&application.executable)
+                    })
+                    .cloned()
+            })
+            .or_else(|| state.config.default_profile.clone());
         BridgeSnapshot {
             version: crate::BRIDGE_VERSION,
             platform: platform::platform_name(),
@@ -162,6 +187,16 @@ impl BridgeService {
         let config = {
             let mut state = self.inner.write().await;
             state.config.profiles = profiles;
+            state.config = state.config.clone().normalized();
+            state.config.clone()
+        };
+        config::save(&self.config_path, &config)
+    }
+
+    pub async fn set_default_profile(&self, profile: ApplicationProfile) -> Result<()> {
+        let config = {
+            let mut state = self.inner.write().await;
+            state.config.default_profile = Some(profile);
             state.config = state.config.clone().normalized();
             state.config.clone()
         };
@@ -226,7 +261,10 @@ impl BridgeService {
                 interval.tick().await;
                 let games = service.inner.read().await.config.games.clone();
                 let active = detector.detect(&games);
-                let applications = applications::visible_applications();
+                let applications = applications::visible_applications()
+                    .into_iter()
+                    .filter(|application| is_registered_game(application, &games))
+                    .collect::<Vec<_>>();
                 let missing_icons = {
                     let state = service.inner.read().await;
                     applications
@@ -283,5 +321,33 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn application_picker_only_accepts_catalog_games() {
+        let games = vec![GameConfig {
+            name: "Counter-Strike 2".into(),
+            executables: vec!["cs2.exe".into()],
+        }];
+        let application = |name: &str, executable: &str| ApplicationInfo {
+            name: name.into(),
+            executable: executable.into(),
+            path: executable.into(),
+            foreground: false,
+            icon_id: "icon".into(),
+        };
+
+        assert!(is_registered_game(
+            &application("Counter-Strike 2", "cs2"),
+            &games
+        ));
+        assert!(is_registered_game(
+            &application("Counter-Strike 2", "cs2.exe"),
+            &games
+        ));
+        assert!(!is_registered_game(
+            &application("Google Chrome", "chrome.exe"),
+            &games
+        ));
     }
 }

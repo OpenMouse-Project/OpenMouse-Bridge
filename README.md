@@ -64,9 +64,13 @@ explicit configuration file.
 - `GET /v1/games` returns the full executable catalog currently being tracked.
 - `PUT /v1/games` adds or updates custom tracked games and persists them. Bundled
   catalog entries are retained so a client cannot accidentally disable detection.
-- `GET /v1/applications` lists visible Windows applications and identifies the
-  foreground application. Each item includes an `iconId`; requesting
+- `GET /v1/applications` lists running games and identifies the foreground
+  game. Only applications from the registered catalog are
+  returned. Each item includes an `iconId`; requesting
   `GET /v1/applications/{iconId}/icon` returns its extracted icon as a PNG.
+- `PUT /v1/default-profile` keeps Bridge synchronized with the mouse and
+  settings currently selected in OpenMouse. Bridge shows this profile whenever
+  no game-specific profile is active.
 - `GET /v1/profiles` reads saved application profiles; `PUT /v1/profiles`
   replaces and persists them.
 - `PUT /v1/battery` accepts `{ deviceId, deviceName, percent, charging }` and

@@ -23,6 +23,8 @@ pub struct BridgeConfig {
     pub games: Vec<GameConfig>,
     #[serde(default)]
     pub profiles: Vec<ApplicationProfile>,
+    #[serde(default)]
+    pub default_profile: Option<ApplicationProfile>,
     #[serde(default = "default_origins")]
     pub allowed_origins: Vec<String>,
 }
@@ -71,6 +73,7 @@ impl Default for BridgeConfig {
             alert_cooldown_minutes: DEFAULT_ALERT_COOLDOWN_MINUTES,
             games: crate::games::catalog(),
             profiles: Vec::new(),
+            default_profile: None,
             allowed_origins: default_origins(),
         }
     }
@@ -119,6 +122,17 @@ impl BridgeConfig {
                 .eq_ignore_ascii_case(&right.application.path)
                 && left.device.id == right.device.id
         });
+        if let Some(profile) = &mut self.default_profile {
+            profile.application.name = profile.application.name.trim().to_owned();
+            profile.device.id = profile.device.id.trim().to_owned();
+            profile.device.name = profile.device.name.trim().to_owned();
+            if profile.application.name.is_empty()
+                || profile.device.id.is_empty()
+                || profile.device.name.is_empty()
+            {
+                self.default_profile = None;
+            }
+        }
         for origin in OFFICIAL_ORIGINS {
             if !self.allowed_origins.iter().any(|entry| entry == origin) {
                 self.allowed_origins.push((*origin).to_owned());
@@ -195,6 +209,7 @@ mod tests {
                 executables: vec![" VALORANT-Win64-Shipping.exe ".into(), "".into()],
             }],
             profiles: Vec::new(),
+            default_profile: None,
             allowed_origins: Vec::new(),
         }
         .normalized();

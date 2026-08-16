@@ -56,6 +56,7 @@ pub fn router(service: BridgeService, origins: &[String]) -> Router {
         .route("/v1/applications", get(applications))
         .route("/v1/applications/{icon_id}/icon", get(application_icon))
         .route("/v1/profiles", get(profiles).put(replace_profiles))
+        .route("/v1/default-profile", put(set_default_profile))
         .route("/v1/battery", put(record_battery))
         .route("/v1/autostart", put(set_autostart))
         .layer(SetResponseHeaderLayer::if_not_present(
@@ -106,6 +107,17 @@ async fn replace_profiles(
 ) -> Result<Json<ApiResult>, (StatusCode, String)> {
     service
         .replace_profiles(payload.profiles)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(ApiResult { ok: true }))
+}
+
+async fn set_default_profile(
+    State(service): State<BridgeService>,
+    Json(profile): Json<ApplicationProfile>,
+) -> Result<Json<ApiResult>, (StatusCode, String)> {
+    service
+        .set_default_profile(profile)
         .await
         .map_err(internal_error)?;
     Ok(Json(ApiResult { ok: true }))
