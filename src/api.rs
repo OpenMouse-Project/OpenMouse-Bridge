@@ -71,6 +71,13 @@ struct PollingResult {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct DpiPayload {
+    stages: Vec<u16>,
+    active_stage: u8,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct DriverPayload {
     /// "install" or "uninstall".
     action: String,
@@ -109,6 +116,7 @@ pub fn router(
         .route("/v1/autostart", put(set_autostart))
         .route("/v1/devices", get(list_devices))
         .route("/v1/devices/{id}/polling", put(set_device_polling))
+        .route("/v1/devices/{id}/dpi", put(set_device_dpi))
         .route("/v1/driver", put(driver_action))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
@@ -139,6 +147,22 @@ async fn set_device_polling(
         ok: true,
         polling_rate_hz: confirmed,
     }))
+}
+
+async fn set_device_dpi(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<DpiPayload>,
+) -> Result<Json<ApiResult>, (StatusCode, String)> {
+    let manager = state.devices.ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "native device support is unavailable".to_owned(),
+    ))?;
+    manager
+        .set_dpi(id, payload.stages, payload.active_stage)
+        .await
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    Ok(Json(ApiResult { ok: true }))
 }
 
 /// Install or remove the WinUSB driver package so the config interface becomes

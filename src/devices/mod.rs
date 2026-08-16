@@ -36,6 +36,8 @@ const CONTROL_TIMEOUT: Duration = Duration::from_millis(1000);
 const BATTERY_READ_WINDOW: Duration = Duration::from_millis(250);
 /// Battery interrupt reads use a 64-byte buffer (the endpoint's packet size).
 const BATTERY_BUFFER: usize = 64;
+/// Default DPI stages shown before the user sets their own.
+const DEFAULT_DPI_STAGES: [u16; attackshark::DPI_STAGE_COUNT] = [400, 800, 1600, 3200, 6400, 12000];
 
 /// A mouse the Bridge can see natively, as reported to the web app.
 #[derive(Clone, Debug, Serialize)]
@@ -53,6 +55,14 @@ pub struct DeviceInfo {
     pub battery_percent: Option<u8>,
     pub polling_rate_hz: Option<u16>,
     pub supported_polling_rates: Vec<u16>,
+    /// The six DPI stages, as last set through the Bridge. The mouse does not
+    /// report its own, so these start at defaults and track what we write.
+    pub dpi_stages: Vec<u16>,
+    /// Active DPI stage, 1-based.
+    pub active_dpi_stage: u8,
+    pub dpi_min: u16,
+    pub dpi_max: u16,
+    pub dpi_step: u16,
     /// User-facing explanation of the device's current state.
     pub note: &'static str,
 }
@@ -64,6 +74,12 @@ enum Command {
         id: String,
         hz: u16,
         reply: oneshot::Sender<Result<u16>>,
+    },
+    SetDpi {
+        id: String,
+        stages: Vec<u16>,
+        active_stage: u8,
+        reply: oneshot::Sender<Result<()>>,
     },
 }
 
@@ -106,6 +122,22 @@ impl DeviceManager {
         rx.await
             .map_err(|_| anyhow!("the device worker dropped the request"))?
     }
+
+    /// Set the six DPI stages and active stage on one device.
+    pub async fn set_dpi(&self, id: String, stages: Vec<u16>, active_stage: u8) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.commands
+            .send(Command::SetDpi {
+                id,
+                stages,
+                active_stage,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| anyhow!("the device worker is not running"))?;
+        rx.await
+            .map_err(|_| anyhow!("the device worker dropped the request"))?
+    }
 }
 
 /// One attached device. `interface` is `None` when interface 2 could not be
@@ -130,6 +162,9 @@ async fn worker(mut commands: mpsc::Receiver<Command>, service: BridgeService) {
                 }
                 Some(Command::SetPolling { id, hz, reply }) => {
                     let _ = reply.send(set_polling(&mut devices, &id, hz).await);
+                }
+                Some(Command::SetDpi { id, stages, active_stage, reply }) => {
+                    let _ = reply.send(set_dpi(&mut devices, &id, &stages, active_stage).await);
                 }
                 None => break,
             },
@@ -205,6 +240,13 @@ fn refresh(devices: &mut Vec<OpenDevice>) {
                 battery_percent: None,
                 polling_rate_hz: None,
                 supported_polling_rates: attackshark::supported_polling_rates(),
+                // The mouse does not report its stages, so start from sensible
+                // defaults; they update as the user writes new ones.
+                dpi_stages: DEFAULT_DPI_STAGES.to_vec(),
+                active_dpi_stage: 2,
+                dpi_min: attackshark::DPI_MIN,
+                dpi_max: attackshark::DPI_MAX,
+                dpi_step: attackshark::DPI_STEP,
                 note,
             },
             interface,
@@ -255,6 +297,66 @@ async fn set_polling(devices: &mut [OpenDevice], id: &str, hz: u16) -> Result<u1
     device.info.polling_rate_hz = Some(hz);
     tracing::info!(device = %device.info.id, hz, "set polling rate over USB");
     Ok(hz)
+}
+
+/// Send the DPI/stage command as a HID SET_REPORT control transfer (wValue
+/// 0x0304). The wireless adapter takes the full 56-byte report; wired X11/R1
+/// take the 52-byte form (checksum-terminated), matching the reference driver.
+async fn set_dpi(
+    devices: &mut [OpenDevice],
+    id: &str,
+    stages: &[u16],
+    active_stage: u8,
+) -> Result<()> {
+    let device = devices
+        .iter_mut()
+        .find(|device| device.info.id == id)
+        .ok_or_else(|| anyhow!("no attached device with id {id}"))?;
+    let interface = device.interface.as_ref().ok_or_else(|| {
+        anyhow!(
+            "this mouse is detected but interface 2 is not claimable; on Windows bind it to \
+             WinUSB with Zadig first"
+        )
+    })?;
+
+    let stage_array: [u16; attackshark::DPI_STAGE_COUNT] = stages
+        .try_into()
+        .map_err(|_| anyhow!("expected {} DPI stages", attackshark::DPI_STAGE_COUNT))?;
+    let packet =
+        attackshark::dpi_packet(stage_array, active_stage, false, true).ok_or_else(|| {
+            anyhow!(
+                "invalid DPI request: stages must be {}–{} and the active stage 1–{}",
+                attackshark::DPI_MIN,
+                attackshark::DPI_MAX,
+                attackshark::DPI_STAGE_COUNT
+            )
+        })?;
+    // Wired variants expect the shorter, checksum-terminated report.
+    let data: &[u8] = if attackshark::is_wireless(device.info.product_id) {
+        &packet
+    } else {
+        &packet[..52]
+    };
+
+    let transfer = interface.control_out(ControlOut {
+        control_type: ControlType::Class,
+        recipient: Recipient::Interface,
+        request: attackshark::SET_REPORT_REQUEST,
+        value: attackshark::DPI_WVALUE,
+        index: u16::from(attackshark::CONTROL_INTERFACE),
+        data,
+    });
+    let completion = tokio::time::timeout(CONTROL_TIMEOUT, transfer)
+        .await
+        .map_err(|_| anyhow!("the DPI command timed out"))?;
+    completion
+        .status
+        .map_err(|error| anyhow!("the mouse rejected the DPI command: {error}"))?;
+
+    device.info.dpi_stages = stage_array.to_vec();
+    device.info.active_dpi_stage = active_stage;
+    tracing::info!(device = %device.info.id, ?stage_array, active_stage, "set DPI over USB");
+    Ok(())
 }
 
 /// Best-effort battery sample: read one interrupt packet from the battery
