@@ -190,6 +190,24 @@ pub fn parse_battery(report: &[u8]) -> Option<u8> {
     (percent <= 100).then_some(percent)
 }
 
+/// Prefix of the DPI-button notification. When the physical DPI button cycles
+/// the active stage, the mouse pushes `03 55 10 <stage> 00` on the same
+/// interrupt endpoint as battery; byte 3 is the new active stage (1-based).
+/// (Battery uses `03 55 40 01 …`; byte 2 — 0x10 vs 0x40 — tells them apart.)
+const DPI_NOTIFY_PREFIX: [u8; 3] = [0x03, 0x55, 0x10];
+
+/// Decode a DPI-button notification, returning the new active stage (1..=6), or
+/// `None` for any other packet.
+pub fn parse_dpi_stage(report: &[u8]) -> Option<u8> {
+    if report.len() < 4 || report[..3] != DPI_NOTIFY_PREFIX {
+        return None;
+    }
+    let stage = report[3];
+    (1..=DPI_STAGE_COUNT as u8)
+        .contains(&stage)
+        .then_some(stage)
+}
+
 /// DPI value → sensor byte, ascending by DPI. From the reference driver's
 /// dpi-map.ts. Codes above 10000 intentionally repeat lower codes; the
 /// stage mask and high-stage flags select the sensor's register page.
@@ -604,6 +622,19 @@ mod tests {
     #[test]
     fn dpi_control_transfer_wvalue_matches_reference() {
         assert_eq!(DPI_WVALUE, 0x0304);
+    }
+
+    #[test]
+    fn dpi_button_notification_reports_active_stage() {
+        // Captured from hardware: cycling the DPI button pushes 03 55 10 <stage> 00.
+        assert_eq!(parse_dpi_stage(&[0x03, 0x55, 0x10, 0x01, 0x00]), Some(1));
+        assert_eq!(parse_dpi_stage(&[0x03, 0x55, 0x10, 0x06, 0x00]), Some(6));
+        // Battery packets and out-of-range stages are not DPI notifications.
+        assert_eq!(parse_dpi_stage(&[0x03, 0x55, 0x40, 0x01, 0x64]), None);
+        assert_eq!(parse_dpi_stage(&[0x03, 0x55, 0x10, 0x07, 0x00]), None);
+        assert_eq!(parse_dpi_stage(&[0x03, 0x55, 0x10]), None);
+        // ...and battery decoding still ignores a DPI packet.
+        assert_eq!(parse_battery(&[0x03, 0x55, 0x10, 0x03, 0x00]), None);
     }
 
     #[test]

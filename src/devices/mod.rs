@@ -374,6 +374,7 @@ async fn poll_battery(devices: &mut [OpenDevice], service: &BridgeService) {
         };
 
         let mut latest_battery: Option<u8> = None;
+        let mut latest_stage: Option<u8> = None;
         // Cap the drain so a chatty device cannot stall the worker.
         for _ in 0..8 {
             let transfer = interface.interrupt_in(
@@ -387,37 +388,39 @@ async fn poll_battery(devices: &mut [OpenDevice], service: &BridgeService) {
                 break;
             }
 
-            // Diagnostic: log the raw packet so DPI-button (and other) reports
-            // can be identified. `battery` is set when it matches the known
-            // battery signature; anything else is a candidate to decode.
-            let hex: String = completion
-                .data
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect();
-            let battery = attackshark::parse_battery(&completion.data);
-            tracing::info!(device = %device.info.id, packet = %hex, ?battery, "interrupt IN packet");
-
-            if let Some(percent) = battery {
+            let data = &completion.data;
+            if let Some(percent) = attackshark::parse_battery(data) {
                 latest_battery = Some(percent);
+            } else if let Some(stage) = attackshark::parse_dpi_stage(data) {
+                latest_stage = Some(stage);
+            } else {
+                // Unrecognized report — log it for future decoding.
+                let hex: String = data.iter().map(|byte| format!("{byte:02x}")).collect();
+                tracing::debug!(device = %device.info.id, packet = %hex, "unknown interrupt IN packet");
             }
         }
 
-        let Some(percent) = latest_battery else {
-            continue;
-        };
-        if device.info.battery_percent == Some(percent) {
-            continue;
+        // The physical DPI button changed the active stage; reflect it.
+        if let Some(stage) = latest_stage
+            && device.info.active_dpi_stage != stage
+        {
+            device.info.active_dpi_stage = stage;
+            tracing::info!(device = %device.info.id, stage, "DPI stage changed on the mouse");
         }
-        device.info.battery_percent = Some(percent);
-        let reading = BatteryReading {
-            device_id: device.info.id.clone(),
-            device_name: device.info.name.clone(),
-            percent,
-            charging: false,
-        };
-        if let Err(error) = service.record_battery(reading).await {
-            tracing::debug!(%error, "could not record native battery reading");
+
+        if let Some(percent) = latest_battery
+            && device.info.battery_percent != Some(percent)
+        {
+            device.info.battery_percent = Some(percent);
+            let reading = BatteryReading {
+                device_id: device.info.id.clone(),
+                device_name: device.info.name.clone(),
+                percent,
+                charging: false,
+            };
+            if let Err(error) = service.record_battery(reading).await {
+                tracing::debug!(%error, "could not record native battery reading");
+            }
         }
     }
 }
