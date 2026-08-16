@@ -8,7 +8,7 @@ use axum::{
     routing::{get, put},
 };
 use serde::{Deserialize, Serialize};
-use tower_http::{cors::CorsLayer, set_header::SetResponseHeaderLayer, trace::TraceLayer};
+use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 use crate::{
     config::{ApplicationProfile, GameConfig},
@@ -78,10 +78,17 @@ pub fn router(
         .iter()
         .filter_map(|origin| origin.parse().ok())
         .collect();
+    // allow_private_network puts `Access-Control-Allow-Private-Network: true`
+    // on the CORS preflight itself. A public HTTPS origin (the deployed site)
+    // reaching this loopback server is a private-network request, and the
+    // browser only accepts it when that header is on the *preflight* response.
+    // A separate response-header layer cannot do this: CorsLayer answers the
+    // preflight OPTIONS directly and never calls inner layers.
     let cors = CorsLayer::new()
         .allow_origin(allowed)
         .allow_methods([Method::GET, Method::PUT])
         .allow_headers([axum::http::header::CONTENT_TYPE])
+        .allow_private_network(true)
         .max_age(Duration::from_secs(3600));
     Router::new()
         .route("/v1/status", get(status))
@@ -95,10 +102,6 @@ pub fn router(
         .route("/v1/autostart", put(set_autostart))
         .route("/v1/devices", get(list_devices))
         .route("/v1/devices/{id}/polling", put(set_device_polling))
-        .layer(SetResponseHeaderLayer::if_not_present(
-            axum::http::HeaderName::from_static("access-control-allow-private-network"),
-            HeaderValue::from_static("true"),
-        ))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(AppState { service, devices })

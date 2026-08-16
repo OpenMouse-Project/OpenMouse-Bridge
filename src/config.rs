@@ -191,6 +191,7 @@ fn default_origins() -> Vec<String> {
         "https://dev.openmouse.app".to_owned(),
         "https://openmouse.app".to_owned(),
         "https://www.openmouse.app".to_owned(),
+        "https://openmouse-sable.vercel.app".to_owned(), // Debuging by viix0dev
         "http://localhost:5173".to_owned(),
         "http://127.0.0.1:5173".to_owned(),
     ]
