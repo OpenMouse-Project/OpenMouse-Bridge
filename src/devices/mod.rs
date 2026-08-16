@@ -207,7 +207,13 @@ fn refresh(api: &mut HidApi, devices: &mut Vec<OpenDevice>) {
                     supported_polling_rates: attackshark::supported_polling_rates(),
                     note: "Battery and polling rate are read natively; other settings still require the desktop driver.",
                 };
-                tracing::info!(device = %info.id, "opened Attack Shark control interface");
+                tracing::info!(
+                    device = %info.id,
+                    interface = entry.interface_number(),
+                    usage_page = format_args!("{:#06x}", entry.usage_page()),
+                    usage = format_args!("{:#06x}", entry.usage()),
+                    "opened Attack Shark control interface",
+                );
                 devices.push(OpenDevice { info, handle });
             }
             Err(error) => {
@@ -218,14 +224,31 @@ fn refresh(api: &mut HidApi, devices: &mut Vec<OpenDevice>) {
 }
 
 /// Ask the mouse for its polling rate and decode the reply. Best-effort.
+///
+/// The X11's HID descriptor declares no feature reports, so on Windows the HID
+/// API can reject these calls outright (HidD_Set/GetFeature validate the buffer
+/// length against the descriptor). We log the exact error so a failing unit
+/// tells us whether the HID path is viable or whether raw USB (WinUSB/Zadig) is
+/// required, rather than silently reporting "unknown".
 fn read_polling(handle: &HidDevice) -> Option<u16> {
-    handle
-        .send_feature_report(&attackshark::polling_read_request())
-        .ok()?;
+    if let Err(error) = handle.send_feature_report(&attackshark::polling_read_request()) {
+        tracing::warn!(%error, "polling read-request (feature report 0xa0) was refused");
+        return None;
+    }
     let mut buffer = [0u8; REPORT_BUFFER];
     buffer[0] = attackshark::POLLING_REPORT_ID;
-    let read = handle.get_feature_report(&mut buffer).ok()?;
-    attackshark::parse_polling_reply(&buffer[..read])
+    let read = match handle.get_feature_report(&mut buffer) {
+        Ok(read) => read,
+        Err(error) => {
+            tracing::warn!(%error, "polling read-back (feature report 0x06) was refused");
+            return None;
+        }
+    };
+    let parsed = attackshark::parse_polling_reply(&buffer[..read]);
+    if parsed.is_none() {
+        tracing::warn!(bytes = ?&buffer[..read], "polling read-back did not decode");
+    }
+    parsed
 }
 
 fn set_polling(devices: &mut [OpenDevice], id: &str, hz: u16) -> Result<u16> {
@@ -238,15 +261,34 @@ fn set_polling(devices: &mut [OpenDevice], id: &str, hz: u16) -> Result<u16> {
     device
         .handle
         .send_feature_report(&packet)
-        .map_err(|error| anyhow!("the mouse refused the polling command: {error}"))?;
+        .map_err(|error| {
+            anyhow!(
+                "the mouse refused the polling command (HID feature report 0x06): {error}. \
+             This mouse declares no HID feature reports, so Windows likely needs the \
+             interface bound to WinUSB (Zadig) and a raw-USB transport."
+            )
+        })?;
 
-    // Confirm the mouse actually kept the new rate before reporting success.
-    let confirmed = read_polling(&device.handle).unwrap_or(hz);
-    if confirmed != hz {
-        return Err(anyhow!("the mouse kept {confirmed} Hz instead of {hz} Hz"));
+    // Try to confirm the mouse kept the new rate. The read-back can fail on
+    // this device even when the write lands, so distinguish the two: a hard
+    // mismatch is an error, but an unreadable rate is reported as "sent,
+    // unverified" rather than a false success.
+    match read_polling(&device.handle) {
+        Some(confirmed) if confirmed == hz => {
+            device.info.polling_rate_hz = Some(confirmed);
+            Ok(confirmed)
+        }
+        Some(other) => Err(anyhow!("the mouse kept {other} Hz instead of {hz} Hz")),
+        None => {
+            // Write was accepted but the rate is not read-backable here.
+            device.info.polling_rate_hz = Some(hz);
+            tracing::info!(
+                hz,
+                "polling command sent; rate is not read-backable on this unit"
+            );
+            Ok(hz)
+        }
     }
-    device.info.polling_rate_hz = Some(confirmed);
-    Ok(confirmed)
 }
 
 /// Drain any pending battery input reports and push them into the service so

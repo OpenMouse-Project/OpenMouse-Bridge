@@ -17,9 +17,10 @@ use eframe::egui::{
 use openmouse_bridge::{
     BRIDGE_PORT, BRIDGE_VERSION, api, config,
     devices::DeviceManager,
-    platform,
+    logging, platform,
     service::{BridgeService, BridgeSnapshot},
 };
+use std::path::Path;
 #[cfg(target_os = "windows")]
 use std::ptr::null_mut;
 use tokio::{net::TcpListener, sync::oneshot};
@@ -438,6 +439,32 @@ impl BridgeDesktop {
                 });
                 ui.add_space(4.0);
                 ui.separator();
+                ui.horizontal(|ui| {
+                    ui.set_min_height(26.0);
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("Diagnostic log").color(TEXT).size(11.0));
+                        ui.label(
+                            RichText::new("Share this file when reporting a device issue")
+                                .color(MUTED)
+                                .size(9.0),
+                        );
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let open = egui::Button::new(
+                            RichText::new("Open logs folder").color(TEXT).size(10.0),
+                        )
+                        .fill(SURFACE)
+                        .stroke(Stroke::new(1.0, BORDER))
+                        .corner_radius(CornerRadius::same(6));
+                        if ui.add(open).clicked()
+                            && let Err(error) = open_path(&logging::log_dir())
+                        {
+                            self.error = Some(error.to_string());
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                ui.separator();
                 setting_row(ui, "Version", BRIDGE_VERSION);
             });
     }
@@ -841,6 +868,44 @@ fn open_openmouse() -> Result<()> {
         .context("macOS could not open OpenMouse")?;
     if !status.success() {
         return Err(anyhow!("macOS could not open OpenMouse"));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn open_path(path: &Path) -> Result<()> {
+    // Ensure the folder exists so Explorer has somewhere to open.
+    let _ = std::fs::create_dir_all(path);
+    let operation = wide("open");
+    let target = wide(&path.to_string_lossy());
+    let result = unsafe {
+        ShellExecuteW(
+            null_mut(),
+            operation.as_ptr(),
+            target.as_ptr(),
+            null_mut(),
+            null_mut(),
+            SW_SHOWNORMAL,
+        )
+    } as isize;
+    if result <= 32 {
+        return Err(anyhow!(
+            "Windows could not open {} (code {result})",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn open_path(path: &Path) -> Result<()> {
+    let _ = std::fs::create_dir_all(path);
+    let status = std::process::Command::new("open")
+        .arg(path)
+        .status()
+        .context("macOS could not open the logs folder")?;
+    if !status.success() {
+        return Err(anyhow!("macOS could not open {}", path.display()));
     }
     Ok(())
 }
