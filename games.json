@@ -1,0 +1,15 @@
+[
+  { "name": "Rainbow Six Siege", "executables": ["RainbowSix.exe", "RainbowSix_Vulkan.exe"] },
+  { "name": "Valorant", "executables": ["VALORANT-Win64-Shipping.exe"] },
+  { "name": "Overwatch 2", "executables": ["Overwatch.exe"] },
+  { "name": "Apex Legends", "executables": ["r5apex.exe", "r5apex_dx12.exe"] },
+  { "name": "Counter-Strike 2", "executables": ["cs2.exe"] },
+  { "name": "Marvel Rivals", "executables": ["Marvel-Win64-Shipping.exe"] },
+  { "name": "Fortnite", "executables": ["FortniteClient-Win64-Shipping.exe"] },
+  { "name": "Escape from Tarkov", "executables": ["EscapeFromTarkov.exe"] },
+  { "name": "League of Legends", "executables": ["League of Legends.exe"] },
+  { "name": "Dota 2", "executables": ["dota2.exe"] },
+  { "name": "Call of Duty", "executables": ["cod.exe"] },
+  { "name": "PUBG: Battlegrounds", "executables": ["TslGame.exe"] },
+  { "name": "THE FINALS", "executables": ["Discovery.exe"] }
+]

@@ -1,7 +1,11 @@
 use std::{
     io::Cursor,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
     thread,
     time::Duration,
 };
@@ -17,6 +21,10 @@ use openmouse_bridge::{
 #[cfg(target_os = "windows")]
 use std::ptr::null_mut;
 use tokio::{net::TcpListener, sync::oneshot};
+use tray_icon::{
+    Icon, TrayIcon, TrayIconBuilder,
+    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
 
@@ -28,11 +36,54 @@ const BORDER: Color32 = Color32::from_rgb(55, 59, 65);
 const TEXT: Color32 = Color32::from_rgb(239, 241, 243);
 const MUTED: Color32 = Color32::from_rgb(151, 157, 166);
 const ACCENT: Color32 = Color32::from_rgb(105, 210, 141);
+const TRAY_SHOW: &str = "openmouse.show";
+const TRAY_OPEN: &str = "openmouse.open";
+const TRAY_QUIT: &str = "openmouse.quit";
 
 enum DesktopEvent {
     Ready,
-    Snapshot(BridgeSnapshot),
+    Snapshot(Box<BridgeSnapshot>),
     ServerError(String),
+}
+
+struct TrayState {
+    _icon: TrayIcon,
+}
+
+impl TrayState {
+    fn new(context: &egui::Context, quitting: Arc<AtomicBool>) -> Result<Self> {
+        let show = MenuItem::with_id(TRAY_SHOW, "Show Bridge", true, None);
+        let open = MenuItem::with_id(TRAY_OPEN, "Open OpenMouse", true, None);
+        let separator = PredefinedMenuItem::separator();
+        let quit = MenuItem::with_id(TRAY_QUIT, "Quit OpenMouse Bridge", true, None);
+        let menu = Menu::with_items(&[&show, &open, &separator, &quit])
+            .context("could not create the tray menu")?;
+        let icon = tray_icon().context("could not create the tray icon image")?;
+        let icon = TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_tooltip("OpenMouse Bridge")
+            .with_icon(icon)
+            .build()
+            .context("could not create the system tray icon")?;
+
+        let tray_context = context.clone();
+        MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+            if event.id == TRAY_SHOW {
+                tray_context.send_viewport_cmd(ViewportCommand::Visible(true));
+                tray_context.send_viewport_cmd(ViewportCommand::Minimized(false));
+                tray_context.send_viewport_cmd(ViewportCommand::Focus);
+            } else if event.id == TRAY_OPEN {
+                if let Err(error) = open_openmouse() {
+                    tracing::error!(%error, "Could not open OpenMouse from the tray");
+                }
+            } else if event.id == TRAY_QUIT {
+                quitting.store(true, Ordering::Release);
+                tray_context.send_viewport_cmd(ViewportCommand::Close);
+            }
+        }));
+
+        Ok(Self { _icon: icon })
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -75,6 +126,7 @@ impl BackgroundServer {
 pub fn run() -> Result<()> {
     let (event_tx, event_rx) = mpsc::channel();
     let server = BackgroundServer::start(event_tx)?;
+    let app_icon = Arc::new(openmouse_app_icon()?);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([420.0, 300.0])
@@ -82,6 +134,7 @@ pub fn run() -> Result<()> {
             .with_max_inner_size([420.0, 300.0])
             .with_resizable(false)
             .with_decorations(false)
+            .with_icon(app_icon)
             .with_transparent(true),
         centered: true,
         renderer: eframe::Renderer::Glow,
@@ -115,7 +168,9 @@ fn run_server(events: Sender<DesktopEvent>, shutdown: oneshot::Receiver<()>) -> 
             loop {
                 interval.tick().await;
                 if snapshot_events
-                    .send(DesktopEvent::Snapshot(snapshot_service.snapshot().await))
+                    .send(DesktopEvent::Snapshot(Box::new(
+                        snapshot_service.snapshot().await,
+                    )))
                     .is_err()
                 {
                     break;
@@ -151,6 +206,8 @@ struct BridgeDesktop {
     snapshot: Option<BridgeSnapshot>,
     server_ready: bool,
     error: Option<String>,
+    _tray: Option<TrayState>,
+    quitting: Arc<AtomicBool>,
 }
 
 impl BridgeDesktop {
@@ -199,6 +256,15 @@ impl BridgeDesktop {
             egui::TextureOptions::LINEAR,
         );
 
+        let quitting = Arc::new(AtomicBool::new(false));
+        let tray = match TrayState::new(&context.egui_ctx, Arc::clone(&quitting)) {
+            Ok(tray) => Some(tray),
+            Err(error) => {
+                tracing::error!(%error, "Could not initialize the system tray");
+                None
+            }
+        };
+
         Self {
             events,
             valorant_logo,
@@ -207,6 +273,8 @@ impl BridgeDesktop {
             snapshot: None,
             server_ready: false,
             error: None,
+            _tray: tray,
+            quitting,
         }
     }
 
@@ -214,7 +282,7 @@ impl BridgeDesktop {
         while let Ok(event) = self.events.try_recv() {
             match event {
                 DesktopEvent::Ready => self.server_ready = true,
-                DesktopEvent::Snapshot(snapshot) => self.snapshot = Some(snapshot),
+                DesktopEvent::Snapshot(snapshot) => self.snapshot = Some(*snapshot),
                 DesktopEvent::ServerError(error) => self.error = Some(error),
             }
         }
@@ -240,6 +308,14 @@ impl BridgeDesktop {
     }
 
     fn activity(&self, ui: &mut egui::Ui) {
+        let active_game = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.active_games.first());
+        let active_profile = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.active_profile.as_ref());
         let width = ui.available_width();
         egui::Frame::new()
             .fill(SURFACE_RAISED)
@@ -249,18 +325,38 @@ impl BridgeDesktop {
             .show(ui, |ui| {
                 ui.set_min_width(width - 24.0);
                 ui.horizontal(|ui| {
-                    valorant_icon(ui, &self.valorant_logo);
-                    ui.label(RichText::new("Valorant").color(TEXT).strong().size(12.0));
+                    match active_game {
+                        Some(game) if game == "Valorant" => {
+                            valorant_icon(ui, &self.valorant_logo);
+                        }
+                        Some(game) => game_icon(ui, game),
+                        None => idle_icon(ui),
+                    }
+                    ui.label(
+                        RichText::new(
+                            active_game
+                                .map(String::as_str)
+                                .unwrap_or("No supported game detected"),
+                        )
+                        .color(if active_game.is_some() { TEXT } else { MUTED })
+                        .strong()
+                        .size(12.0),
+                    );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new("RUNNING").color(ACCENT).strong().size(10.0));
+                        let (label, color) = if active_game.is_some() {
+                            ("RUNNING", ACCENT)
+                        } else {
+                            ("IDLE", MUTED)
+                        };
+                        ui.label(RichText::new(label).color(color).strong().size(10.0));
                         let (dot, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
-                        ui.painter().circle_filled(dot.center(), 3.0, ACCENT);
+                        ui.painter().circle_filled(dot.center(), 3.0, color);
                     });
                 });
                 ui.add_space(4.0);
                 ui.separator();
                 ui.add_space(4.0);
-                profile_summary(ui);
+                profile_summary(ui, active_profile);
             });
     }
 
@@ -376,7 +472,9 @@ impl BridgeDesktop {
                     .frame(false)
                     .min_size(Vec2::new(24.0, 24.0));
                 if controls.add(close).on_hover_text("Close Bridge").clicked() {
-                    controls.ctx().send_viewport_cmd(ViewportCommand::Close);
+                    controls
+                        .ctx()
+                        .send_viewport_cmd(ViewportCommand::Visible(false));
                 }
                 let minimize = egui::Button::new(RichText::new("−").color(MUTED).size(16.0))
                     .frame(false)
@@ -400,6 +498,12 @@ impl eframe::App for BridgeDesktop {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.receive_events();
+        if ui.ctx().input(|input| input.viewport().close_requested())
+            && !self.quitting.load(Ordering::Acquire)
+        {
+            ui.ctx().send_viewport_cmd(ViewportCommand::CancelClose);
+            ui.ctx().send_viewport_cmd(ViewportCommand::Visible(false));
+        }
         ui.ctx().request_repaint_after(Duration::from_millis(500));
 
         egui::Frame::new()
@@ -442,6 +546,26 @@ fn valorant_icon(ui: &mut egui::Ui, texture: &egui::TextureHandle) {
     ui.add(egui::Image::new(texture).fit_to_exact_size(Vec2::new(40.0, 24.0)));
 }
 
+fn game_icon(ui: &mut egui::Ui, game: &str) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(40.0, 24.0), Sense::hover());
+    ui.painter().circle_filled(rect.center(), 11.0, SURFACE);
+    let initial = game.chars().next().unwrap_or('?').to_string();
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        initial,
+        egui::FontId::proportional(11.0),
+        TEXT,
+    );
+}
+
+fn idle_icon(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(40.0, 24.0), Sense::hover());
+    ui.painter()
+        .circle_stroke(rect.center(), 10.0, Stroke::new(1.0, BORDER));
+    ui.painter().circle_filled(rect.center(), 2.5, MUTED);
+}
+
 fn decode_png(bytes: &[u8]) -> egui::ColorImage {
     let decoder = png::Decoder::new(Cursor::new(bytes));
     let mut reader = decoder
@@ -460,6 +584,43 @@ fn decode_png(bytes: &[u8]) -> egui::ColorImage {
         [info.width as usize, info.height as usize],
         &pixels[..info.buffer_size()],
     )
+}
+
+fn openmouse_icon_rgba() -> Result<(Vec<u8>, u32, u32)> {
+    let mut decoder =
+        png::Decoder::new(Cursor::new(include_bytes!("../assets/openmouse-logo.png")));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder
+        .read_info()
+        .context("could not decode the OpenMouse logo")?;
+    let mut pixels = vec![
+        0;
+        reader
+            .output_buffer_size()
+            .expect("logo is within PNG limits")
+    ];
+    let info = reader
+        .next_frame(&mut pixels)
+        .context("could not read the OpenMouse logo")?;
+    if info.color_type != png::ColorType::Rgba {
+        return Err(anyhow!("the OpenMouse logo must decode as RGBA"));
+    }
+    pixels.truncate(info.buffer_size());
+    Ok((pixels, info.width, info.height))
+}
+
+fn openmouse_app_icon() -> Result<egui::IconData> {
+    let (rgba, width, height) = openmouse_icon_rgba()?;
+    Ok(egui::IconData {
+        rgba,
+        width,
+        height,
+    })
+}
+
+fn tray_icon() -> Result<Icon> {
+    let (rgba, width, height) = openmouse_icon_rgba()?;
+    Icon::from_rgba(rgba, width, height).context("could not create the OpenMouse tray icon")
 }
 
 fn settings_button(ui: &mut egui::Ui) -> bool {
@@ -552,7 +713,10 @@ fn setting_row(ui: &mut egui::Ui, label: &str, value: &str) {
     });
 }
 
-fn profile_summary(ui: &mut egui::Ui) {
+fn profile_summary(
+    ui: &mut egui::Ui,
+    profile: Option<&openmouse_bridge::config::ApplicationProfile>,
+) {
     let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 38.0), Sense::hover());
     let painter = ui.painter();
@@ -571,7 +735,9 @@ fn profile_summary(ui: &mut egui::Ui) {
     painter.text(
         egui::pos2(rect.left(), value_y),
         egui::Align2::LEFT_BOTTOM,
-        "Valorant",
+        profile
+            .map(|profile| profile.application.name.as_str())
+            .unwrap_or("No saved profile"),
         value_font.clone(),
         TEXT,
     );
@@ -587,7 +753,9 @@ fn profile_summary(ui: &mut egui::Ui) {
     painter.text(
         egui::pos2(dpi_x, value_y),
         egui::Align2::CENTER_BOTTOM,
-        "800",
+        profile
+            .and_then(|profile| profile.settings.dpi)
+            .map_or_else(|| "—".to_owned(), |dpi| dpi.to_string()),
         value_font.clone(),
         TEXT,
     );
@@ -602,7 +770,9 @@ fn profile_summary(ui: &mut egui::Ui) {
     painter.text(
         egui::pos2(rect.right(), value_y),
         egui::Align2::RIGHT_BOTTOM,
-        "4000 Hz",
+        profile
+            .and_then(|profile| profile.settings.polling_rate_hz)
+            .map_or_else(|| "—".to_owned(), |rate| format!("{rate} Hz")),
         value_font,
         TEXT,
     );

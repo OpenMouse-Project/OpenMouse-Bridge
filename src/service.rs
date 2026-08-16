@@ -64,6 +64,7 @@ pub struct BridgeSnapshot {
     pub battery_threshold_percent: u8,
     pub autostart_enabled: bool,
     pub foreground_application: Option<ApplicationInfo>,
+    pub active_profile: Option<ApplicationProfile>,
     pub visible_application_count: usize,
     pub profile_count: usize,
 }
@@ -85,6 +86,28 @@ impl BridgeService {
 
     pub async fn snapshot(&self) -> BridgeSnapshot {
         let state = self.inner.read().await;
+        let foreground_application = state
+            .applications
+            .iter()
+            .find(|application| application.foreground)
+            .cloned();
+        let active_profile = foreground_application.as_ref().and_then(|application| {
+            state
+                .config
+                .profiles
+                .iter()
+                .find(|profile| {
+                    profile
+                        .application
+                        .path
+                        .eq_ignore_ascii_case(&application.path)
+                        || profile
+                            .application
+                            .executable
+                            .eq_ignore_ascii_case(&application.executable)
+                })
+                .cloned()
+        });
         BridgeSnapshot {
             version: crate::BRIDGE_VERSION,
             platform: platform::platform_name(),
@@ -102,11 +125,8 @@ impl BridgeService {
             tracked_game_count: state.config.games.len(),
             battery_threshold_percent: state.config.battery_threshold_percent,
             autostart_enabled: platform::autostart_enabled(),
-            foreground_application: state
-                .applications
-                .iter()
-                .find(|application| application.foreground)
-                .cloned(),
+            foreground_application,
+            active_profile,
             visible_application_count: state.applications.len(),
             profile_count: state.config.profiles.len(),
         }
@@ -132,6 +152,10 @@ impl BridgeService {
 
     pub async fn profiles(&self) -> Vec<ApplicationProfile> {
         self.inner.read().await.config.profiles.clone()
+    }
+
+    pub async fn games(&self) -> Vec<GameConfig> {
+        self.inner.read().await.config.games.clone()
     }
 
     pub async fn replace_profiles(&self, profiles: Vec<ApplicationProfile>) -> Result<()> {

@@ -52,7 +52,7 @@ pub fn router(service: BridgeService, origins: &[String]) -> Router {
         .max_age(Duration::from_secs(3600));
     Router::new()
         .route("/v1/status", get(status))
-        .route("/v1/games", put(replace_games))
+        .route("/v1/games", get(games).put(replace_games))
         .route("/v1/applications", get(applications))
         .route("/v1/applications/{icon_id}/icon", get(application_icon))
         .route("/v1/profiles", get(profiles).put(replace_profiles))
@@ -94,6 +94,10 @@ async fn application_icon(
 
 async fn profiles(State(service): State<BridgeService>) -> Json<Vec<ApplicationProfile>> {
     Json(service.profiles().await)
+}
+
+async fn games(State(service): State<BridgeService>) -> Json<Vec<GameConfig>> {
+    Json(service.games().await)
 }
 
 async fn replace_profiles(

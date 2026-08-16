@@ -69,7 +69,7 @@ impl Default for BridgeConfig {
         Self {
             battery_threshold_percent: DEFAULT_BATTERY_THRESHOLD,
             alert_cooldown_minutes: DEFAULT_ALERT_COOLDOWN_MINUTES,
-            games: Vec::new(),
+            games: crate::games::catalog(),
             profiles: Vec::new(),
             allowed_origins: default_origins(),
         }
@@ -80,6 +80,7 @@ impl BridgeConfig {
     pub fn normalized(mut self) -> Self {
         self.battery_threshold_percent = self.battery_threshold_percent.min(100);
         self.alert_cooldown_minutes = self.alert_cooldown_minutes.max(1);
+        crate::games::merge_catalog(&mut self.games);
         for game in &mut self.games {
             game.name = game.name.trim().to_owned();
             game.executables = game
@@ -93,6 +94,9 @@ impl BridgeConfig {
         }
         self.games
             .retain(|game| !game.name.is_empty() && !game.executables.is_empty());
+        self.games.sort_by(|left, right| left.name.cmp(&right.name));
+        self.games
+            .dedup_by(|left, right| left.name.eq_ignore_ascii_case(&right.name));
         for profile in &mut self.profiles {
             profile.application.name = profile.application.name.trim().to_owned();
             profile.application.executable = profile.application.executable.trim().to_owned();
@@ -196,8 +200,12 @@ mod tests {
         .normalized();
         assert_eq!(config.battery_threshold_percent, 100);
         assert_eq!(config.alert_cooldown_minutes, 1);
-        assert_eq!(config.games[0].name, "Valorant");
-        assert_eq!(config.games[0].executables, ["valorant-win64-shipping.exe"]);
+        let valorant = config
+            .games
+            .iter()
+            .find(|game| game.name == "Valorant")
+            .expect("Valorant should be in the built-in catalog");
+        assert_eq!(valorant.executables, ["valorant-win64-shipping.exe"]);
         assert!(
             config
                 .allowed_origins

@@ -17,8 +17,9 @@ The initial service provides:
 
 It does not run as an elevated Windows Service. It runs in the signed-in user's
 session, which is required for desktop notifications and avoids administrator
-permissions. Closing the status window currently stops Bridge; tray/background
-window behavior will follow with the desktop controls.
+permissions. Closing the status window hides it to the system tray while game
+detection and the loopback API continue running. The tray menu can restore the
+window, open OpenMouse, or explicitly quit Bridge.
 
 ## Run locally
 
@@ -29,7 +30,11 @@ cargo run
 ```
 
 Bridge creates `config.json` in the operating system's per-user application
-configuration directory. Add games there, for example:
+configuration directory. It automatically seeds and updates its tracked games
+from the bundled [`games.json`](games.json) catalog. Custom entries written via
+the API or added to the config are preserved when new catalog entries ship.
+
+The relevant part of the generated config looks like this:
 
 ```json
 {
@@ -56,7 +61,9 @@ explicit configuration file.
 
 - `GET /v1/status` reports the Bridge version, platform, active games, battery
   threshold, and autostart state.
-- `PUT /v1/games` replaces the tracked game list and persists it.
+- `GET /v1/games` returns the full executable catalog currently being tracked.
+- `PUT /v1/games` adds or updates custom tracked games and persists them. Bundled
+  catalog entries are retained so a client cannot accidentally disable detection.
 - `GET /v1/applications` lists visible Windows applications and identifies the
   foreground application. Each item includes an `iconId`; requesting
   `GET /v1/applications/{iconId}/icon` returns its extracted icon as a PNG.
