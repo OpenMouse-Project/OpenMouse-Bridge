@@ -83,6 +83,10 @@ explicit configuration file.
 Only configured web origins receive CORS access. The listener never binds to a
 LAN or public interface.
 
+## Attack Shark - Beta Bridge (Under Testing)
+- `GET /v1/devices` returns the devices
+- `PUT /v1/devices/{id}/polling` changes polling rate
+
 ## Current boundary
 
 Battery readings initially come from the connected OpenMouse control panel.
