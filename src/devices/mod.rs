@@ -360,34 +360,49 @@ async fn set_dpi(
     Ok(())
 }
 
-/// Best-effort battery sample: read one interrupt packet from the battery
-/// endpoint, and push a change into the service's low-battery notifier.
+/// Drain the interface-2 interrupt endpoint each cycle: record battery, and
+/// log every packet so we can discover what else the mouse reports (e.g. a
+/// notification when the physical DPI button is pressed). Draining catches
+/// packets that queued since the last poll, not just a single snapshot.
+///
+/// Runs for wired units too — only the battery signature is wireless-specific;
+/// a DPI-change notification (if any) could arrive on either.
 async fn poll_battery(devices: &mut [OpenDevice], service: &BridgeService) {
     for device in devices.iter_mut() {
-        if !attackshark::is_wireless(device.info.product_id) {
-            continue;
-        }
         let Some(interface) = device.interface.as_ref() else {
             continue;
         };
 
-        let transfer = interface.interrupt_in(
-            attackshark::BATTERY_ENDPOINT,
-            RequestBuffer::new(BATTERY_BUFFER),
-        );
-        let Ok(completion) = tokio::time::timeout(BATTERY_READ_WINDOW, transfer).await else {
-            continue; // No battery packet this cycle.
-        };
-        if completion.status.is_err() {
-            continue;
+        let mut latest_battery: Option<u8> = None;
+        // Cap the drain so a chatty device cannot stall the worker.
+        for _ in 0..8 {
+            let transfer = interface.interrupt_in(
+                attackshark::BATTERY_ENDPOINT,
+                RequestBuffer::new(BATTERY_BUFFER),
+            );
+            let Ok(completion) = tokio::time::timeout(BATTERY_READ_WINDOW, transfer).await else {
+                break; // Nothing more queued this cycle.
+            };
+            if completion.status.is_err() || completion.data.is_empty() {
+                break;
+            }
+
+            // Diagnostic: log the raw packet so DPI-button (and other) reports
+            // can be identified. `battery` is set when it matches the known
+            // battery signature; anything else is a candidate to decode.
+            let hex: String = completion.data.iter().map(|byte| format!("{byte:02x}")).collect();
+            let battery = attackshark::parse_battery(&completion.data);
+            tracing::info!(device = %device.info.id, packet = %hex, ?battery, "interrupt IN packet");
+
+            if let Some(percent) = battery {
+                latest_battery = Some(percent);
+            }
         }
-        let Some(percent) = attackshark::parse_battery(&completion.data) else {
-            continue;
-        };
+
+        let Some(percent) = latest_battery else { continue };
         if device.info.battery_percent == Some(percent) {
             continue;
         }
-
         device.info.battery_percent = Some(percent);
         let reading = BatteryReading {
             device_id: device.info.id.clone(),
