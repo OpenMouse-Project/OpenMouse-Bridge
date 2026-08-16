@@ -1,0 +1,70 @@
+; OpenMouse-AttackShark-X11.inf
+;
+; Binds Microsoft's in-box WinUSB.sys to the CONFIGURATION interface
+; (interface 2) of the Attack Shark X11 / R1 family so the OpenMouse Bridge can
+; send settings over raw USB. This is the same driver assignment Zadig makes,
+; but scoped and installed by us.
+;
+; SAFETY
+;   * No firmware is written. This only changes which Windows driver serves one
+;     USB interface. The mouse firmware is never modified, so it cannot be
+;     bricked by installing or removing this package.
+;   * It matches ONLY interface 2 (MI_02) of three specific product IDs. Windows
+;     binds drivers by exact hardware ID, so this package physically cannot
+;     attach to the pointing interface, the keyboard interface, or any other
+;     device. The sensor and buttons live on interface 1 and are never touched.
+;   * Fully reversible: remove the package (pnputil /delete-driver ... /uninstall
+;     or Device Manager) and Windows restores the default HID driver on the next
+;     reconnect.
+;
+; Interface 2 is the composite system-control/consumer interface. While it is
+; bound to WinUSB, that interface no longer acts as HID (its media keys, if any,
+; pause); pointing and clicking are unaffected.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = USBDevice
+ClassGuid   = {88BAE032-5A81-49F0-BC3D-A4FF138216D6}
+Provider    = %ProviderName%
+CatalogFile = OpenMouse-AttackShark-X11.cat
+DriverVer   = 08/16/2026,1.0.0.0
+PnpLockdown = 1
+
+; ---------------------------------------------------------------------------
+; Only interface 2 of the known X11-family product IDs is listed here, so the
+; driver store can never match this package against another interface, another
+; product, or another vendor.
+; ---------------------------------------------------------------------------
+[Manufacturer]
+%ProviderName% = OpenMouse, NTamd64, NTarm64
+
+[OpenMouse.NTamd64]
+%DeviceName.FA60% = USB_Install, USB\VID_1D57&PID_FA60&MI_02
+%DeviceName.FA55% = USB_Install, USB\VID_1D57&PID_FA55&MI_02
+%DeviceName.FA61% = USB_Install, USB\VID_1D57&PID_FA61&MI_02
+
+[OpenMouse.NTarm64]
+%DeviceName.FA60% = USB_Install, USB\VID_1D57&PID_FA60&MI_02
+%DeviceName.FA55% = USB_Install, USB\VID_1D57&PID_FA55&MI_02
+%DeviceName.FA61% = USB_Install, USB\VID_1D57&PID_FA61&MI_02
+
+[USB_Install]
+Include = winusb.inf
+Needs   = WINUSB.NT
+
+[USB_Install.Services]
+Include = winusb.inf
+Needs   = WINUSB.NT.Services
+
+[USB_Install.HW]
+AddReg = Dev_AddReg
+
+; Device interface GUID the OpenMouse Bridge uses to find this WinUSB device.
+[Dev_AddReg]
+HKR,,DeviceInterfaceGUIDs,0x10000,"{E001BC92-43DE-4903-A5D5-1FFE3E82900D}"
+
+[Strings]
+ProviderName    = "OpenMouse"
+DeviceName.FA60 = "Attack Shark X11 config interface (OpenMouse WinUSB)"
+DeviceName.FA55 = "Attack Shark X11 wired config interface (OpenMouse WinUSB)"
+DeviceName.FA61 = "Attack Shark R1 config interface (OpenMouse WinUSB)"

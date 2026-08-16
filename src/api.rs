@@ -69,6 +69,13 @@ struct PollingResult {
     polling_rate_hz: u16,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DriverPayload {
+    /// "install" or "uninstall".
+    action: String,
+}
+
 pub fn router(
     service: BridgeService,
     devices: Option<DeviceManager>,
@@ -102,6 +109,7 @@ pub fn router(
         .route("/v1/autostart", put(set_autostart))
         .route("/v1/devices", get(list_devices))
         .route("/v1/devices/{id}/polling", put(set_device_polling))
+        .route("/v1/driver", put(driver_action))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(AppState { service, devices })
@@ -131,6 +139,23 @@ async fn set_device_polling(
         ok: true,
         polling_rate_hz: confirmed,
     }))
+}
+
+/// Install or remove the WinUSB driver package so the config interface becomes
+/// reachable (Windows only). Runs behind a UAC prompt and may block, so it hops
+/// to a blocking thread.
+async fn driver_action(
+    Json(payload): Json<DriverPayload>,
+) -> Result<Json<ApiResult>, (StatusCode, String)> {
+    let outcome = tokio::task::spawn_blocking(move || match payload.action.as_str() {
+        "install" => crate::driver::install(),
+        "uninstall" => crate::driver::uninstall(),
+        other => Err(anyhow::anyhow!("unknown driver action: {other}")),
+    })
+    .await
+    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    outcome.map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    Ok(Json(ApiResult { ok: true }))
 }
 
 async fn status(State(service): State<BridgeService>) -> Json<crate::service::BridgeSnapshot> {

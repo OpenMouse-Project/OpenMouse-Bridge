@@ -12,7 +12,7 @@ winresource = "0.1"
 anyhow = "1.0"
 axum = "0.8"
 directories = "6.0"
-hidapi = "2.6"
+nusb = "0.1"
 notify-rust = "4.11"
 png = "0.18"
 serde = { version = "1.0", features = ["derive"] }

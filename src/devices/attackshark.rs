@@ -25,13 +25,25 @@ pub const X11_WIRED_PID: u16 = 0xfa55;
 pub const X11_WIRELESS_PID: u16 = 0xfa60;
 pub const R1_PID: u16 = 0xfa61;
 
-/// USB interface that carries the configuration feature reports.
-pub const CONTROL_INTERFACE: i32 = 2;
+/// USB interface that carries the configuration channel.
+pub const CONTROL_INTERFACE: u8 = 2;
 
+/// The config channel is reached with raw USB control transfers, exactly like
+/// the reference driver (dressedinblack5/attack-shark-x11-electron): a HID
+/// class SET_REPORT to interface 2. Windows' HID stack refuses these because
+/// the descriptor declares no feature reports, so this must go through a raw
+/// USB handle (WinUSB / Zadig on Windows, hidraw/libusb elsewhere).
+///
+/// bmRequestType 0x21 = Host->Device | Class | Interface.
+pub const SET_REPORT_REQUEST: u8 = 0x09;
+/// wValue high byte: HID report type 0x03 = Feature.
+pub const FEATURE_REPORT_TYPE: u16 = 0x03;
 /// Feature report id the polling-rate command is written on.
 pub const POLLING_REPORT_ID: u8 = 0x06;
-/// Feature report id used to request a state read-back.
-pub const READ_REQUEST_REPORT_ID: u8 = 0xa0;
+/// wValue for the polling SET_REPORT: (Feature << 8) | report id = 0x0306.
+pub const POLLING_WVALUE: u16 = (FEATURE_REPORT_TYPE << 8) | POLLING_REPORT_ID as u16;
+/// Interrupt IN endpoint that streams battery packets on the wireless receiver.
+pub const BATTERY_ENDPOINT: u8 = 0x83;
 /// Input report id the autonomous battery packet arrives on.
 pub const BATTERY_REPORT_ID: u8 = 0x03;
 
@@ -87,31 +99,6 @@ pub fn polling_packet(hz: u16) -> Option<[u8; 9]> {
     ])
 }
 
-/// Encode the read-request that asks the mouse to publish its current polling
-/// rate on `POLLING_REPORT_ID`. Byte 0 is the `READ_REQUEST_REPORT_ID`.
-pub fn polling_read_request() -> [u8; 8] {
-    [
-        READ_REQUEST_REPORT_ID,
-        0x00,
-        0x01,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-    ]
-}
-
-/// Decode a polling-rate feature report read back from the mouse. `report`
-/// includes the leading report id, so the rate code sits at index 2. Returns
-/// the rate in Hz, or `None` if the code is unknown or the buffer is short.
-pub fn parse_polling_reply(report: &[u8]) -> Option<u16> {
-    let code = *report.get(2)?;
-    POLLING_RATES
-        .iter()
-        .find_map(|&(hz, wire)| (wire == code).then_some(hz))
-}
-
 /// Decode a battery input report. `report` includes the leading report id, so
 /// the signature occupies bytes 0..4 and the percentage byte 4. Returns the
 /// percentage (0..=100) or `None` for a non-battery or out-of-range report.
@@ -147,13 +134,11 @@ mod tests {
     }
 
     #[test]
-    fn polling_reply_round_trips_every_rate() {
-        for &(hz, code) in &POLLING_RATES {
-            let reply = [POLLING_REPORT_ID, 0x00, code, 0x00];
-            assert_eq!(parse_polling_reply(&reply), Some(hz));
-        }
-        assert_eq!(parse_polling_reply(&[POLLING_REPORT_ID, 0x00, 0x99]), None);
-        assert_eq!(parse_polling_reply(&[POLLING_REPORT_ID]), None);
+    fn polling_control_transfer_parameters_match_reference() {
+        // Reference PollingRateBuilder: bRequest 0x09, wValue 0x0306, wIndex 2.
+        assert_eq!(SET_REPORT_REQUEST, 0x09);
+        assert_eq!(POLLING_WVALUE, 0x0306);
+        assert_eq!(CONTROL_INTERFACE, 2);
     }
 
     #[test]

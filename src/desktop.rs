@@ -132,10 +132,10 @@ pub fn run() -> Result<()> {
     let app_icon = Arc::new(openmouse_app_icon()?);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([420.0, 300.0])
+            .with_inner_size([420.0, 380.0])
             .with_min_inner_size([420.0, 300.0])
-            .with_max_inner_size([420.0, 300.0])
-            .with_resizable(false)
+            .with_max_inner_size([420.0, 720.0])
+            .with_resizable(true)
             .with_decorations(false)
             .with_icon(app_icon)
             .with_transparent(true),
@@ -549,30 +549,36 @@ impl eframe::App for BridgeDesktop {
             .show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
                 self.title_bar(ui);
-                egui::Frame::new()
-                    .inner_margin(20.0)
-                    .show(ui, |ui| match self.page {
-                        DesktopPage::Home => {
-                            self.status_card(ui);
-                            ui.add_space(8.0);
-                            self.activity(ui);
-                            ui.add_space(12.0);
-                            let button = egui::Button::new(
-                                RichText::new("Open OpenMouse")
-                                    .color(BACKGROUND)
-                                    .strong()
-                                    .size(12.0),
-                            )
-                            .fill(ACCENT)
-                            .stroke(Stroke::NONE)
-                            .corner_radius(CornerRadius::same(6));
-                            if ui.add_sized([ui.available_width(), 34.0], button).clicked()
-                                && let Err(error) = open_openmouse()
-                            {
-                                self.error = Some(error.to_string());
-                            }
-                        }
-                        DesktopPage::Settings => self.settings(ui),
+                // The Settings page can grow taller than the fixed window, so
+                // let the body scroll instead of clipping.
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        egui::Frame::new()
+                            .inner_margin(20.0)
+                            .show(ui, |ui| match self.page {
+                                DesktopPage::Home => {
+                                    self.status_card(ui);
+                                    ui.add_space(8.0);
+                                    self.activity(ui);
+                                    ui.add_space(12.0);
+                                    let button = egui::Button::new(
+                                        RichText::new("Open OpenMouse")
+                                            .color(BACKGROUND)
+                                            .strong()
+                                            .size(12.0),
+                                    )
+                                    .fill(ACCENT)
+                                    .stroke(Stroke::NONE)
+                                    .corner_radius(CornerRadius::same(6));
+                                    if ui.add_sized([ui.available_width(), 34.0], button).clicked()
+                                        && let Err(error) = open_openmouse()
+                                    {
+                                        self.error = Some(error.to_string());
+                                    }
+                                }
+                                DesktopPage::Settings => self.settings(ui),
+                            });
                     });
             });
     }
