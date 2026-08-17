@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -66,6 +69,20 @@ pub struct BatteryReading {
 
 struct BatteryState {
     last_alert: Option<Instant>,
+    device_name: String,
+    percent: u8,
+    charging: bool,
+    updated_at: Instant,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceBattery {
+    pub device_id: String,
+    pub device_name: String,
+    pub percent: u8,
+    pub charging: bool,
+    pub stale: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -92,6 +109,7 @@ pub struct BridgeSnapshot {
     pub visible_application_count: usize,
     pub profile_count: usize,
     pub client_connected: bool,
+    pub batteries: Vec<DeviceBattery>,
 }
 
 impl BridgeService {
@@ -144,6 +162,18 @@ impl BridgeService {
                     .cloned()
             })
             .or_else(|| state.config.default_profile.clone());
+        let mut batteries = state
+            .battery
+            .iter()
+            .map(|(device_id, entry)| DeviceBattery {
+                device_id: device_id.clone(),
+                device_name: entry.device_name.clone(),
+                percent: entry.percent,
+                charging: entry.charging,
+                stale: entry.updated_at.elapsed() >= Duration::from_secs(120),
+            })
+            .collect::<Vec<_>>();
+        batteries.sort_by(|a, b| a.device_id.cmp(&b.device_id));
         BridgeSnapshot {
             version: crate::BRIDGE_VERSION,
             platform: platform::platform_name(),
@@ -167,6 +197,7 @@ impl BridgeService {
             visible_application_count: state.applications.len(),
             profile_count: state.config.profiles.len(),
             client_connected,
+            batteries,
         }
     }
 
@@ -253,23 +284,32 @@ impl BridgeService {
                     } else {
                         previous_alert
                     },
+                    device_name: reading.device_name.clone(),
+                    percent: reading.percent,
+                    charging: reading.charging,
+                    updated_at: Instant::now(),
                 },
             );
             should_alert
         };
         if alert {
-            platform::notify(
-                "Mouse battery is low",
-                &format!(
-                    "{} has {}% battery remaining.",
-                    reading.device_name, reading.percent
-                ),
-            )?;
+            let body = format!(
+                "{} has {}% battery remaining.",
+                reading.device_name, reading.percent
+            );
+            // Showing a notification can block (e.g. an unbundled macOS binary
+            // pops a chooser dialog), so run it detached: never stall the request
+            // or the runtime, and never let a notification failure fail the write.
+            std::thread::spawn(move || {
+                if let Err(error) = platform::notify("Mouse battery is low", &body) {
+                    tracing::warn!(%error, "Could not show the low-battery notification");
+                }
+            });
         }
         Ok(alert)
     }
 
-    pub fn start_game_monitor(&self) {
+    pub fn start_game_monitor(&self, window_active: Arc<AtomicBool>) {
         let service = self.clone();
         tokio::spawn(async move {
             let mut detector = GameDetector::default();
@@ -282,20 +322,28 @@ impl BridgeService {
                     .into_iter()
                     .filter(|application| is_registered_game(application, &games))
                     .collect::<Vec<_>>();
-                let missing_icons = {
-                    let state = service.inner.read().await;
-                    applications
-                        .iter()
-                        .filter(|application| {
-                            !state.application_icons.contains_key(&application.icon_id)
-                        })
-                        .map(|application| (application.icon_id.clone(), application.path.clone()))
+                // Application icons are only used by the status window, so skip
+                // the expensive extraction while it is hidden to the tray.
+                let icons = if window_active.load(Ordering::Acquire) {
+                    let missing_icons = {
+                        let state = service.inner.read().await;
+                        applications
+                            .iter()
+                            .filter(|application| {
+                                !state.application_icons.contains_key(&application.icon_id)
+                            })
+                            .map(|application| {
+                                (application.icon_id.clone(), application.path.clone())
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    missing_icons
+                        .into_iter()
+                        .map(|(icon_id, path)| (icon_id, applications::application_icon(&path)))
                         .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
                 };
-                let icons = missing_icons
-                    .into_iter()
-                    .map(|(icon_id, path)| (icon_id, applications::application_icon(&path)))
-                    .collect::<Vec<_>>();
                 let mut state = service.inner.write().await;
                 state.active_games = active;
                 state.applications = applications;
