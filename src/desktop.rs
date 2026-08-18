@@ -20,7 +20,10 @@ use openmouse_bridge::{
 };
 #[cfg(target_os = "windows")]
 use std::ptr::null_mut;
-use tokio::{net::TcpListener, sync::oneshot};
+use tokio::{
+    net::TcpListener,
+    sync::{mpsc as tokio_mpsc, oneshot},
+};
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder,
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
@@ -46,6 +49,12 @@ enum DesktopEvent {
     Ready,
     Snapshot(Box<BridgeSnapshot>),
     ServerError(String),
+}
+
+/// Commands the (synchronous) UI sends to the async runtime that owns the
+/// Bridge service.
+enum ServerCommand {
+    SetBatteryThreshold(u8),
 }
 
 struct TrayState {
@@ -106,11 +115,15 @@ struct BackgroundServer {
 }
 
 impl BackgroundServer {
-    fn start(events: Sender<DesktopEvent>, window_active: Arc<AtomicBool>) -> Result<Self> {
+    fn start(
+        events: Sender<DesktopEvent>,
+        commands: tokio_mpsc::UnboundedReceiver<ServerCommand>,
+        window_active: Arc<AtomicBool>,
+    ) -> Result<Self> {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let thread = thread::Builder::new()
             .name("openmouse-bridge-runtime".into())
-            .spawn(move || run_server(events, shutdown_rx, window_active))
+            .spawn(move || run_server(events, commands, shutdown_rx, window_active))
             .context("could not start the Bridge runtime")?;
         Ok(Self {
             shutdown: Some(shutdown_tx),
@@ -132,14 +145,15 @@ impl BackgroundServer {
 
 pub fn run() -> Result<()> {
     let (event_tx, event_rx) = mpsc::channel();
+    let (command_tx, command_rx) = tokio_mpsc::unbounded_channel();
     let window_active = Arc::new(AtomicBool::new(true));
-    let server = BackgroundServer::start(event_tx, Arc::clone(&window_active))?;
+    let server = BackgroundServer::start(event_tx, command_rx, Arc::clone(&window_active))?;
     let app_icon = Arc::new(openmouse_app_icon()?);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([420.0, 300.0])
-            .with_min_inner_size([420.0, 300.0])
-            .with_max_inner_size([420.0, 300.0])
+            .with_inner_size([420.0, 276.0])
+            .with_min_inner_size([420.0, 276.0])
+            .with_max_inner_size([420.0, 276.0])
             .with_resizable(false)
             .with_decorations(false)
             .with_icon(app_icon)
@@ -152,7 +166,12 @@ pub fn run() -> Result<()> {
         "OpenMouse Bridge",
         options,
         Box::new(move |context| {
-            Ok(Box::new(BridgeDesktop::new(context, event_rx, window_active)))
+            Ok(Box::new(BridgeDesktop::new(
+                context,
+                event_rx,
+                command_tx,
+                window_active,
+            )))
         }),
     )
     .map_err(|error| anyhow!(error.to_string()));
@@ -162,6 +181,7 @@ pub fn run() -> Result<()> {
 
 fn run_server(
     events: Sender<DesktopEvent>,
+    mut commands: tokio_mpsc::UnboundedReceiver<ServerCommand>,
     shutdown: oneshot::Receiver<()>,
     window_active: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -174,6 +194,19 @@ fn run_server(
         let origins = bridge_config.allowed_origins.clone();
         let service = BridgeService::new(bridge_config, path.clone());
         service.start_game_monitor(Arc::clone(&window_active));
+
+        let command_service = service.clone();
+        tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                match command {
+                    ServerCommand::SetBatteryThreshold(percent) => {
+                        if let Err(error) = command_service.set_battery_threshold(percent).await {
+                            tracing::error!(%error, "Could not update the battery threshold");
+                        }
+                    }
+                }
+            }
+        });
 
         let snapshot_service = service.clone();
         let snapshot_events = events.clone();
@@ -229,12 +262,15 @@ struct BridgeDesktop {
     quitting: Arc<AtomicBool>,
     window_active: Arc<AtomicBool>,
     showing: bool,
+    commands: tokio_mpsc::UnboundedSender<ServerCommand>,
+    battery_threshold: Option<u8>,
 }
 
 impl BridgeDesktop {
     fn new(
         context: &eframe::CreationContext<'_>,
         events: Receiver<DesktopEvent>,
+        commands: tokio_mpsc::UnboundedSender<ServerCommand>,
         window_active: Arc<AtomicBool>,
     ) -> Self {
         let mut fonts = egui::FontDefinitions::default();
@@ -259,7 +295,7 @@ impl BridgeDesktop {
         context.egui_ctx.set_visuals(visuals);
 
         let mut style = (*context.egui_ctx.style_of(egui::Theme::Dark)).clone();
-        style.spacing.item_spacing = Vec2::new(8.0, 8.0);
+        style.spacing.item_spacing = Vec2::new(8.0, 5.0);
         style.spacing.button_padding = Vec2::new(14.0, 9.0);
         style.text_styles.insert(
             egui::TextStyle::Body,
@@ -306,6 +342,8 @@ impl BridgeDesktop {
             quitting,
             window_active,
             showing: true,
+            commands,
+            battery_threshold: None,
         }
     }
 
@@ -385,7 +423,7 @@ impl BridgeDesktop {
                     if let Some(battery) = &battery {
                         draw_battery_ring(ui.painter(), avatar, battery.percent, battery.charging);
                     }
-                    ui.add_space(6.0);
+                    ui.add_space(12.0);
 
                     let remaining = ui.available_width();
                     ui.vertical(|ui| {
@@ -402,11 +440,11 @@ impl BridgeDesktop {
                                 pill(ui, pill_label, pill_color);
                             });
                         });
-                        ui.add_space(7.0);
+                        ui.add_space(2.0);
                         match &battery {
                             Some(battery) => {
                                 battery_bar(ui, battery.percent);
-                                ui.add_space(5.0);
+                                ui.add_space(2.0);
                                 ui.horizontal(|ui| {
                                     ui.set_min_width(remaining);
                                     let left = if battery.charging {
@@ -485,18 +523,6 @@ impl BridgeDesktop {
             });
     }
 
-    fn stat_chips(&self, ui: &mut egui::Ui) {
-        let snapshot = self.snapshot.as_ref();
-        let games = snapshot.map_or(0, |snapshot| snapshot.tracked_game_count);
-        let profiles = snapshot.map_or(0, |snapshot| snapshot.profile_count);
-        let apps = snapshot.map_or(0, |snapshot| snapshot.visible_application_count);
-        ui.columns(3, |columns| {
-            stat_chip(&mut columns[0], &games.to_string(), "GAMES");
-            stat_chip(&mut columns[1], &profiles.to_string(), "PROFILES");
-            stat_chip(&mut columns[2], &apps.to_string(), "APPS OPEN");
-        });
-    }
-
     fn settings(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if back_button(ui) {
@@ -507,67 +533,83 @@ impl BridgeDesktop {
         ui.add_space(10.0);
 
         let width = ui.available_width();
-        egui::Frame::new()
-            .fill(SURFACE_RAISED)
-            .stroke(Stroke::new(1.0, BORDER))
-            .corner_radius(CornerRadius::same(8))
-            .inner_margin(12.0)
+        let remaining = ui.available_height();
+        let threshold = self
+            .battery_threshold
+            .or_else(|| {
+                self.snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.battery_threshold_percent)
+            })
+            .unwrap_or(20);
+        egui::ScrollArea::vertical()
+            .max_height(remaining)
+            .auto_shrink([false, true])
             .show(ui, |ui| {
-                ui.set_min_width(width - 24.0);
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new("Start Bridge at login")
-                                .color(TEXT)
-                                .size(11.0),
-                        );
-                        ui.label(
-                            RichText::new("Keep OpenMouse ready after restart")
-                                .color(MUTED)
-                                .size(9.0),
-                        );
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let mut enabled = self
-                            .snapshot
-                            .as_ref()
-                            .is_some_and(|snapshot| snapshot.autostart_enabled);
-                        if toggle_switch(ui, &mut enabled, "Start Bridge at login") {
-                            match platform::set_autostart(enabled) {
-                                Ok(()) => {
-                                    if let Some(snapshot) = &mut self.snapshot {
-                                        snapshot.autostart_enabled = enabled;
+                egui::Frame::new()
+                    .fill(SURFACE_RAISED)
+                    .stroke(Stroke::new(1.0, BORDER))
+                    .corner_radius(CornerRadius::same(8))
+                    .inner_margin(12.0)
+                    .show(ui, |ui| {
+                        ui.set_min_width(width - 24.0);
+                        setting_label(ui, "Start Bridge at login", "Keep OpenMouse ready after restart", |ui| {
+                            let mut enabled = self
+                                .snapshot
+                                .as_ref()
+                                .is_some_and(|snapshot| snapshot.autostart_enabled);
+                            if toggle_switch(ui, &mut enabled, "Start Bridge at login") {
+                                match platform::set_autostart(enabled) {
+                                    Ok(()) => {
+                                        if let Some(snapshot) = &mut self.snapshot {
+                                            snapshot.autostart_enabled = enabled;
+                                        }
                                     }
+                                    Err(error) => self.error = Some(error.to_string()),
                                 }
-                                Err(error) => self.error = Some(error.to_string()),
                             }
-                        }
+                        });
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+                        setting_label(ui, "Low-battery alert", "Warn when the mouse drops to this level", |ui| {
+                            if step_button(ui, "+") {
+                                self.adjust_threshold(threshold, 5);
+                            }
+                            ui.add_space(2.0);
+                            ui.label(
+                                RichText::new(format!("{threshold}%"))
+                                    .color(TEXT)
+                                    .strong()
+                                    .size(11.0),
+                            );
+                            ui.add_space(2.0);
+                            if step_button(ui, "−") {
+                                self.adjust_threshold(threshold, -5);
+                            }
+                        });
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+                        setting_label(ui, "Discord Rich Presence", "Show your active game and profile", |ui| {
+                            toggle_switch(ui, &mut self.discord_rpc_enabled, "Discord Rich Presence");
+                        });
+                        ui.add_space(4.0);
+                        ui.separator();
+                        setting_row(ui, "Version", BRIDGE_VERSION);
                     });
-                });
-                ui.add_space(4.0);
-                ui.separator();
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new("Discord Rich Presence")
-                                .color(TEXT)
-                                .size(11.0),
-                        );
-                        ui.label(
-                            RichText::new("Show your active game and profile")
-                                .color(MUTED)
-                                .size(9.0),
-                        );
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        toggle_switch(ui, &mut self.discord_rpc_enabled, "Discord Rich Presence");
-                    });
-                });
-                ui.add_space(4.0);
-                ui.separator();
-                setting_row(ui, "Version", BRIDGE_VERSION);
             });
+    }
+
+    fn adjust_threshold(&mut self, current: u8, delta: i8) {
+        let next = (i16::from(current) + i16::from(delta)).clamp(5, 50) as u8;
+        if next != current {
+            self.battery_threshold = Some(next);
+            if let Some(snapshot) = &mut self.snapshot {
+                snapshot.battery_threshold_percent = next;
+            }
+            let _ = self.commands.send(ServerCommand::SetBatteryThreshold(next));
+        }
     }
 
     fn title_bar(&mut self, ui: &mut egui::Ui) {
@@ -679,11 +721,9 @@ impl eframe::App for BridgeDesktop {
                     .show(ui, |ui| match self.page {
                         DesktopPage::Home => {
                             self.battery_hero(ui);
-                            ui.add_space(10.0);
+                            ui.add_space(6.0);
                             self.activity(ui);
-                            ui.add_space(10.0);
-                            self.stat_chips(ui);
-                            ui.add_space(12.0);
+                            ui.add_space(8.0);
                             let button = egui::Button::new(
                                 RichText::new("Open OpenMouse")
                                     .color(BACKGROUND)
@@ -900,6 +940,32 @@ fn toggle_switch(ui: &mut egui::Ui, enabled: &mut bool, tooltip: &str) -> bool {
     clicked
 }
 
+/// A settings row: a two-line title/subtitle on the left and a right-aligned
+/// control rendered by `control`.
+fn setting_label(
+    ui: &mut egui::Ui,
+    title: &str,
+    subtitle: &str,
+    control: impl FnOnce(&mut egui::Ui),
+) {
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.label(RichText::new(title).color(TEXT).size(11.0));
+            ui.label(RichText::new(subtitle).color(MUTED).size(9.0));
+        });
+        ui.with_layout(Layout::right_to_left(Align::Center), control);
+    });
+}
+
+fn step_button(ui: &mut egui::Ui, symbol: &str) -> bool {
+    let button = egui::Button::new(RichText::new(symbol).color(TEXT).size(13.0))
+        .fill(SURFACE)
+        .stroke(Stroke::new(1.0, BORDER))
+        .corner_radius(CornerRadius::same(5))
+        .min_size(Vec2::new(22.0, 22.0));
+    ui.add(button).clicked()
+}
+
 fn setting_row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.horizontal(|ui| {
         ui.set_min_height(26.0);
@@ -963,9 +1029,10 @@ fn draw_mouse(painter: &egui::Painter, rect: egui::Rect) {
     );
 }
 
-/// Overlay a battery percentage badge at the bottom-right of `rect`.
+/// Overlay a battery percentage badge on the lower-right of the mouse body.
 fn draw_battery_ring(painter: &egui::Painter, rect: egui::Rect, percent: u8, charging: bool) {
-    let center = egui::pos2(rect.right() - 3.0, rect.bottom() - 3.0);
+    let body = egui::Rect::from_center_size(rect.center(), Vec2::new(24.0, 34.0));
+    let center = egui::pos2(body.right() - 1.0, body.bottom() - 2.0);
     let color = if charging { ACCENT } else { battery_color(percent) };
     painter.circle_filled(center, 10.0, BACKGROUND);
     painter.circle_stroke(center, 8.5, Stroke::new(2.0, color));
@@ -1001,21 +1068,6 @@ fn pill(ui: &mut egui::Ui, label: &str, color: Color32) {
                 ui.painter().circle_filled(dot.center(), 3.0, color);
                 ui.add_space(1.0);
                 ui.label(RichText::new(label).color(color).strong().size(9.5));
-            });
-        });
-}
-
-fn stat_chip(ui: &mut egui::Ui, value: &str, label: &str) {
-    egui::Frame::new()
-        .fill(SURFACE)
-        .stroke(Stroke::new(1.0, BORDER))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(egui::Margin::symmetric(10, 8))
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            ui.vertical(|ui| {
-                ui.label(RichText::new(value).color(TEXT).strong().size(16.0));
-                ui.label(RichText::new(label).color(MUTED).size(8.5));
             });
         });
 }
