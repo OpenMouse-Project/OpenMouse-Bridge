@@ -7,7 +7,10 @@
 mod desktop;
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::{Arc, atomic::AtomicBool},
+};
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 use anyhow::{Context, Result};
@@ -41,7 +44,9 @@ async fn run() -> Result<()> {
     let (config, path) = config::load_or_create()?;
     let origins = config.allowed_origins.clone();
     let service = BridgeService::new(config, path.clone());
-    service.start_game_monitor();
+    // Headless mode has no status window, but the web app still fetches
+    // application icons over the API, so always keep them extracted.
+    service.start_game_monitor(Arc::new(AtomicBool::new(true)));
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), BRIDGE_PORT);
     let listener = TcpListener::bind(address)
         .await
