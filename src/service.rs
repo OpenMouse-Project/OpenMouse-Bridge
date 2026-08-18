@@ -451,7 +451,12 @@ mod tests {
         BridgeService::new(config, PathBuf::from("unused-test-config.json"))
     }
 
-    fn test_profile(name: &str, path: &str, dpi: Option<u32>, hz: Option<u32>) -> ApplicationProfile {
+    fn test_profile(
+        name: &str,
+        path: &str,
+        dpi: Option<u32>,
+        hz: Option<u32>,
+    ) -> ApplicationProfile {
         ApplicationProfile {
             application: config::ProfileApplication {
                 name: name.into(),

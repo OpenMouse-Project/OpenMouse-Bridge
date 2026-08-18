@@ -553,47 +553,66 @@ impl BridgeDesktop {
                     .inner_margin(12.0)
                     .show(ui, |ui| {
                         ui.set_min_width(width - 24.0);
-                        setting_label(ui, "Start Bridge at login", "Keep OpenMouse ready after restart", |ui| {
-                            let mut enabled = self
-                                .snapshot
-                                .as_ref()
-                                .is_some_and(|snapshot| snapshot.autostart_enabled);
-                            if toggle_switch(ui, &mut enabled, "Start Bridge at login") {
-                                match platform::set_autostart(enabled) {
-                                    Ok(()) => {
-                                        if let Some(snapshot) = &mut self.snapshot {
-                                            snapshot.autostart_enabled = enabled;
+                        setting_label(
+                            ui,
+                            "Start Bridge at login",
+                            "Keep OpenMouse ready after restart",
+                            |ui| {
+                                let mut enabled = self
+                                    .snapshot
+                                    .as_ref()
+                                    .is_some_and(|snapshot| snapshot.autostart_enabled);
+                                if toggle_switch(ui, &mut enabled, "Start Bridge at login") {
+                                    match platform::set_autostart(enabled) {
+                                        Ok(()) => {
+                                            if let Some(snapshot) = &mut self.snapshot {
+                                                snapshot.autostart_enabled = enabled;
+                                            }
                                         }
+                                        Err(error) => self.error = Some(error.to_string()),
                                     }
-                                    Err(error) => self.error = Some(error.to_string()),
                                 }
-                            }
-                        });
+                            },
+                        );
                         ui.add_space(4.0);
                         ui.separator();
                         ui.add_space(4.0);
-                        setting_label(ui, "Low-battery alert", "Warn when the mouse drops to this level", |ui| {
-                            if step_button(ui, "+") {
-                                self.adjust_threshold(threshold, 5);
-                            }
-                            ui.add_space(2.0);
-                            ui.label(
-                                RichText::new(format!("{threshold}%"))
-                                    .color(TEXT)
-                                    .strong()
-                                    .size(11.0),
-                            );
-                            ui.add_space(2.0);
-                            if step_button(ui, "−") {
-                                self.adjust_threshold(threshold, -5);
-                            }
-                        });
+                        setting_label(
+                            ui,
+                            "Low-battery alert",
+                            "Warn when the mouse drops to this level",
+                            |ui| {
+                                if step_button(ui, "+") {
+                                    self.adjust_threshold(threshold, 5);
+                                }
+                                ui.add_space(2.0);
+                                ui.label(
+                                    RichText::new(format!("{threshold}%"))
+                                        .color(TEXT)
+                                        .strong()
+                                        .size(11.0),
+                                );
+                                ui.add_space(2.0);
+                                if step_button(ui, "−") {
+                                    self.adjust_threshold(threshold, -5);
+                                }
+                            },
+                        );
                         ui.add_space(4.0);
                         ui.separator();
                         ui.add_space(4.0);
-                        setting_label(ui, "Discord Rich Presence", "Show your active game and profile", |ui| {
-                            toggle_switch(ui, &mut self.discord_rpc_enabled, "Discord Rich Presence");
-                        });
+                        setting_label(
+                            ui,
+                            "Discord Rich Presence",
+                            "Show your active game and profile",
+                            |ui| {
+                                toggle_switch(
+                                    ui,
+                                    &mut self.discord_rpc_enabled,
+                                    "Discord Rich Presence",
+                                );
+                            },
+                        );
                         ui.add_space(4.0);
                         ui.separator();
                         setting_row(ui, "Version", BRIDGE_VERSION);
@@ -634,8 +653,11 @@ impl BridgeDesktop {
                 } else {
                     AMBER
                 };
-                ui.painter()
-                    .circle_filled(egui::pos2(bar.left() + 4.0, bar.center().y), 3.5, dot_color);
+                ui.painter().circle_filled(
+                    egui::pos2(bar.left() + 4.0, bar.center().y),
+                    3.5,
+                    dot_color,
+                );
                 let title_end = ui.painter().text(
                     egui::pos2(bar.left() + 14.0, bar.center().y),
                     egui::Align2::LEFT_CENTER,
@@ -1033,7 +1055,11 @@ fn draw_mouse(painter: &egui::Painter, rect: egui::Rect) {
 fn draw_battery_ring(painter: &egui::Painter, rect: egui::Rect, percent: u8, charging: bool) {
     let body = egui::Rect::from_center_size(rect.center(), Vec2::new(24.0, 34.0));
     let center = egui::pos2(body.right() - 1.0, body.bottom() - 2.0);
-    let color = if charging { ACCENT } else { battery_color(percent) };
+    let color = if charging {
+        ACCENT
+    } else {
+        battery_color(percent)
+    };
     painter.circle_filled(center, 10.0, BACKGROUND);
     painter.circle_stroke(center, 8.5, Stroke::new(2.0, color));
     painter.text(
