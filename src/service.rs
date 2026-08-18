@@ -41,6 +41,66 @@ fn is_registered_game(application: &ApplicationInfo, games: &[GameConfig]) -> bo
     })
 }
 
+/// How long a new active profile must persist before a switch notification
+/// fires, so rapid alt-tabbing does not spam notifications.
+const PROFILE_DEBOUNCE: Duration = Duration::from_millis(2500);
+
+/// The profile that applies to the current foreground application, falling back
+/// to the configured default profile. Shared by the snapshot and the monitor.
+fn active_profile_for(
+    config: &BridgeConfig,
+    applications: &[ApplicationInfo],
+) -> Option<ApplicationProfile> {
+    applications
+        .iter()
+        .find(|application| application.foreground)
+        .and_then(|application| {
+            config
+                .profiles
+                .iter()
+                .find(|profile| {
+                    profile
+                        .application
+                        .path
+                        .eq_ignore_ascii_case(&application.path)
+                        || profile
+                            .application
+                            .name
+                            .eq_ignore_ascii_case(&application.name)
+                        || profile
+                            .application
+                            .executable
+                            .eq_ignore_ascii_case(&application.executable)
+                })
+                .cloned()
+        })
+        .or_else(|| config.default_profile.clone())
+}
+
+/// A stable identity for a profile, used to detect switches.
+fn profile_key(profile: &ApplicationProfile) -> String {
+    if profile.application.path.is_empty() {
+        profile.application.name.to_ascii_lowercase()
+    } else {
+        profile.application.path.to_ascii_lowercase()
+    }
+}
+
+fn profile_notification_body(profile: &ApplicationProfile) -> String {
+    let mut parts = Vec::new();
+    if let Some(dpi) = profile.settings.dpi {
+        parts.push(format!("{dpi} DPI"));
+    }
+    if let Some(rate) = profile.settings.polling_rate_hz {
+        parts.push(format!("{rate} Hz"));
+    }
+    if parts.is_empty() {
+        profile.application.name.clone()
+    } else {
+        format!("{} · {}", profile.application.name, parts.join(" · "))
+    }
+}
+
 #[derive(Clone)]
 pub struct BridgeService {
     inner: Arc<RwLock<BridgeState>>,
@@ -53,6 +113,10 @@ struct BridgeState {
     applications: Vec<ApplicationInfo>,
     application_icons: HashMap<String, Option<Vec<u8>>>,
     battery: HashMap<String, BatteryState>,
+    // Debounced active-profile tracking for switch notifications.
+    active_profile_key: Option<String>,
+    pending_profile: Option<(Option<String>, Instant)>,
+    profile_seeded: bool,
     started_at: Instant,
     last_client_heartbeat: Option<Instant>,
 }
@@ -121,6 +185,9 @@ impl BridgeService {
                 applications: Vec::new(),
                 application_icons: HashMap::new(),
                 battery: HashMap::new(),
+                active_profile_key: None,
+                pending_profile: None,
+                profile_seeded: false,
                 started_at: Instant::now(),
                 last_client_heartbeat: None,
             })),
@@ -138,30 +205,7 @@ impl BridgeService {
             .iter()
             .find(|application| application.foreground)
             .cloned();
-        let active_profile = foreground_application
-            .as_ref()
-            .and_then(|application| {
-                state
-                    .config
-                    .profiles
-                    .iter()
-                    .find(|profile| {
-                        profile
-                            .application
-                            .path
-                            .eq_ignore_ascii_case(&application.path)
-                            || profile
-                                .application
-                                .name
-                                .eq_ignore_ascii_case(&application.name)
-                            || profile
-                                .application
-                                .executable
-                                .eq_ignore_ascii_case(&application.executable)
-                    })
-                    .cloned()
-            })
-            .or_else(|| state.config.default_profile.clone());
+        let active_profile = active_profile_for(&state.config, &state.applications);
         let mut batteries = state
             .battery
             .iter()
@@ -245,6 +289,16 @@ impl BridgeService {
         let config = {
             let mut state = self.inner.write().await;
             state.config.default_profile = Some(profile);
+            state.config = state.config.clone().normalized();
+            state.config.clone()
+        };
+        config::save(&self.config_path, &config)
+    }
+
+    pub async fn set_battery_threshold(&self, percent: u8) -> Result<()> {
+        let config = {
+            let mut state = self.inner.write().await;
+            state.config.battery_threshold_percent = percent;
             state.config = state.config.clone().normalized();
             state.config.clone()
         };
@@ -348,6 +402,42 @@ impl BridgeService {
                 state.active_games = active;
                 state.applications = applications;
                 state.application_icons.extend(icons);
+
+                // Detect a debounced active-profile switch and notify once the
+                // new profile has stayed active long enough.
+                let current = active_profile_for(&state.config, &state.applications);
+                let current_key = current.as_ref().map(profile_key);
+                let mut notify_body: Option<String> = None;
+                if !state.profile_seeded {
+                    // Adopt the initial profile silently so startup is quiet.
+                    state.active_profile_key = current_key;
+                    state.pending_profile = None;
+                    state.profile_seeded = true;
+                } else if current_key == state.active_profile_key {
+                    state.pending_profile = None;
+                } else {
+                    let ready = matches!(
+                        &state.pending_profile,
+                        Some((key, since)) if *key == current_key && since.elapsed() >= PROFILE_DEBOUNCE
+                    );
+                    let waiting =
+                        matches!(&state.pending_profile, Some((key, _)) if *key == current_key);
+                    if ready {
+                        state.active_profile_key = current_key;
+                        state.pending_profile = None;
+                        notify_body = current.as_ref().map(profile_notification_body);
+                    } else if !waiting {
+                        state.pending_profile = Some((current_key, Instant::now()));
+                    }
+                }
+                drop(state);
+                if let Some(body) = notify_body {
+                    std::thread::spawn(move || {
+                        if let Err(error) = platform::notify("Mouse profile applied", &body) {
+                            tracing::warn!(%error, "Could not show the profile notification");
+                        }
+                    });
+                }
             }
         });
     }
@@ -359,6 +449,76 @@ mod tests {
 
     fn service(config: BridgeConfig) -> BridgeService {
         BridgeService::new(config, PathBuf::from("unused-test-config.json"))
+    }
+
+    fn test_profile(name: &str, path: &str, dpi: Option<u32>, hz: Option<u32>) -> ApplicationProfile {
+        ApplicationProfile {
+            application: config::ProfileApplication {
+                name: name.into(),
+                executable: format!("{name}.exe"),
+                path: path.into(),
+            },
+            device: config::ProfileDevice {
+                id: "device".into(),
+                name: "Mouse".into(),
+            },
+            settings: config::ProfileSettings {
+                dpi,
+                polling_rate_hz: hz,
+            },
+        }
+    }
+
+    fn test_app(name: &str, path: &str, foreground: bool) -> ApplicationInfo {
+        ApplicationInfo {
+            name: name.into(),
+            executable: format!("{name}.exe"),
+            path: path.into(),
+            foreground,
+            icon_id: String::new(),
+        }
+    }
+
+    #[test]
+    fn active_profile_matches_foreground_then_falls_back_to_default() {
+        let mut config = BridgeConfig::default();
+        let valorant = test_profile("Valorant", "/games/valorant", Some(800), Some(1000));
+        config.profiles = vec![valorant.clone()];
+        config.default_profile = Some(test_profile("Default", "", Some(400), None));
+
+        let apps = vec![
+            test_app("Chrome", "/apps/chrome", false),
+            test_app("Valorant", "/games/valorant", true),
+        ];
+        assert_eq!(active_profile_for(&config, &apps), Some(valorant));
+
+        let apps = vec![test_app("Chrome", "/apps/chrome", true)];
+        assert_eq!(
+            active_profile_for(&config, &apps).unwrap().application.name,
+            "Default"
+        );
+
+        let apps = vec![test_app("Chrome", "/apps/chrome", false)];
+        assert_eq!(
+            active_profile_for(&config, &apps).unwrap().application.name,
+            "Default"
+        );
+    }
+
+    #[test]
+    fn profile_notification_body_lists_available_settings() {
+        assert_eq!(
+            profile_notification_body(&test_profile("Valorant", "/g", Some(800), Some(1000))),
+            "Valorant · 800 DPI · 1000 Hz"
+        );
+        assert_eq!(
+            profile_notification_body(&test_profile("CS", "/g", Some(400), None)),
+            "CS · 400 DPI"
+        );
+        assert_eq!(
+            profile_notification_body(&test_profile("App", "/g", None, None)),
+            "App"
+        );
     }
 
     #[tokio::test]
