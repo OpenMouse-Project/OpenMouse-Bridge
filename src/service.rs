@@ -403,16 +403,22 @@ impl BridgeService {
                 state.applications = applications;
                 state.application_icons.extend(icons);
 
-                // Detect a debounced active-profile switch and notify once the
-                // new profile has stayed active long enough.
+                // Detect a debounced active-profile switch, push the new
+                // profile's DPI/polling rate to the mouse over native HID
+                // when Bridge has a driver for it, and notify once the new
+                // profile has stayed active long enough.
                 let current = active_profile_for(&state.config, &state.applications);
                 let current_key = current.as_ref().map(profile_key);
-                let mut notify_body: Option<String> = None;
+                // (profile to push to hardware, whether to notify about it)
+                let mut apply: Option<(ApplicationProfile, bool)> = None;
                 if !state.profile_seeded {
-                    // Adopt the initial profile silently so startup is quiet.
+                    // Adopt the initial profile silently so startup is quiet,
+                    // but still push it to the mouse — Bridge should reflect
+                    // the right settings from a cold start, not only switches.
                     state.active_profile_key = current_key;
                     state.pending_profile = None;
                     state.profile_seeded = true;
+                    apply = current.clone().map(|profile| (profile, false));
                 } else if current_key == state.active_profile_key {
                     state.pending_profile = None;
                 } else {
@@ -425,15 +431,56 @@ impl BridgeService {
                     if ready {
                         state.active_profile_key = current_key;
                         state.pending_profile = None;
-                        notify_body = current.as_ref().map(profile_notification_body);
+                        apply = current.clone().map(|profile| (profile, true));
                     } else if !waiting {
                         state.pending_profile = Some((current_key, Instant::now()));
                     }
                 }
                 drop(state);
-                if let Some(body) = notify_body {
+                if let Some((profile, announce)) = apply {
                     std::thread::spawn(move || {
-                        if let Err(error) = platform::notify("Mouse profile applied", &body) {
+                        let outcome = crate::drivers::apply_profile(&profile);
+                        match &outcome {
+                            Ok(true) => tracing::info!(
+                                profile = %profile.application.name,
+                                device = %profile.device.name,
+                                "Applied the mouse profile natively"
+                            ),
+                            Ok(false) => tracing::debug!(
+                                profile = %profile.application.name,
+                                device = %profile.device.name,
+                                "No native driver for this device; not applying natively"
+                            ),
+                            Err(error) => tracing::warn!(
+                                %error,
+                                profile = %profile.application.name,
+                                device = %profile.device.name,
+                                "Could not apply the mouse profile natively"
+                            ),
+                        }
+                        if !announce {
+                            return;
+                        }
+                        let (title, body) = match outcome {
+                            Ok(true) => {
+                                ("Mouse profile applied", profile_notification_body(&profile))
+                            }
+                            Ok(false) => (
+                                "Mouse profile selected",
+                                format!(
+                                    "{} — open OpenMouse to apply it to this mouse.",
+                                    profile.application.name
+                                ),
+                            ),
+                            Err(_) => (
+                                "Mouse profile selected",
+                                format!(
+                                    "{} — could not reach the mouse. Open OpenMouse to apply it.",
+                                    profile.application.name
+                                ),
+                            ),
+                        };
+                        if let Err(error) = platform::notify(title, &body) {
                             tracing::warn!(%error, "Could not show the profile notification");
                         }
                     });

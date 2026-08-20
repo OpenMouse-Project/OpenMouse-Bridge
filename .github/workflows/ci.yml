@@ -9,6 +9,10 @@ on:
 permissions:
   contents: write
 
+env:
+  # Keep in sync with release.yml's NATIVE_HID_NODE_VERSION.
+  NATIVE_HID_NODE_VERSION: v24.18.1
+
 jobs:
   check:
     name: Check (${{ matrix.os }})
@@ -36,12 +40,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
       - name: Build
         run: cargo build --release --locked
+      - name: Prepare native-hid (deps + bundled Node.js runtime)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          npm install --prefix native-hid --omit=dev
+          # Trim node-hid's other-platform prebuilt bindings — this archive
+          # only ever runs on win32-x64.
+          Get-ChildItem native-hid/node_modules/node-hid/prebuilds -Directory |
+            Where-Object { $_.Name -ne "HID-win32-x64" } |
+            Remove-Item -Recurse -Force
+          Invoke-WebRequest -Uri "https://nodejs.org/dist/$env:NATIVE_HID_NODE_VERSION/node-$env:NATIVE_HID_NODE_VERSION-win-x64.zip" -OutFile node.zip
+          Expand-Archive node.zip -DestinationPath node-extracted
+          New-Item -ItemType Directory -Force -Path native-hid/node | Out-Null
+          Copy-Item "node-extracted/node-$env:NATIVE_HID_NODE_VERSION-win-x64/node.exe" native-hid/node/node.exe
       - name: Package
         shell: pwsh
         run: |
-          Compress-Archive -Path target/release/openmouse-bridge.exe,README.md -DestinationPath openmouse-bridge-windows-x64.zip
+          Compress-Archive -Path target/release/openmouse-bridge.exe,README.md,native-hid -DestinationPath openmouse-bridge-windows-x64.zip
           (Get-FileHash openmouse-bridge-windows-x64.zip -Algorithm SHA256).Hash.ToLower() + "  openmouse-bridge-windows-x64.zip" | Set-Content openmouse-bridge-windows-x64.zip.sha256
       - uses: actions/upload-artifact@v4
         with:

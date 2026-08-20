@@ -7,6 +7,12 @@ on:
 permissions:
   contents: write
 
+env:
+  # The Node.js runtime bundled into native-hid/node/ so Bridge can push
+  # DPI/polling-rate settings to non-Pulsar mice without end users needing
+  # Node.js installed separately. Bump by hand when a newer LTS ships.
+  NATIVE_HID_NODE_VERSION: v24.18.1
+
 jobs:
   windows:
     name: Windows x64
@@ -17,6 +23,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
       - run: cargo test --locked
       - run: cargo build --release --locked
       - name: Sign executable
@@ -26,10 +35,24 @@ jobs:
           $certificate = Join-Path $env:RUNNER_TEMP "openmouse-bridge.pfx"
           [IO.File]::WriteAllBytes($certificate, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64))
           & signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificate /p $env:WINDOWS_CERTIFICATE_PASSWORD target/release/openmouse-bridge.exe
+      - name: Prepare native-hid (deps + bundled Node.js runtime)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          npm install --prefix native-hid --omit=dev
+          # Trim node-hid's other-platform prebuilt bindings — this archive
+          # only ever runs on win32-x64.
+          Get-ChildItem native-hid/node_modules/node-hid/prebuilds -Directory |
+            Where-Object { $_.Name -ne "HID-win32-x64" } |
+            Remove-Item -Recurse -Force
+          Invoke-WebRequest -Uri "https://nodejs.org/dist/$env:NATIVE_HID_NODE_VERSION/node-$env:NATIVE_HID_NODE_VERSION-win-x64.zip" -OutFile node.zip
+          Expand-Archive node.zip -DestinationPath node-extracted
+          New-Item -ItemType Directory -Force -Path native-hid/node | Out-Null
+          Copy-Item "node-extracted/node-$env:NATIVE_HID_NODE_VERSION-win-x64/node.exe" native-hid/node/node.exe
       - name: Package
         shell: pwsh
         run: |
-          Compress-Archive -Path target/release/openmouse-bridge.exe,README.md -DestinationPath openmouse-bridge-windows-x64.zip
+          Compress-Archive -Path target/release/openmouse-bridge.exe,README.md,native-hid -DestinationPath openmouse-bridge-windows-x64.zip
           (Get-FileHash openmouse-bridge-windows-x64.zip -Algorithm SHA256).Hash.ToLower() + "  openmouse-bridge-windows-x64.zip" | Set-Content openmouse-bridge-windows-x64.zip.sha256
       - uses: actions/upload-artifact@v4
         with:
@@ -46,9 +69,28 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
       - run: cargo test --locked
       - run: cargo build --release --locked --target aarch64-apple-darwin
       - run: cargo build --release --locked --target x86_64-apple-darwin
+      - name: Prepare native-hid (deps + bundled Node.js runtime)
+        run: |
+          set -euo pipefail
+          npm install --prefix native-hid --omit=dev
+          # Trim node-hid's non-macOS prebuilt bindings; keep both Apple
+          # silicon and Intel since the Bridge binary itself is universal.
+          find native-hid/node_modules/node-hid/prebuilds -mindepth 1 -maxdepth 1 -type d \
+            ! -name HID-darwin-arm64 ! -name HID-darwin-x64 -exec rm -rf {} +
+          curl -fsSL "https://nodejs.org/dist/$NATIVE_HID_NODE_VERSION/node-$NATIVE_HID_NODE_VERSION-darwin-arm64.tar.gz" | tar -xz
+          curl -fsSL "https://nodejs.org/dist/$NATIVE_HID_NODE_VERSION/node-$NATIVE_HID_NODE_VERSION-darwin-x64.tar.gz" | tar -xz
+          mkdir -p native-hid/node/bin
+          lipo -create \
+            "node-$NATIVE_HID_NODE_VERSION-darwin-arm64/bin/node" \
+            "node-$NATIVE_HID_NODE_VERSION-darwin-x64/bin/node" \
+            -output native-hid/node/bin/node
+          chmod +x native-hid/node/bin/node
       - name: Package universal binary
         run: |
           lipo -create \
@@ -56,7 +98,7 @@ jobs:
             target/x86_64-apple-darwin/release/openmouse-bridge \
             -output openmouse-bridge
           chmod +x openmouse-bridge
-          zip openmouse-bridge-macos-universal.zip openmouse-bridge README.md
+          zip -r openmouse-bridge-macos-universal.zip openmouse-bridge README.md native-hid
           shasum -a 256 openmouse-bridge-macos-universal.zip > openmouse-bridge-macos-universal.zip.sha256
       - uses: actions/upload-artifact@v4
         with:
