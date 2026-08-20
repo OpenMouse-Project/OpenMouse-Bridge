@@ -49,12 +49,91 @@ enum DesktopEvent {
     Ready,
     Snapshot(Box<BridgeSnapshot>),
     ServerError(String),
+    UpdateCheck(UpdateCheckOutcome),
 }
 
 /// Commands the (synchronous) UI sends to the async runtime that owns the
 /// Bridge service.
 enum ServerCommand {
     SetBatteryThreshold(u8),
+    CheckForUpdate,
+}
+
+const RELEASES_URL: &str =
+    "https://api.github.com/repos/OpenMouse-Project/OpenMouse-Bridge/releases/latest";
+const RELEASES_PAGE_URL: &str =
+    "https://github.com/OpenMouse-Project/OpenMouse-Bridge/releases/latest";
+
+#[derive(Clone)]
+enum UpdateCheckOutcome {
+    UpToDate,
+    Available { version: String },
+    Failed(String),
+}
+
+#[derive(Clone, Default)]
+enum UpdateCheckState {
+    #[default]
+    Idle,
+    Checking,
+    Done(UpdateCheckOutcome),
+}
+
+#[derive(serde::Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+}
+
+/// Parses a `MAJOR.MINOR.PATCH` version (an optional leading `v` and any
+/// `-`/`+` suffix are ignored), mirroring `openmouse/src/updates.ts`'s
+/// `compareVersions` so Bridge's own update check agrees with the web app's.
+fn parse_version(version: &str) -> Option<[u32; 3]> {
+    let trimmed = version.trim().trim_start_matches('v');
+    let core = trimmed.split(['-', '+']).next().unwrap_or(trimmed);
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some([major, minor, patch])
+}
+
+async fn check_for_update() -> UpdateCheckOutcome {
+    let request = reqwest::Client::new()
+        .get(RELEASES_URL)
+        .header(reqwest::header::USER_AGENT, "OpenMouse-Bridge")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .await;
+    let response = match request {
+        Ok(response) => response,
+        Err(error) => return UpdateCheckOutcome::Failed(error.to_string()),
+    };
+    if !response.status().is_success() {
+        return UpdateCheckOutcome::Failed(format!("GitHub returned HTTP {}", response.status()));
+    }
+    let release = match response.json::<GitHubRelease>().await {
+        Ok(release) => release,
+        Err(error) => return UpdateCheckOutcome::Failed(error.to_string()),
+    };
+    let (Some(current), Some(latest)) = (
+        parse_version(BRIDGE_VERSION),
+        parse_version(&release.tag_name),
+    ) else {
+        return UpdateCheckOutcome::Failed(format!(
+            "Could not compare versions ({BRIDGE_VERSION} vs {})",
+            release.tag_name
+        ));
+    };
+    if latest > current {
+        UpdateCheckOutcome::Available {
+            version: release.tag_name.trim_start_matches('v').to_owned(),
+        }
+    } else {
+        UpdateCheckOutcome::UpToDate
+    }
 }
 
 struct TrayState {
@@ -152,9 +231,8 @@ pub fn run() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([420.0, 276.0])
-            .with_min_inner_size([420.0, 276.0])
-            .with_max_inner_size([420.0, 276.0])
-            .with_resizable(false)
+            .with_min_inner_size([360.0, 260.0])
+            .with_resizable(true)
             .with_decorations(false)
             .with_icon(app_icon)
             .with_transparent(true),
@@ -196,6 +274,7 @@ fn run_server(
         service.start_game_monitor(Arc::clone(&window_active));
 
         let command_service = service.clone();
+        let command_events = events.clone();
         tokio::spawn(async move {
             while let Some(command) = commands.recv().await {
                 match command {
@@ -203,6 +282,16 @@ fn run_server(
                         if let Err(error) = command_service.set_battery_threshold(percent).await {
                             tracing::error!(%error, "Could not update the battery threshold");
                         }
+                    }
+                    ServerCommand::CheckForUpdate => {
+                        // Its own task: a slow or hung GitHub request should
+                        // not delay other commands (e.g. the battery slider)
+                        // queued behind it.
+                        let events = command_events.clone();
+                        tokio::spawn(async move {
+                            let outcome = check_for_update().await;
+                            let _ = events.send(DesktopEvent::UpdateCheck(outcome));
+                        });
                     }
                 }
             }
@@ -264,6 +353,7 @@ struct BridgeDesktop {
     showing: bool,
     commands: tokio_mpsc::UnboundedSender<ServerCommand>,
     battery_threshold: Option<u8>,
+    update_check: UpdateCheckState,
 }
 
 impl BridgeDesktop {
@@ -344,6 +434,7 @@ impl BridgeDesktop {
             showing: true,
             commands,
             battery_threshold: None,
+            update_check: UpdateCheckState::default(),
         }
     }
 
@@ -353,6 +444,9 @@ impl BridgeDesktop {
                 DesktopEvent::Ready => self.server_ready = true,
                 DesktopEvent::Snapshot(snapshot) => self.snapshot = Some(*snapshot),
                 DesktopEvent::ServerError(error) => self.error = Some(error),
+                DesktopEvent::UpdateCheck(outcome) => {
+                    self.update_check = UpdateCheckState::Done(outcome)
+                }
             }
         }
     }
@@ -616,6 +710,45 @@ impl BridgeDesktop {
                         ui.add_space(4.0);
                         ui.separator();
                         setting_row(ui, "Version", BRIDGE_VERSION);
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+                        let (subtitle, action) = match &self.update_check {
+                            UpdateCheckState::Idle => (
+                                "Check GitHub for a newer release".to_owned(),
+                                UpdateAction::Check,
+                            ),
+                            UpdateCheckState::Checking => {
+                                ("Checking…".to_owned(), UpdateAction::Wait)
+                            }
+                            UpdateCheckState::Done(UpdateCheckOutcome::UpToDate) => {
+                                ("You're up to date".to_owned(), UpdateAction::Check)
+                            }
+                            UpdateCheckState::Done(UpdateCheckOutcome::Available { version }) => {
+                                (format!("v{version} is available"), UpdateAction::Download)
+                            }
+                            UpdateCheckState::Done(UpdateCheckOutcome::Failed(message)) => {
+                                (format!("Could not check: {message}"), UpdateAction::Check)
+                            }
+                        };
+                        setting_label(ui, "Updates", &subtitle, |ui| match action {
+                            UpdateAction::Wait => {
+                                ui.label(RichText::new("…").color(MUTED).size(10.0));
+                            }
+                            UpdateAction::Check => {
+                                if link_button(ui, "Check for updates") {
+                                    self.update_check = UpdateCheckState::Checking;
+                                    let _ = self.commands.send(ServerCommand::CheckForUpdate);
+                                }
+                            }
+                            UpdateAction::Download => {
+                                if link_button(ui, "Download")
+                                    && let Err(error) = open_url(RELEASES_PAGE_URL)
+                                {
+                                    self.error = Some(error.to_string());
+                                }
+                            }
+                        });
                     });
             });
     }
@@ -765,6 +898,8 @@ impl eframe::App for BridgeDesktop {
                     });
             });
 
+        handle_edge_resize(ui.ctx());
+
         // Only keep the render loop alive while the window is actually on
         // screen. Once it is hidden to the tray we stop repainting entirely and
         // pause snapshot production, so an idle Bridge costs almost nothing.
@@ -772,6 +907,45 @@ impl eframe::App for BridgeDesktop {
         if self.showing {
             ui.ctx().request_repaint_after(Duration::from_secs(1));
         }
+    }
+}
+
+/// Detects the pointer sitting in a thin band along the window's edges and
+/// starts an OS-native interactive resize on press, plus sets a matching
+/// resize cursor on hover. Needed because `with_decorations(false)` (the
+/// custom-drawn titlebar) means there is no native chrome to drag from —
+/// checked last so it wins the cursor for the true edge pixels over
+/// whatever other widgets requested that frame.
+fn handle_edge_resize(ctx: &egui::Context) {
+    const MARGIN: f32 = 6.0;
+
+    let Some(pointer) = ctx.input(|input| input.pointer.hover_pos()) else {
+        return;
+    };
+    let rect = ctx.input(|input| input.viewport_rect());
+    let north = pointer.y <= rect.top() + MARGIN;
+    let south = pointer.y >= rect.bottom() - MARGIN;
+    let west = pointer.x <= rect.left() + MARGIN;
+    let east = pointer.x >= rect.right() - MARGIN;
+
+    use egui::{CursorIcon, viewport::ResizeDirection as Dir};
+    let zone = match (north, south, west, east) {
+        (true, _, true, _) => Some((CursorIcon::ResizeNwSe, Dir::NorthWest)),
+        (true, _, _, true) => Some((CursorIcon::ResizeNeSw, Dir::NorthEast)),
+        (_, true, true, _) => Some((CursorIcon::ResizeNeSw, Dir::SouthWest)),
+        (_, true, _, true) => Some((CursorIcon::ResizeNwSe, Dir::SouthEast)),
+        (true, false, false, false) => Some((CursorIcon::ResizeVertical, Dir::North)),
+        (false, true, false, false) => Some((CursorIcon::ResizeVertical, Dir::South)),
+        (false, false, true, false) => Some((CursorIcon::ResizeHorizontal, Dir::West)),
+        (false, false, false, true) => Some((CursorIcon::ResizeHorizontal, Dir::East)),
+        _ => None,
+    };
+    let Some((cursor, direction)) = zone else {
+        return;
+    };
+    ctx.set_cursor_icon(cursor);
+    if ctx.input(|input| input.pointer.primary_pressed()) {
+        ctx.send_viewport_cmd(ViewportCommand::BeginResize(direction));
     }
 }
 
@@ -979,6 +1153,19 @@ fn setting_label(
     });
 }
 
+enum UpdateAction {
+    /// A check is already in flight; nothing to click.
+    Wait,
+    Check,
+    Download,
+}
+
+fn link_button(ui: &mut egui::Ui, label: &str) -> bool {
+    let button =
+        egui::Button::new(RichText::new(label).color(ACCENT).strong().size(10.0)).frame(false);
+    ui.add(button).clicked()
+}
+
 fn step_button(ui: &mut egui::Ui, symbol: &str) -> bool {
     let button = egui::Button::new(RichText::new(symbol).color(TEXT).size(13.0))
         .fill(SURFACE)
@@ -1098,10 +1285,14 @@ fn pill(ui: &mut egui::Ui, label: &str, color: Color32) {
         });
 }
 
-#[cfg(target_os = "windows")]
 fn open_openmouse() -> Result<()> {
+    open_url(OPENMOUSE_URL)
+}
+
+#[cfg(target_os = "windows")]
+fn open_url(url: &str) -> Result<()> {
     let operation = wide("open");
-    let target = wide(OPENMOUSE_URL);
+    let target = wide(url);
     let result = unsafe {
         ShellExecuteW(
             null_mut(),
@@ -1113,19 +1304,19 @@ fn open_openmouse() -> Result<()> {
         )
     } as isize;
     if result <= 32 {
-        return Err(anyhow!("Windows could not open OpenMouse (code {result})"));
+        return Err(anyhow!("Windows could not open {url} (code {result})"));
     }
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn open_openmouse() -> Result<()> {
+fn open_url(url: &str) -> Result<()> {
     let status = std::process::Command::new("open")
-        .arg(OPENMOUSE_URL)
+        .arg(url)
         .status()
-        .context("macOS could not open OpenMouse")?;
+        .with_context(|| format!("macOS could not open {url}"))?;
     if !status.success() {
-        return Err(anyhow!("macOS could not open OpenMouse"));
+        return Err(anyhow!("macOS could not open {url}"));
     }
     Ok(())
 }
