@@ -8,11 +8,6 @@ on:
 
 permissions:
   contents: write
-  # The rolling dev-build job force-pushes a tag; GITHUB_TOKEN needs this
-  # too whenever that ref's commits touch .github/workflows/*.yml, or the
-  # push is rejected ("without `workflows` permission") even though
-  # contents: write already covers ordinary ref pushes.
-  workflows: write
 
 env:
   # Keep in sync with release.yml's NATIVE_HID_NODE_VERSION.
