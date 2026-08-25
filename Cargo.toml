@@ -10,9 +10,12 @@ winresource = "0.1"
 
 [dependencies]
 anyhow = "1.0"
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 directories = "6.0"
-hidapi = "2.6.6"
+# macos-shared-device turns off Darwin's exclusive-by-default open. CONFIRMED
+# on real hardware (see Desktop's src-tauri/src/hid.rs): an exclusive open
+# freezes the mouse's own cursor motion for as long as the handle is held.
+hidapi = { version = "2.6.6", features = ["macos-shared-device"] }
 notify-rust = "4.11"
 png = "0.18"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

@@ -1,10 +1,12 @@
 use std::time::Duration;
 
+use std::sync::Arc;
+
 use axum::{
     Json, Router,
     body::Body,
     extract::{Path, State},
-    http::{HeaderValue, Method, Response, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, Response, StatusCode, header},
     routing::{get, put},
 };
 use serde::{Deserialize, Serialize};
@@ -12,7 +14,7 @@ use tower_http::{cors::CorsLayer, set_header::SetResponseHeaderLayer, trace::Tra
 
 use crate::{
     config::{ApplicationProfile, GameConfig},
-    platform,
+    hid, platform,
     service::{BatteryReading, BridgeService},
 };
 
@@ -60,6 +62,17 @@ pub fn router(service: BridgeService, origins: &[String]) -> Router {
         .route("/v1/default-profile", put(set_default_profile))
         .route("/v1/battery", put(record_battery))
         .route("/v1/autostart", put(set_autostart))
+        // Native HID for browsers without WebHID. Its own origin check runs
+        // inside the handler: a WebSocket handshake never passes through CORS.
+        .route(
+            "/v1/hid",
+            get({
+                let origins = Arc::new(origins.to_vec());
+                move |upgrade, headers: HeaderMap| {
+                    hid::socket::upgrade(upgrade, headers, origins.clone())
+                }
+            }),
+        )
         .layer(SetResponseHeaderLayer::if_not_present(
             axum::http::HeaderName::from_static("access-control-allow-private-network"),
             HeaderValue::from_static("true"),

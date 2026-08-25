@@ -83,12 +83,40 @@ explicit configuration file.
 Only configured web origins receive CORS access. The listener never binds to a
 LAN or public interface.
 
+## Native HID for browsers without WebHID
+
+`GET /v1/hid` upgrades to a WebSocket carrying raw HID: enumerate, open,
+send and receive reports, and a stream of input reports. It exists so Firefox
+and other browsers with no WebHID can run the OpenMouse control panel exactly
+as Chrome does — the web app wraps this socket back into a `navigator.hid`
+shim, and `@openmouse/protocol`'s driver classes run unchanged on top of it.
+
+Unlike the rest of the API, this endpoint parses each device's HID report
+descriptor (`src/hid/descriptor.rs`) and reports real `collections`. That is
+what lets the web app's driver registry auto-detect a mouse here the same way
+it does over WebHID, instead of falling back to a hand-maintained brand table
+the way `native-hid/` has to.
+
+Two rules are enforced on every socket:
+
+- The handshake must carry an `Origin` from `allowedOrigins`. A WebSocket
+  handshake is not covered by CORS, so this check is made by hand — it is all
+  that stands between any page the user visits and their mouse.
+- Generic Desktop mouse and keyboard collections are never listed or opened.
+  Chrome withholds the same ones from WebHID, and opening one natively freezes
+  the device's own input on macOS.
+
+Enumeration is limited to the vendor ids the client asks for, which the web app
+takes from its own supported-device filters, so a page never learns about HID
+devices OpenMouse has no driver for. Every device a socket opened is closed
+when it disconnects.
+
 ## Current boundary
 
 Battery readings initially come from the connected OpenMouse control panel.
-True alerts while the browser is closed require native HID/protocol support in
-Bridge and are a later milestone. Game detection already runs independently in
-the background.
+True alerts while the browser is closed require Bridge to poll a device on its
+own schedule; `/v1/hid` only moves reports while a browser tab is driving it.
+Game detection already runs independently in the background.
 
 ## Verify
 
