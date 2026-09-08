@@ -29,6 +29,7 @@
 globalThis.window ??= globalThis;
 
 import { BRAND_DRIVERS, brandKey } from "./brands.mjs";
+import { applyX11PollingRate, x11DeviceInfos } from "./attack-shark-x11.mjs";
 import { candidateDevices } from "./hid-device-adapter.mjs";
 
 const EXIT_APPLIED = 0;
@@ -74,10 +75,21 @@ async function probe(device, candidate) {
 async function main() {
   const input = JSON.parse(await readStdin());
   const brand = typeof input.brand === "string" ? input.brand : "";
-  const entry = BRAND_DRIVERS[brandKey(brand)];
+  const normalizedBrand = brandKey(brand);
+  const entry = BRAND_DRIVERS[normalizedBrand];
   if (!entry) {
     console.error(`[native-hid] no driver registered for brand "${brand}"`);
     process.exit(EXIT_NO_DRIVER);
+  }
+
+  if (normalizedBrand === "attack shark" && x11DeviceInfos().length > 0) {
+    if (Number.isFinite(input.dpi)) {
+      throw new Error("Attack Shark X11 native DPI control is not implemented yet; polling-only requests are supported.");
+    }
+    if (Number.isFinite(input.pollingRateHz)) {
+      applyX11PollingRate(input.pollingRateHz);
+      process.exit(EXIT_APPLIED);
+    }
   }
 
   const attempts = [];
