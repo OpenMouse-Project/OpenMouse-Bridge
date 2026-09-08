@@ -92,6 +92,12 @@ pub fn read_battery(device_id: &str) -> Result<Option<NativeBattery>> {
     native_hid::read_battery(brand)
 }
 
+/// local Bridge. Native-only devices use this path when WebHID cannot access
+/// their protected configuration interface.
+pub fn apply_settings(brand: &str, dpi: Option<u32>, polling_rate_hz: Option<u32>) -> Result<bool> {
+    native_hid::apply_settings(brand, dpi, polling_rate_hz)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
