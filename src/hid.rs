@@ -174,18 +174,27 @@ impl ReportLayout {
 }
 
 #[derive(Clone)]
-struct Candidate {
+struct CandidatePath {
     path: CString,
+    layout: ReportLayout,
+}
+
+#[derive(Clone)]
+struct Candidate {
+    paths: Vec<CandidatePath>,
     summary: DeviceSummary,
+}
+
+struct OpenPath {
+    device: Arc<Mutex<HidDevice>>,
     layout: ReportLayout,
 }
 
 struct OpenDevice {
-    device: Arc<Mutex<HidDevice>>,
-    layout: ReportLayout,
+    paths: Vec<OpenPath>,
     listening: bool,
     stop: Option<Arc<AtomicBool>>,
-    reader: Option<thread::JoinHandle<()>>,
+    readers: Vec<thread::JoinHandle<()>>,
 }
 
 impl OpenDevice {
@@ -193,7 +202,7 @@ impl OpenDevice {
         if let Some(stop) = self.stop.take() {
             stop.store(true, Ordering::Release);
         }
-        if let Some(reader) = self.reader.take() {
+        for reader in self.readers.drain(..) {
             let _ = reader.join();
         }
         self.listening = false;
@@ -209,7 +218,7 @@ impl Drop for OpenDevice {
 struct HidSession {
     api: HidApi,
     next_key: u64,
-    path_keys: HashMap<Vec<u8>, String>,
+    device_keys: HashMap<Vec<u8>, String>,
     candidates: HashMap<String, Candidate>,
     open_devices: HashMap<String, OpenDevice>,
     listeners: HashSet<String>,
@@ -222,7 +231,7 @@ impl HidSession {
             api: HidApi::new()
                 .map_err(|error| format!("could not initialize native HID: {error}"))?,
             next_key: 1,
-            path_keys: HashMap::new(),
+            device_keys: HashMap::new(),
             candidates: HashMap::new(),
             open_devices: HashMap::new(),
             listeners: HashSet::new(),
@@ -277,24 +286,24 @@ impl HidSession {
             .refresh_devices()
             .map_err(|error| format!("could not refresh HID devices: {error}"))?;
 
-        let mut by_path = HashMap::<Vec<u8>, Vec<hidapi::DeviceInfo>>::new();
+        let mut by_device = HashMap::<Vec<u8>, Vec<hidapi::DeviceInfo>>::new();
         for info in self.api.device_list() {
             if vendors.contains(&info.vendor_id()) {
-                by_path
-                    .entry(info.path().to_bytes().to_vec())
+                by_device
+                    .entry(device_group_key(info))
                     .or_default()
                     .push(info.clone());
             }
         }
 
-        let mut summaries = Vec::with_capacity(by_path.len());
-        for (path_bytes, infos) in by_path {
-            let key = if let Some(key) = self.path_keys.get(&path_bytes) {
+        let mut summaries = Vec::with_capacity(by_device.len());
+        for (device_id, infos) in by_device {
+            let key = if let Some(key) = self.device_keys.get(&device_id) {
                 key.clone()
             } else {
                 let key = format!("hid-{}", self.next_key);
                 self.next_key += 1;
-                self.path_keys.insert(path_bytes, key.clone());
+                self.device_keys.insert(device_id, key.clone());
                 key
             };
             if !self.candidates.contains_key(&key) {
@@ -317,18 +326,30 @@ impl HidSession {
             .candidates
             .get(key)
             .ok_or_else(|| "the selected HID interface is no longer available".to_owned())?;
-        let device = self
-            .api
-            .open_path(&candidate.path)
-            .map_err(|error| format!("could not open the HID interface: {error}"))?;
+        let mut paths = Vec::with_capacity(candidate.paths.len());
+        let mut errors = Vec::new();
+        for candidate_path in &candidate.paths {
+            match self.api.open_path(&candidate_path.path) {
+                Ok(device) => paths.push(OpenPath {
+                    device: Arc::new(Mutex::new(device)),
+                    layout: candidate_path.layout.clone(),
+                }),
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        if paths.is_empty() {
+            return Err(format!(
+                "could not open the HID interface: {}",
+                errors.join("; ")
+            ));
+        }
         self.open_devices.insert(
             key.to_owned(),
             OpenDevice {
-                device: Arc::new(Mutex::new(device)),
-                layout: candidate.layout.clone(),
+                paths,
                 listening: false,
                 stop: None,
-                reader: None,
+                readers: Vec::new(),
             },
         );
         if self.listeners.contains(key) {
@@ -364,57 +385,64 @@ impl HidSession {
         if open.listening {
             return Ok(());
         }
-        let device = Arc::clone(&open.device);
         let stop = Arc::new(AtomicBool::new(false));
-        let thread_stop = Arc::clone(&stop);
-        let tx = self.input_tx.clone();
-        let device_key = key.to_owned();
-        let buffer_len = open.layout.input_buffer_len();
-        let uses_report_ids = open.layout.input_uses_report_ids();
-        let reader = thread::Builder::new()
-            .name(format!("openmouse-hid-{key}"))
-            .spawn(move || {
-                let mut buffer = vec![0; buffer_len];
-                while !thread_stop.load(Ordering::Acquire) {
-                    let result = device
-                        .lock()
-                        .map_err(|_| "native HID lock was poisoned".to_owned())
-                        .and_then(|device| {
-                            device
-                                .read_timeout(&mut buffer, READ_TIMEOUT_MS)
-                                .map_err(|error| error.to_string())
-                        });
-                    match result {
-                        Ok(0) => {}
-                        Ok(size) => {
-                            let (report_id, data) = if uses_report_ids {
-                                (buffer[0], buffer[1..size].to_vec())
-                            } else {
-                                (0, buffer[..size].to_vec())
-                            };
-                            if tx
-                                .send(InputReport {
-                                    kind: "inputreport",
-                                    device: device_key.clone(),
-                                    report_id,
-                                    data,
-                                })
-                                .is_err()
-                            {
+        for (index, path) in open.paths.iter().enumerate() {
+            let device = Arc::clone(&path.device);
+            let buffer_len = path.layout.input_buffer_len();
+            let uses_report_ids = path.layout.input_uses_report_ids();
+            let thread_stop = Arc::clone(&stop);
+            let tx = self.input_tx.clone();
+            let device_key = key.to_owned();
+            let reader = thread::Builder::new()
+                .name(format!("openmouse-hid-{key}-{index}"))
+                .spawn(move || {
+                    let mut buffer = vec![0; buffer_len];
+                    while !thread_stop.load(Ordering::Acquire) {
+                        let result = device
+                            .lock()
+                            .map_err(|_| "native HID lock was poisoned".to_owned())
+                            .and_then(|device| {
+                                device
+                                    .read_timeout(&mut buffer, READ_TIMEOUT_MS)
+                                    .map_err(|error| error.to_string())
+                            });
+                        match result {
+                            Ok(0) => {}
+                            Ok(size) => {
+                                let (report_id, data) = if uses_report_ids {
+                                    (buffer[0], buffer[1..size].to_vec())
+                                } else {
+                                    (0, buffer[..size].to_vec())
+                                };
+                                if tx
+                                    .send(InputReport {
+                                        kind: "inputreport",
+                                        device: device_key.clone(),
+                                        report_id,
+                                        data,
+                                    })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    device = %device_key,
+                                    interface = index,
+                                    %error,
+                                    "Native HID input reader stopped"
+                                );
                                 break;
                             }
                         }
-                        Err(error) => {
-                            tracing::warn!(device = %device_key, %error, "Native HID input reader stopped");
-                            break;
-                        }
                     }
-                }
-            })
-            .map_err(|error| format!("could not start the HID input reader: {error}"))?;
+                })
+                .map_err(|error| format!("could not start the HID input reader: {error}"))?;
+            open.readers.push(reader);
+        }
         open.listening = true;
         open.stop = Some(stop);
-        open.reader = Some(reader);
         Ok(())
     }
 
@@ -443,19 +471,34 @@ impl HidSession {
         let mut frame = Vec::with_capacity(data.len() + 1);
         frame.push(report_id);
         frame.extend_from_slice(&data);
-        let device = open
-            .device
-            .lock()
-            .map_err(|_| "native HID lock was poisoned".to_owned())?;
-        if feature {
-            device
-                .send_feature_report(&frame)
-                .map_err(|error| format!("could not send feature report {report_id}: {error}"))
+        let mut sent = false;
+        let mut last_error = None;
+        for path in &open.paths {
+            let result = path
+                .device
+                .lock()
+                .map_err(|_| "native HID lock was poisoned".to_owned())
+                .and_then(|device| {
+                    if feature {
+                        device.send_feature_report(&frame).map(|_| ())
+                    } else {
+                        device.write(&frame).map(|_| ())
+                    }
+                    .map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(()) => sent = true,
+                Err(error) => last_error = Some(error),
+            }
+        }
+        if sent {
+            Ok(())
         } else {
-            device
-                .write(&frame)
-                .map(|_| ())
-                .map_err(|error| format!("could not send output report {report_id}: {error}"))
+            let operation = if feature { "feature" } else { "output" };
+            Err(format!(
+                "could not send {operation} report {report_id}: {}",
+                last_error.unwrap_or_else(|| "no HID path was open".to_owned())
+            ))
         }
     }
 
@@ -464,19 +507,70 @@ impl HidSession {
             .open_devices
             .get(key)
             .ok_or_else(|| "the HID interface is not open".to_owned())?;
-        let mut data = vec![0; open.layout.feature_buffer_len(report_id)?];
-        data[0] = report_id;
-        let size = open
-            .device
-            .lock()
-            .map_err(|_| "native HID lock was poisoned".to_owned())?
-            .get_feature_report(&mut data)
-            .map_err(|error| format!("could not receive feature report {report_id}: {error}"))?;
-        if size == 0 {
-            return Ok(Vec::new());
+        let mut declared = false;
+        let mut last_error = None;
+        for path in &open.paths {
+            let Ok(buffer_len) = path.layout.feature_buffer_len(report_id) else {
+                continue;
+            };
+            declared = true;
+            let mut data = vec![0; buffer_len];
+            data[0] = report_id;
+            let result = path
+                .device
+                .lock()
+                .map_err(|_| "native HID lock was poisoned".to_owned())
+                .and_then(|device| {
+                    device
+                        .get_feature_report(&mut data)
+                        .map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(0) => return Ok(Vec::new()),
+                Ok(size) => return Ok(data[1..size].to_vec()),
+                Err(error) => last_error = Some(error),
+            }
         }
-        Ok(data[1..size].to_vec())
+        if !declared {
+            return Err(format!(
+                "feature report {report_id} is not declared by this interface"
+            ));
+        }
+        Err(format!(
+            "could not receive feature report {report_id}: {}",
+            last_error.unwrap_or_else(|| "no HID path was open".to_owned())
+        ))
     }
+}
+
+fn device_group_key(info: &hidapi::DeviceInfo) -> Vec<u8> {
+    const RAZER_VENDOR_ID: u16 = 0x1532;
+    const VIPER_ULTIMATE_RECEIVER_ID: u16 = 0x007b;
+
+    if info.vendor_id() == RAZER_VENDOR_ID && info.product_id() == VIPER_ULTIMATE_RECEIVER_ID {
+        if let Some(serial) = info.serial_number().filter(|serial| !serial.is_empty()) {
+            return format!(
+                "razer:{:04x}:{:04x}:{serial}",
+                info.vendor_id(),
+                info.product_id()
+            )
+            .into_bytes();
+        }
+        return interface_path_key(info.path().to_bytes());
+    }
+    info.path().to_bytes().to_vec()
+}
+
+fn interface_path_key(path: &[u8]) -> Vec<u8> {
+    let mut key = path.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
+    if let Some(offset) = key.windows(6).position(|window| {
+        window.starts_with(b"&col")
+            && window[4].is_ascii_hexdigit()
+            && window[5].is_ascii_hexdigit()
+    }) {
+        key.drain(offset..offset + 6);
+    }
+    key
 }
 
 fn inspect_candidate(
@@ -487,27 +581,43 @@ fn inspect_candidate(
     let primary = infos
         .first()
         .ok_or_else(|| "HID enumeration returned an empty interface".to_owned())?;
-    let path = primary.path().to_owned();
-    let fallback_collections = infos
-        .iter()
-        .map(|info| CollectionInfo {
-            usage_page: info.usage_page(),
-            usage: info.usage(),
-            ..CollectionInfo::default()
-        })
-        .collect::<Vec<_>>();
+    let mut unique_paths = Vec::new();
+    let mut seen_paths = HashSet::new();
+    for info in infos {
+        if seen_paths.insert(info.path().to_bytes().to_vec()) {
+            unique_paths.push(info.path().to_owned());
+        }
+    }
 
-    let parsed = api.open_path(&path).ok().and_then(|device| {
-        let mut descriptor = vec![0; MAX_REPORT_DESCRIPTOR_SIZE];
-        let size = device.get_report_descriptor(&mut descriptor).ok()?;
-        parse_report_descriptor(&descriptor[..size]).ok()
-    });
-    let (collections, layout) = parsed
-        .filter(|(collections, _)| !collections.is_empty())
-        .unwrap_or((fallback_collections, ReportLayout::default()));
+    let mut collections = Vec::new();
+    let mut paths = Vec::with_capacity(unique_paths.len());
+    for path in unique_paths {
+        let parsed = api.open_path(&path).ok().and_then(|device| {
+            let mut descriptor = vec![0; MAX_REPORT_DESCRIPTOR_SIZE];
+            let size = device.get_report_descriptor(&mut descriptor).ok()?;
+            parse_report_descriptor(&descriptor[..size]).ok()
+        });
+        let layout = if let Some((mut path_collections, path_layout)) = parsed {
+            collections.append(&mut path_collections);
+            path_layout
+        } else {
+            ReportLayout::default()
+        };
+        paths.push(CandidatePath { path, layout });
+    }
+    if collections.is_empty() {
+        collections = infos
+            .iter()
+            .map(|info| CollectionInfo {
+                usage_page: info.usage_page(),
+                usage: info.usage(),
+                ..CollectionInfo::default()
+            })
+            .collect();
+    }
 
     Ok(Candidate {
-        path,
+        paths,
         summary: DeviceSummary {
             key,
             vendor_id: primary.vendor_id(),
@@ -519,7 +629,6 @@ fn inspect_candidate(
                 .to_owned(),
             collections,
         },
-        layout,
     })
 }
 
@@ -784,6 +893,19 @@ mod tests {
         assert_eq!(collections[0].feature_reports[0].report_id, 5);
         assert_eq!(layout.feature_buffer_len(5).unwrap(), 65);
         assert!(layout.input_uses_report_ids());
+    }
+
+    #[test]
+    fn windows_collection_paths_share_one_interface_identity() {
+        let first = br"\\?\hid#vid_1532&pid_007b&mi_00&col01#8&2b00&0&0000#{hid-guid}";
+        let second = br"\\?\HID#VID_1532&PID_007B&MI_00&COL02#8&2B00&0&0000#{HID-GUID}";
+        let other_interface = br"\\?\hid#vid_1532&pid_007b&mi_01&col01#8&2b00&0&0000#{hid-guid}";
+
+        assert_eq!(interface_path_key(first), interface_path_key(second));
+        assert_ne!(
+            interface_path_key(first),
+            interface_path_key(other_interface)
+        );
     }
 
     #[test]
