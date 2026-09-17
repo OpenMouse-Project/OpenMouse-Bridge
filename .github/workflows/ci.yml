@@ -29,6 +29,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
       - name: Check formatting
         if: runner.os == 'Linux'
         run: cargo fmt --check
@@ -43,9 +44,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+          cache: npm
+          cache-dependency-path: native-hid/package-lock.json
       - name: Build
         run: cargo build --release --locked
       - name: Prepare native-hid (deps + bundled Node.js runtime)

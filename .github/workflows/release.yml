@@ -23,9 +23,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+          cache: npm
+          cache-dependency-path: native-hid/package-lock.json
       - run: cargo test --locked
       - run: cargo build --release --locked
       - name: Sign executable
@@ -69,9 +72,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+          cache: npm
+          cache-dependency-path: native-hid/package-lock.json
       - run: cargo test --locked
       - run: cargo build --release --locked --target aarch64-apple-darwin
       - run: cargo build --release --locked --target x86_64-apple-darwin
