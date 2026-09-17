@@ -23,7 +23,7 @@ use tray_icon::{
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
 
-const OPENMOUSE_URL: &str = "https://openmouse.app";
+const OPENMOUSE_URL: &str = "https://control.openmouse.app";
 const TRAY_AUTOSTART: &str = "openmouse.autostart";
 const TRAY_OPEN: &str = "openmouse.open";
 const TRAY_EXIT: &str = "openmouse.exit";

@@ -80,11 +80,15 @@ async fn hid_upgrade(
     headers: HeaderMap,
     allowed_origins: Arc<HashSet<String>>,
 ) -> Result<Response<Body>, StatusCode> {
-    let origin = headers
+    let Some(origin) = headers
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
-        .ok_or(StatusCode::FORBIDDEN)?;
+    else {
+        tracing::warn!("Rejected native HID WebSocket without an Origin header");
+        return Err(StatusCode::FORBIDDEN);
+    };
     if !allowed_origins.contains(origin) {
+        tracing::warn!(%origin, "Rejected native HID WebSocket from an unapproved origin");
         return Err(StatusCode::FORBIDDEN);
     }
     Ok(websocket.on_upgrade(crate::hid::serve))

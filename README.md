@@ -49,7 +49,7 @@ The relevant part of the generated config looks like this:
   ],
   "profiles": [],
   "allowedOrigins": [
-    "https://dev.openmouse.app",
+    "https://control.openmouse.app",
     "http://localhost:5173"
   ]
 }

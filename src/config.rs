@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 const DEFAULT_BATTERY_THRESHOLD: u8 = 20;
 const DEFAULT_ALERT_COOLDOWN_MINUTES: u64 = 360;
 const OFFICIAL_ORIGINS: &[&str] = &[
+    "https://control.openmouse.app",
     "https://dev.openmouse.app",
     "https://openmouse.app",
     "https://www.openmouse.app",
@@ -187,6 +188,7 @@ const fn default_alert_cooldown() -> u64 {
 
 fn default_origins() -> Vec<String> {
     vec![
+        "https://control.openmouse.app".to_owned(),
         "https://dev.openmouse.app".to_owned(),
         "https://openmouse.app".to_owned(),
         "https://www.openmouse.app".to_owned(),
@@ -225,7 +227,7 @@ mod tests {
             config
                 .allowed_origins
                 .iter()
-                .any(|origin| origin == "https://dev.openmouse.app")
+                .any(|origin| origin == "https://control.openmouse.app")
         );
     }
 }
