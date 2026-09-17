@@ -363,7 +363,7 @@ impl BridgeService {
         Ok(alert)
     }
 
-    pub fn start_game_monitor(&self, window_active: Arc<AtomicBool>) {
+    pub fn start_game_monitor(&self, extract_icons: Arc<AtomicBool>) {
         let service = self.clone();
         tokio::spawn(async move {
             let mut detector = GameDetector::default();
@@ -376,9 +376,9 @@ impl BridgeService {
                     .into_iter()
                     .filter(|application| is_registered_game(application, &games))
                     .collect::<Vec<_>>();
-                // Application icons are only used by the status window, so skip
-                // the expensive extraction while it is hidden to the tray.
-                let icons = if window_active.load(Ordering::Acquire) {
+                // Icon extraction can be disabled by callers that never serve
+                // the application's icon endpoint.
+                let icons = if extract_icons.load(Ordering::Acquire) {
                     let missing_icons = {
                         let state = service.inner.read().await;
                         applications

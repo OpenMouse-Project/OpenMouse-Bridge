@@ -1,10 +1,10 @@
-use std::time::Duration;
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, State},
-    http::{HeaderValue, Method, Response, StatusCode, header},
+    extract::{Path, State, ws::WebSocketUpgrade},
+    http::{HeaderMap, HeaderValue, Method, Response, StatusCode, header},
     routing::{get, put},
 };
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,11 @@ pub fn router(service: BridgeService, origins: &[String]) -> Router {
         .iter()
         .filter_map(|origin| origin.parse().ok())
         .collect();
+    let hid_origins = Arc::new(origins.iter().cloned().collect::<HashSet<_>>());
+    let hid_route = Router::new().route(
+        "/v1/hid",
+        get(move |websocket, headers| hid_upgrade(websocket, headers, Arc::clone(&hid_origins))),
+    );
     let cors = CorsLayer::new()
         .allow_origin(allowed)
         .allow_methods([Method::GET, Method::PUT])
@@ -60,6 +65,7 @@ pub fn router(service: BridgeService, origins: &[String]) -> Router {
         .route("/v1/default-profile", put(set_default_profile))
         .route("/v1/battery", put(record_battery))
         .route("/v1/autostart", put(set_autostart))
+        .merge(hid_route)
         .layer(SetResponseHeaderLayer::if_not_present(
             axum::http::HeaderName::from_static("access-control-allow-private-network"),
             HeaderValue::from_static("true"),
@@ -67,6 +73,21 @@ pub fn router(service: BridgeService, origins: &[String]) -> Router {
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(service)
+}
+
+async fn hid_upgrade(
+    websocket: WebSocketUpgrade,
+    headers: HeaderMap,
+    allowed_origins: Arc<HashSet<String>>,
+) -> Result<Response<Body>, StatusCode> {
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .ok_or(StatusCode::FORBIDDEN)?;
+    if !allowed_origins.contains(origin) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(websocket.on_upgrade(crate::hid::serve))
 }
 
 async fn status(State(service): State<BridgeService>) -> Json<crate::service::BridgeSnapshot> {

@@ -3,6 +3,7 @@ pub mod applications;
 pub mod config;
 pub mod drivers;
 pub mod games;
+mod hid;
 pub mod platform;
 pub mod service;
 

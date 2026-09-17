@@ -6,20 +6,21 @@ portable so Linux and macOS adapters can follow without changing the web app.
 
 The initial service provides:
 
-- a minimal native Windows and macOS status window with a shortcut to OpenMouse;
+- a tray icon with **Run on Start**, **Open OpenMouse**, and **Exit** actions;
 - process-based detection for configured game executables;
 - discovery of visible Windows and macOS applications and the foreground application;
 - persistent application profiles tied to a specific mouse;
 - low-battery notifications with a configurable threshold and cooldown;
-- Windows startup-at-login registration under the current user;
+- startup-at-login registration under the current user;
+- native HID access for devices and collections that browsers cannot expose;
 - a versioned HTTP API bound only to `127.0.0.1:17846`;
 - an explicit browser-origin allowlist.
 
 It does not run as an elevated Windows Service. It runs in the signed-in user's
-session, which is required for desktop notifications and avoids administrator
-permissions. Closing the status window hides it to the system tray while game
-detection and the loopback API continue running. The tray menu can restore the
-window, open OpenMouse, or explicitly quit Bridge.
+session, which is required for the tray icon and desktop notifications and
+avoids administrator permissions. Bridge has no status or settings window; the
+tray menu is its complete native interface while device control remains in the
+OpenMouse web app.
 
 ## Run locally
 
@@ -79,16 +80,21 @@ explicit configuration file.
 - `PUT /v1/battery` accepts `{ deviceId, deviceName, percent, charging }` and
   applies the notification threshold and cooldown.
 - `PUT /v1/autostart` accepts `{ enabled }`. It is implemented on Windows.
+- `GET /v1/hid` upgrades to the native HID WebSocket transport. It enumerates
+  only vendor IDs requested by OpenMouse, reports parsed HID collections, and
+  supports open, close, input, output, and feature-report operations. This lets
+  the existing `@openmouse/protocol` drivers run unchanged when WebHID is absent
+  or blocks a protected collection.
 
-Only configured web origins receive CORS access. The listener never binds to a
-LAN or public interface.
+HTTP CORS and WebSocket upgrades both enforce the configured origin allowlist.
+The listener binds only to loopback, never to a LAN or public interface.
 
 ## Current boundary
 
-Battery readings initially come from the connected OpenMouse control panel.
-True alerts while the browser is closed require native HID/protocol support in
-Bridge and are a later milestone. Game detection already runs independently in
-the background.
+The HID WebSocket is active only while the control panel is connected. Battery
+readings still come from that panel, so true battery alerts while the browser is
+closed require a background native protocol reader. Game detection and saved
+profile switching already run independently in the background.
 
 ## Verify
 
