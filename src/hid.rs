@@ -15,6 +15,8 @@ use tokio::sync::mpsc;
 
 const MAX_REPORT_BYTES: usize = MAX_REPORT_DESCRIPTOR_SIZE;
 const READ_TIMEOUT_MS: i32 = 100;
+const RAZER_VENDOR_ID: u16 = 0x1532;
+const RAZER_FEATURE_BUFFER_LEN: usize = 91;
 
 #[derive(Debug, Deserialize)]
 struct ClientMessage {
@@ -192,6 +194,7 @@ struct OpenPath {
 
 struct OpenDevice {
     paths: Vec<OpenPath>,
+    vendor_id: u16,
     listening: bool,
     stop: Option<Arc<AtomicBool>>,
     readers: Vec<thread::JoinHandle<()>>,
@@ -347,6 +350,7 @@ impl HidSession {
             key.to_owned(),
             OpenDevice {
                 paths,
+                vendor_id: candidate.summary.vendor_id,
                 listening: false,
                 stop: None,
                 readers: Vec::new(),
@@ -507,13 +511,16 @@ impl HidSession {
             .open_devices
             .get(key)
             .ok_or_else(|| "the HID interface is not open".to_owned())?;
-        let mut declared = false;
+        let mut available = false;
+        let mut fallback_response = None;
         let mut last_error = None;
         for path in &open.paths {
-            let Ok(buffer_len) = path.layout.feature_buffer_len(report_id) else {
-                continue;
+            let buffer_len = match path.layout.feature_buffer_len(report_id) {
+                Ok(length) => length,
+                Err(_) if open.vendor_id == RAZER_VENDOR_ID => RAZER_FEATURE_BUFFER_LEN,
+                Err(_) => continue,
             };
-            declared = true;
+            available = true;
             let mut data = vec![0; buffer_len];
             data[0] = report_id;
             let result = path
@@ -526,12 +533,24 @@ impl HidSession {
                         .map_err(|error| error.to_string())
                 });
             match result {
-                Ok(0) => return Ok(Vec::new()),
-                Ok(size) => return Ok(data[1..size].to_vec()),
+                Ok(size) => {
+                    let response = if size == 0 {
+                        Vec::new()
+                    } else {
+                        data[1..size].to_vec()
+                    };
+                    if open.vendor_id != RAZER_VENDOR_ID || response.iter().any(|byte| *byte != 0) {
+                        return Ok(response);
+                    }
+                    fallback_response.get_or_insert(response);
+                }
                 Err(error) => last_error = Some(error),
             }
         }
-        if !declared {
+        if let Some(response) = fallback_response {
+            return Ok(response);
+        }
+        if !available {
             return Err(format!(
                 "feature report {report_id} is not declared by this interface"
             ));
@@ -543,34 +562,18 @@ impl HidSession {
     }
 }
 
-fn device_group_key(info: &hidapi::DeviceInfo) -> Vec<u8> {
-    const RAZER_VENDOR_ID: u16 = 0x1532;
-    const VIPER_ULTIMATE_RECEIVER_ID: u16 = 0x007b;
-
-    if info.vendor_id() == RAZER_VENDOR_ID && info.product_id() == VIPER_ULTIMATE_RECEIVER_ID {
-        if let Some(serial) = info.serial_number().filter(|serial| !serial.is_empty()) {
-            return format!(
-                "razer:{:04x}:{:04x}:{serial}",
-                info.vendor_id(),
-                info.product_id()
-            )
-            .into_bytes();
-        }
-        return interface_path_key(info.path().to_bytes());
-    }
-    info.path().to_bytes().to_vec()
+fn razer_group_key(product_id: u16, serial: Option<&str>) -> Vec<u8> {
+    format!("razer:{product_id:04x}:{}", serial.unwrap_or("no-serial")).into_bytes()
 }
 
-fn interface_path_key(path: &[u8]) -> Vec<u8> {
-    let mut key = path.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
-    if let Some(offset) = key.windows(6).position(|window| {
-        window.starts_with(b"&col")
-            && window[4].is_ascii_hexdigit()
-            && window[5].is_ascii_hexdigit()
-    }) {
-        key.drain(offset..offset + 6);
+fn device_group_key(info: &hidapi::DeviceInfo) -> Vec<u8> {
+    if info.vendor_id() == RAZER_VENDOR_ID {
+        return razer_group_key(
+            info.product_id(),
+            info.serial_number().filter(|serial| !serial.is_empty()),
+        );
     }
-    key
+    info.path().to_bytes().to_vec()
 }
 
 fn inspect_candidate(
@@ -589,14 +592,19 @@ fn inspect_candidate(
         }
     }
 
+    let inspect_descriptors = primary.vendor_id() != RAZER_VENDOR_ID;
     let mut collections = Vec::new();
     let mut paths = Vec::with_capacity(unique_paths.len());
     for path in unique_paths {
-        let parsed = api.open_path(&path).ok().and_then(|device| {
-            let mut descriptor = vec![0; MAX_REPORT_DESCRIPTOR_SIZE];
-            let size = device.get_report_descriptor(&mut descriptor).ok()?;
-            parse_report_descriptor(&descriptor[..size]).ok()
-        });
+        let parsed = inspect_descriptors
+            .then(|| {
+                api.open_path(&path).ok().and_then(|device| {
+                    let mut descriptor = vec![0; MAX_REPORT_DESCRIPTOR_SIZE];
+                    let size = device.get_report_descriptor(&mut descriptor).ok()?;
+                    parse_report_descriptor(&descriptor[..size]).ok()
+                })
+            })
+            .flatten();
         let layout = if let Some((mut path_collections, path_layout)) = parsed {
             collections.append(&mut path_collections);
             path_layout
@@ -896,16 +904,17 @@ mod tests {
     }
 
     #[test]
-    fn windows_collection_paths_share_one_interface_identity() {
-        let first = br"\\?\hid#vid_1532&pid_007b&mi_00&col01#8&2b00&0&0000#{hid-guid}";
-        let second = br"\\?\HID#VID_1532&PID_007B&MI_00&COL02#8&2B00&0&0000#{HID-GUID}";
-        let other_interface = br"\\?\hid#vid_1532&pid_007b&mi_01&col01#8&2b00&0&0000#{hid-guid}";
-
-        assert_eq!(interface_path_key(first), interface_path_key(second));
-        assert_ne!(
-            interface_path_key(first),
-            interface_path_key(other_interface)
+    fn razer_interfaces_share_one_transport_identity() {
+        assert_eq!(
+            razer_group_key(0x00b0, Some("receiver-123")),
+            razer_group_key(0x00b0, Some("receiver-123"))
         );
+        assert_eq!(razer_group_key(0x00b0, None), razer_group_key(0x00b0, None));
+        assert_ne!(
+            razer_group_key(0x00b0, Some("receiver-123")),
+            razer_group_key(0x00b0, Some("receiver-456"))
+        );
+        assert_ne!(razer_group_key(0x00b0, None), razer_group_key(0x00b1, None));
     }
 
     #[test]
