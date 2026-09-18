@@ -36,6 +36,12 @@ struct AutostartPayload {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct BatteryThresholdPayload {
+    percent: u8,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ProfilesPayload {
     profiles: Vec<ApplicationProfile>,
 }
@@ -65,6 +71,7 @@ pub fn router(service: BridgeService, origins: &[String]) -> Router {
         .route("/v1/default-profile", put(set_default_profile))
         .route("/v1/battery", put(record_battery))
         .route("/v1/autostart", put(set_autostart))
+        .route("/v1/battery-threshold", put(set_battery_threshold))
         .merge(hid_route)
         .layer(SetResponseHeaderLayer::if_not_present(
             axum::http::HeaderName::from_static("access-control-allow-private-network"),
@@ -171,6 +178,17 @@ async fn record_battery(
 ) -> Result<Json<ApiResult>, (StatusCode, String)> {
     service
         .record_battery(reading)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(ApiResult { ok: true }))
+}
+
+async fn set_battery_threshold(
+    State(service): State<BridgeService>,
+    Json(payload): Json<BatteryThresholdPayload>,
+) -> Result<Json<ApiResult>, (StatusCode, String)> {
+    service
+        .set_battery_threshold(payload.percent)
         .await
         .map_err(internal_error)?;
     Ok(Json(ApiResult { ok: true }))
