@@ -154,6 +154,14 @@ pub fn config_path() -> Result<PathBuf> {
     Ok(dirs.config_dir().join("config.json"))
 }
 
+pub fn log_dir() -> Result<PathBuf> {
+    let config = config_path()?;
+    let parent = config
+        .parent()
+        .context("the Bridge config path has no parent directory")?;
+    Ok(parent.join("logs"))
+}
+
 pub fn load_or_create() -> Result<(BridgeConfig, PathBuf)> {
     let path = config_path()?;
     if path.exists() {

@@ -58,6 +58,20 @@ The relevant part of the generated config looks like this:
 For development and portable tests, `OPENMOUSE_BRIDGE_CONFIG` can point to an
 explicit configuration file.
 
+## Logs
+
+Bridge writes daily `openmouse-bridge.*.log` files to a `logs` directory beside
+its generated configuration and retains the latest seven files. On Windows this
+is `%APPDATA%\OpenMouse\OpenMouse Bridge\logs` by default. The first startup log
+line includes the resolved log directory when a custom config path or another
+platform is used.
+
+The native HID trace records WebSocket sessions, command names and durations,
+enumerated device IDs, transport counts, slow scans, and errors. It does not log
+HID report payloads or full device serial numbers. Set `RUST_LOG=openmouse_bridge=debug`
+before starting Bridge to include unchanged polling scans and per-device
+enumeration details.
+
 ## Loopback API
 
 - `GET /v1/status` reports the Bridge version, platform, active games, battery

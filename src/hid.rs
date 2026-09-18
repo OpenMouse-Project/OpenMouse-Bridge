@@ -3,9 +3,10 @@ use std::{
     ffi::CString,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
+    time::Instant,
 };
 
 use axum::extract::ws::{Message, WebSocket};
@@ -17,6 +18,7 @@ const MAX_REPORT_BYTES: usize = MAX_REPORT_DESCRIPTOR_SIZE;
 const READ_TIMEOUT_MS: i32 = 100;
 const RAZER_VENDOR_ID: u16 = 0x1532;
 const RAZER_FEATURE_BUFFER_LEN: usize = 91;
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Deserialize)]
 struct ClientMessage {
@@ -61,6 +63,21 @@ enum Command {
         #[serde(rename = "reportId")]
         report_id: u8,
     },
+}
+
+impl Command {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::List { .. } => "list",
+            Self::Open { .. } => "open",
+            Self::Close { .. } => "close",
+            Self::Listen { .. } => "listen",
+            Self::Unlisten { .. } => "unlisten",
+            Self::SendReport { .. } => "sendReport",
+            Self::SendFeatureReport { .. } => "sendFeatureReport",
+            Self::ReceiveFeatureReport { .. } => "receiveFeatureReport",
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -219,9 +236,11 @@ impl Drop for OpenDevice {
 }
 
 struct HidSession {
+    session_id: u64,
     api: HidApi,
     next_key: u64,
     device_keys: HashMap<Vec<u8>, String>,
+    last_device_keys: Option<Vec<String>>,
     candidates: HashMap<String, Candidate>,
     open_devices: HashMap<String, OpenDevice>,
     listeners: HashSet<String>,
@@ -229,12 +248,14 @@ struct HidSession {
 }
 
 impl HidSession {
-    fn new(input_tx: mpsc::UnboundedSender<InputReport>) -> Result<Self, String> {
+    fn new(session_id: u64, input_tx: mpsc::UnboundedSender<InputReport>) -> Result<Self, String> {
         Ok(Self {
+            session_id,
             api: HidApi::new()
                 .map_err(|error| format!("could not initialize native HID: {error}"))?,
             next_key: 1,
             device_keys: HashMap::new(),
+            last_device_keys: None,
             candidates: HashMap::new(),
             open_devices: HashMap::new(),
             listeners: HashSet::new(),
@@ -244,6 +265,12 @@ impl HidSession {
 
     fn execute(&mut self, message: ClientMessage) -> Reply {
         let id = message.id;
+        let command = message.command.kind();
+        let vendor_count = match &message.command {
+            Command::List { vendor_ids } => Some(vendor_ids.len()),
+            _ => None,
+        };
+        let started = Instant::now();
         let outcome = match message.command {
             Command::List { vendor_ids } => self.list(vendor_ids).map(|devices| Reply {
                 devices: Some(devices),
@@ -274,7 +301,60 @@ impl HidSession {
                     ..Reply::ok(id)
                 }),
         };
-        outcome.unwrap_or_else(|error| Reply::error(id, error))
+        let reply = outcome.unwrap_or_else(|error| Reply::error(id, error));
+        let elapsed_ms = started.elapsed().as_millis();
+        let device_count = reply.devices.as_ref().map(Vec::len);
+        let listed_keys = reply.devices.as_ref().map(|devices| {
+            devices
+                .iter()
+                .map(|device| device.key.clone())
+                .collect::<Vec<_>>()
+        });
+        let inventory_changed = listed_keys
+            .as_ref()
+            .is_some_and(|keys| self.last_device_keys.as_ref() != Some(keys));
+        if let Some(keys) = listed_keys {
+            self.last_device_keys = Some(keys);
+        }
+        if !reply.ok {
+            tracing::warn!(
+                session_id = self.session_id,
+                request_id = id,
+                command,
+                elapsed_ms,
+                error = reply.error.as_deref().unwrap_or("unknown error"),
+                "HID command failed"
+            );
+        } else if command == "list" && elapsed_ms >= 1_000 {
+            tracing::warn!(
+                session_id = self.session_id,
+                request_id = id,
+                command,
+                elapsed_ms,
+                vendor_count,
+                device_count,
+                "HID enumeration was slow"
+            );
+        } else if matches!(command, "open" | "close") || (command == "list" && inventory_changed) {
+            tracing::info!(
+                session_id = self.session_id,
+                request_id = id,
+                command,
+                elapsed_ms,
+                vendor_count,
+                device_count,
+                "HID command completed"
+            );
+        } else {
+            tracing::debug!(
+                session_id = self.session_id,
+                request_id = id,
+                command,
+                elapsed_ms,
+                "HID command completed"
+            );
+        }
+        reply
     }
 
     fn list(&mut self, vendor_ids: Vec<u16>) -> Result<Vec<DeviceSummary>, String> {
@@ -315,6 +395,15 @@ impl HidSession {
             }
             if let Some(candidate) = self.candidates.get(&key) {
                 summaries.push(candidate.summary.clone());
+                tracing::debug!(
+                    session_id = self.session_id,
+                    device_key = %candidate.summary.key,
+                    vendor_id = format_args!("{:#06x}", candidate.summary.vendor_id),
+                    product_id = format_args!("{:#06x}", candidate.summary.product_id),
+                    product_name = %candidate.summary.product_name,
+                    path_count = candidate.paths.len(),
+                    "HID device enumerated"
+                );
             }
         }
         summaries.sort_by(|left, right| left.key.cmp(&right.key));
@@ -346,6 +435,15 @@ impl HidSession {
                 errors.join("; ")
             ));
         }
+        tracing::info!(
+            session_id = self.session_id,
+            device_key = key,
+            vendor_id = format_args!("{:#06x}", candidate.summary.vendor_id),
+            product_id = format_args!("{:#06x}", candidate.summary.product_id),
+            opened_paths = paths.len(),
+            failed_paths = errors.len(),
+            "HID device opened"
+        );
         self.open_devices.insert(
             key.to_owned(),
             OpenDevice {
@@ -817,10 +915,13 @@ fn build_collection(index: usize, nodes: &[CollectionNode]) -> CollectionInfo {
 }
 
 pub async fn serve(mut socket: WebSocket) {
+    let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+    tracing::info!(session_id, "HID websocket connected");
     let (input_tx, mut input_rx) = mpsc::unbounded_channel();
-    let session = match HidSession::new(input_tx) {
+    let session = match HidSession::new(session_id, input_tx) {
         Ok(session) => Arc::new(Mutex::new(session)),
         Err(error) => {
+            tracing::warn!(session_id, %error, "HID session initialization failed");
             let _ = send_json(&mut socket, &Reply::error(0, error)).await;
             return;
         }
@@ -837,6 +938,7 @@ pub async fn serve(mut socket: WebSocket) {
                 let request = match serde_json::from_str::<ClientMessage>(&text) {
                     Ok(request) => request,
                     Err(error) => {
+                        tracing::warn!(session_id, %error, "Invalid HID websocket command");
                         if send_json(&mut socket, &Reply::error(0, format!("invalid HID command: {error}"))).await.is_err() {
                             break;
                         }
@@ -864,6 +966,7 @@ pub async fn serve(mut socket: WebSocket) {
     }
 
     drop(session);
+    tracing::info!(session_id, "HID websocket disconnected");
 }
 
 async fn send_json(socket: &mut WebSocket, value: &impl Serialize) -> Result<(), axum::Error> {
