@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 
 const MAX_REPORT_BYTES: usize = MAX_REPORT_DESCRIPTOR_SIZE;
 const READ_TIMEOUT_MS: i32 = 100;
+const LOGITECH_VENDOR_ID: u16 = 0x046D;
 const RAZER_VENDOR_ID: u16 = 0x1532;
 const RAZER_FEATURE_BUFFER_LEN: usize = 91;
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -163,6 +164,7 @@ struct ReportItem {
 struct ReportLayout {
     feature_bits: HashMap<u8, usize>,
     input_bits: HashMap<u8, usize>,
+    output_bits: HashMap<u8, usize>,
 }
 
 impl ReportLayout {
@@ -575,7 +577,25 @@ impl HidSession {
         frame.extend_from_slice(&data);
         let mut sent = false;
         let mut last_error = None;
+        let declared_path_exists = open.paths.iter().any(|path| {
+            let reports = if feature {
+                &path.layout.feature_bits
+            } else {
+                &path.layout.output_bits
+            };
+            reports.contains_key(&report_id)
+        });
         for path in &open.paths {
+            if declared_path_exists {
+                let reports = if feature {
+                    &path.layout.feature_bits
+                } else {
+                    &path.layout.output_bits
+                };
+                if !reports.contains_key(&report_id) {
+                    continue;
+                }
+            }
             let result = path
                 .device
                 .lock()
@@ -660,13 +680,18 @@ impl HidSession {
     }
 }
 
-fn razer_group_key(product_id: u16, serial: Option<&str>) -> Vec<u8> {
-    format!("razer:{product_id:04x}:{}", serial.unwrap_or("no-serial")).into_bytes()
+fn grouped_device_key(vendor_id: u16, product_id: u16, serial: Option<&str>) -> Vec<u8> {
+    format!(
+        "{vendor_id:04x}:{product_id:04x}:{}",
+        serial.unwrap_or("no-serial")
+    )
+    .into_bytes()
 }
 
 fn device_group_key(info: &hidapi::DeviceInfo) -> Vec<u8> {
-    if info.vendor_id() == RAZER_VENDOR_ID {
-        return razer_group_key(
+    if matches!(info.vendor_id(), RAZER_VENDOR_ID | LOGITECH_VENDOR_ID) {
+        return grouped_device_key(
+            info.vendor_id(),
             info.product_id(),
             info.serial_number().filter(|serial| !serial.is_empty()),
         );
@@ -852,10 +877,10 @@ fn parse_report_descriptor(bytes: &[u8]) -> Result<(Vec<CollectionInfo>, ReportL
                         );
                     let totals = match tag {
                         8 => &mut layout.input_bits,
+                        9 => &mut layout.output_bits,
                         11 => &mut layout.feature_bits,
                         _ => {
-                            usages.clear();
-                            continue;
+                            unreachable!("only input, output, and feature items reach this branch")
                         }
                     };
                     *totals.entry(globals.report_id).or_default() = totals
@@ -1001,23 +1026,34 @@ mod tests {
         assert_eq!(collections[0].input_reports[0].report_id, 8);
         assert_eq!(collections[0].input_reports[0].items[0].report_count, 16);
         assert_eq!(collections[0].output_reports[0].report_id, 8);
+        assert_eq!(layout.output_bits.get(&8), Some(&128));
         assert_eq!(collections[0].feature_reports[0].report_id, 5);
         assert_eq!(layout.feature_buffer_len(5).unwrap(), 65);
         assert!(layout.input_uses_report_ids());
     }
 
     #[test]
-    fn razer_interfaces_share_one_transport_identity() {
+    fn multi_interface_devices_share_one_transport_identity() {
         assert_eq!(
-            razer_group_key(0x00b0, Some("receiver-123")),
-            razer_group_key(0x00b0, Some("receiver-123"))
+            grouped_device_key(RAZER_VENDOR_ID, 0x00b0, Some("receiver-123")),
+            grouped_device_key(RAZER_VENDOR_ID, 0x00b0, Some("receiver-123"))
         );
-        assert_eq!(razer_group_key(0x00b0, None), razer_group_key(0x00b0, None));
+        assert_eq!(
+            grouped_device_key(LOGITECH_VENDOR_ID, 0xc54d, None),
+            grouped_device_key(LOGITECH_VENDOR_ID, 0xc54d, None)
+        );
         assert_ne!(
-            razer_group_key(0x00b0, Some("receiver-123")),
-            razer_group_key(0x00b0, Some("receiver-456"))
+            grouped_device_key(RAZER_VENDOR_ID, 0x00b0, Some("receiver-123")),
+            grouped_device_key(RAZER_VENDOR_ID, 0x00b0, Some("receiver-456"))
         );
-        assert_ne!(razer_group_key(0x00b0, None), razer_group_key(0x00b1, None));
+        assert_ne!(
+            grouped_device_key(RAZER_VENDOR_ID, 0x00b0, None),
+            grouped_device_key(LOGITECH_VENDOR_ID, 0x00b0, None)
+        );
+        assert_ne!(
+            grouped_device_key(LOGITECH_VENDOR_ID, 0xc54d, None),
+            grouped_device_key(LOGITECH_VENDOR_ID, 0xc548, None)
+        );
     }
 
     #[test]

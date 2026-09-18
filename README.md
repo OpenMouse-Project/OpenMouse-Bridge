@@ -62,7 +62,7 @@ explicit configuration file.
 
 Bridge writes daily `openmouse-bridge.*.log` files to a `logs` directory beside
 its generated configuration and retains the latest seven files. On Windows this
-is `%APPDATA%\OpenMouse\OpenMouse Bridge\logs` by default. The first startup log
+is `%APPDATA%\OpenMouse\OpenMouse Bridge\config\logs` by default. The first startup log
 line includes the resolved log directory when a custom config path or another
 platform is used.
 
