@@ -116,9 +116,14 @@ class ManagedDevice {
     this.key = key;
     this.vendorId = candidate.vendorId;
     this.productId = candidate.productId;
-    this.productName = (candidate.vendorId === 0x1d57 && (candidate.productId === 0xfa60 || candidate.productId === 0xfa55))
-      ? "Delux M800 Mini"
-      : (candidate.productName || "Delux Mouse");
+    // NOTE: Do NOT override productName with "Delux M800 Mini" here.
+    // AttackSharkHidClient.detectFamily() explicitly rejects devices whose
+    // productName matches /delux/i and returns null (unsupported), which
+    // breaks battery tracking. The driver identifies the X11 family by PID
+    // (0xfa60 / 0xfa55) when collections.length === 0 (our Bridge adapter),
+    // so leave the raw hardware name intact. Delux branding is applied via
+    // device-images.ts and i18n on the UI side, not here.
+    this.productName = candidate.productName || "";
     this.path = candidate._infos[0]?.path;
     this.adapter = candidate;
     this._listeners = new Set();
@@ -140,15 +145,20 @@ class ManagedDevice {
       this.batteryPercent = pct;
       this.batteryAt = Date.now();
       console.log(`[Bridge] 🔋 Battery update for ${this.productName}: ${pct}%`);
-      // Push battery event to all connected WebSocket clients.
-      const event = JSON.stringify({
-        type: 'battery',
+      // Forward the raw battery input report to all connected WebSocket clients
+      // using type:'report' — the format bridge-hid.ts's #receive handler
+      // already understands and routes to device.deliver() → AttackShark
+      // driver's onInputReport → x11RuntimeStates cache update.
+      // Payload mirrors the real HID packet: [0x55, 0x40, 0x01, pct]
+      const reportPayload = [BATTERY_SIGNATURE[0], BATTERY_SIGNATURE[1], BATTERY_SIGNATURE[2], pct];
+      const reportEvent = JSON.stringify({
+        type: 'report',
         device: this.key,
-        batteryPercent: pct,
-        batteryState: 'Discharging',
+        reportId: BATTERY_REPORT_ID,
+        data: reportPayload,
       });
       for (const ws of activeSockets) {
-        try { ws.send(event); } catch { /* client gone */ }
+        try { ws.send(reportEvent); } catch { /* client gone */ }
       }
     };
     this._batteryMonitor = handler;
@@ -392,6 +402,20 @@ wss.on('connection', (ws) => {
         dev._bridgeListener = handler;
         dev.adapter.addEventListener('inputreport', handler);
         ws.send(JSON.stringify({ id, ok: true }));
+        // If we already have a cached battery value from the passive monitor,
+        // replay it immediately as a fake input report so the AttackShark
+        // driver's waitForX11Battery() 2.5-second wait resolves instantly
+        // instead of timing out and returning null.
+        if (dev.batteryPercent !== null && dev.batteryAt > Date.now() - 60_000) {
+          const pct = dev.batteryPercent;
+          const replay = JSON.stringify({
+            type: 'report',
+            device: msg.device,
+            reportId: BATTERY_REPORT_ID,
+            data: [BATTERY_SIGNATURE[0], BATTERY_SIGNATURE[1], BATTERY_SIGNATURE[2], pct],
+          });
+          try { ws.send(replay); } catch { /* client gone */ }
+        }
       }
       return;
     }
