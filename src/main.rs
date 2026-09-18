@@ -93,7 +93,11 @@ fn init_tracing() -> Option<WorkerGuard> {
         Ok((directory, appender)) => {
             let (writer, guard) = tracing_appender::non_blocking(appender);
             subscriber.with_writer(std::io::stdout.and(writer)).init();
-            tracing::info!(log_directory = %directory.display(), "Bridge file logging initialized");
+            tracing::info!(
+                version = env!("CARGO_PKG_VERSION"),
+                log_directory = %directory.display(),
+                "Bridge file logging initialized"
+            );
             Some(guard)
         }
         Err(error) => {

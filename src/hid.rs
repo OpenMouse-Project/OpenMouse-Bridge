@@ -207,6 +207,7 @@ struct Candidate {
 }
 
 struct OpenPath {
+    path: CString,
     device: Arc<Mutex<HidDevice>>,
     layout: ReportLayout,
 }
@@ -425,6 +426,7 @@ impl HidSession {
         for candidate_path in &candidate.paths {
             match self.api.open_path(&candidate_path.path) {
                 Ok(device) => paths.push(OpenPath {
+                    path: candidate_path.path.clone(),
                     device: Arc::new(Mutex::new(device)),
                     layout: candidate_path.layout.clone(),
                 }),
@@ -482,18 +484,36 @@ impl HidSession {
     }
 
     fn start_reader(&mut self, key: &str) -> Result<(), String> {
+        let reader_specs = {
+            let open = self
+                .open_devices
+                .get(key)
+                .ok_or_else(|| "the HID interface must be open before listening".to_owned())?;
+            if open.listening {
+                return Ok(());
+            }
+            open.paths
+                .iter()
+                .map(|path| {
+                    let device = self
+                        .api
+                        .open_path(&path.path)
+                        .map_err(|error| format!("could not open HID input reader: {error}"))?;
+                    Ok((
+                        device,
+                        path.layout.input_buffer_len(),
+                        path.layout.input_uses_report_ids(),
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()?
+        };
+
         let open = self
             .open_devices
             .get_mut(key)
             .ok_or_else(|| "the HID interface must be open before listening".to_owned())?;
-        if open.listening {
-            return Ok(());
-        }
         let stop = Arc::new(AtomicBool::new(false));
-        for (index, path) in open.paths.iter().enumerate() {
-            let device = Arc::clone(&path.device);
-            let buffer_len = path.layout.input_buffer_len();
-            let uses_report_ids = path.layout.input_uses_report_ids();
+        for (index, (device, buffer_len, uses_report_ids)) in reader_specs.into_iter().enumerate() {
             let thread_stop = Arc::clone(&stop);
             let tx = self.input_tx.clone();
             let device_key = key.to_owned();
@@ -502,15 +522,7 @@ impl HidSession {
                 .spawn(move || {
                     let mut buffer = vec![0; buffer_len];
                     while !thread_stop.load(Ordering::Acquire) {
-                        let result = device
-                            .lock()
-                            .map_err(|_| "native HID lock was poisoned".to_owned())
-                            .and_then(|device| {
-                                device
-                                    .read_timeout(&mut buffer, READ_TIMEOUT_MS)
-                                    .map_err(|error| error.to_string())
-                            });
-                        match result {
+                        match device.read_timeout(&mut buffer, READ_TIMEOUT_MS) {
                             Ok(0) => {}
                             Ok(size) => {
                                 let (report_id, data) = if uses_report_ids {
