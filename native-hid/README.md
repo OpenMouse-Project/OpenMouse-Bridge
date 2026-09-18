@@ -39,6 +39,13 @@ for that brand's vendor id(s) and tries each candidate class directly:
 throw is treated as correct, and `setDpi()`/`setPollingRate()` are called on
 it.
 
+The Attack Shark X11 family is the exception. Its settings channel is not
+visible through WebHID, so `apply.mjs` first checks for VID `0x1d57`, PIDs
+`0xfa55`/`0xfa60`/`0xfa61`, interface 2 and sends its verified polling feature
+report directly through `node-hid`. This keeps the normal operating-system
+HID driver in place; WinUSB and Zadig are not required. Native X11 DPI support
+is deliberately rejected until its six stages can be read and preserved.
+
 ## Exit code contract (Bridge depends on this — see `src/drivers/native_hid.rs`)
 
 - `0` — a device was found and the requested settings were applied.
@@ -81,10 +88,12 @@ runtime first and falls back to `node` on `PATH`, so local development
 
 ## Status
 
-- The adapter and dispatch logic are structurally tested (module resolution,
-  exit codes, control flow) but have not been run against real hardware from
-  this environment — no gaming mouse was reachable here. Validate against an
-  actual device before relying on this for a non-Pulsar mouse.
+- Attack Shark X11 polling was hardware-verified on Windows with the wireless
+  PID `0xfa60`, interface 2, using the standard Microsoft HID driver. Switching
+  between 500 Hz and 1000 Hz succeeded without WinUSB or Zadig.
+- Other adapter and dispatch paths are structurally tested (module resolution,
+  exit codes and control flow) and still require validation on their respective
+  hardware.
 - G-Wolves is deliberately left out of `brands.mjs`: it isn't a finished,
   exported driver in `mouse-protocol` yet (untracked source, no
   `package.json` export, no `registry.ts` entry as of this writing).

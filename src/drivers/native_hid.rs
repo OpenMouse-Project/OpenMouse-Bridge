@@ -39,12 +39,23 @@ struct ApplyRequest<'a> {
 /// web app over WebHID instead), and `Err` when a driver exists but the
 /// apply itself failed (including the helper or Node.js being unavailable).
 pub fn apply(profile: &ApplicationProfile) -> Result<bool> {
-    let script = locate_apply_script()?;
     let brand = profile.device.id.split(':').next().unwrap_or_default();
+    apply_settings(
+        brand,
+        profile.settings.dpi,
+        profile.settings.polling_rate_hz,
+    )
+}
+
+/// Pushes an explicit settings request from the local HTTP API. This shares
+/// the exact helper path used by automatic profiles, so native device control
+/// and profile switching cannot drift into separate protocol implementations.
+pub fn apply_settings(brand: &str, dpi: Option<u32>, polling_rate_hz: Option<u32>) -> Result<bool> {
+    let script = locate_apply_script()?;
     let request = ApplyRequest {
         brand,
-        dpi: profile.settings.dpi,
-        polling_rate_hz: profile.settings.polling_rate_hz,
+        dpi,
+        polling_rate_hz,
     };
     let payload =
         serde_json::to_vec(&request).context("could not encode the native-hid request")?;

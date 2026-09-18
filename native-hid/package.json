@@ -4,6 +4,9 @@
   "private": true,
   "description": "Node.js helper Bridge spawns to push saved profile DPI/polling-rate settings to a mouse over native HID, reusing OpenMouse's own hardware-verified WebHID driver classes from @openmouse/protocol instead of reimplementing per-vendor protocols.",
   "type": "module",
+  "scripts": {
+    "test": "node --test \"src/**/*.test.mjs\""
+  },
   "engines": {
     "node": ">=20"
   },
