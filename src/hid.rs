@@ -728,9 +728,12 @@ fn grouped_device_key(vendor_id: u16, product_id: u16, serial: Option<&str>) -> 
     )
     .into_bytes()
 }
+fn should_group_interfaces(vendor_id: u16) -> bool {
+    cfg!(target_os = "windows") && matches!(vendor_id, RAZER_VENDOR_ID | LOGITECH_VENDOR_ID)
+}
 
 fn device_group_key(info: &hidapi::DeviceInfo) -> Vec<u8> {
-    if matches!(info.vendor_id(), RAZER_VENDOR_ID | LOGITECH_VENDOR_ID) {
+    if should_group_interfaces(info.vendor_id()) {
         return grouped_device_key(
             info.vendor_id(),
             info.product_id(),
@@ -1074,7 +1077,16 @@ mod tests {
     }
 
     #[test]
-    fn multi_interface_devices_share_one_transport_identity() {
+    fn multi_interface_devices_group_only_on_windows() {
+        assert_eq!(
+            should_group_interfaces(RAZER_VENDOR_ID),
+            cfg!(target_os = "windows")
+        );
+        assert_eq!(
+            should_group_interfaces(LOGITECH_VENDOR_ID),
+            cfg!(target_os = "windows")
+        );
+        assert!(!should_group_interfaces(0x1234));
         assert_eq!(
             grouped_device_key(RAZER_VENDOR_ID, 0x00b0, Some("receiver-123")),
             grouped_device_key(RAZER_VENDOR_ID, 0x00b0, Some("receiver-123"))
