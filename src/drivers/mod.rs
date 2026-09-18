@@ -17,6 +17,7 @@ use anyhow::Result;
 use crate::config::ApplicationProfile;
 
 mod native_hid;
+pub mod delux;
 pub mod pulsar;
 
 /// Pushes a profile's DPI/polling rate to the mouse over native HID, if
@@ -28,7 +29,7 @@ pub mod pulsar;
 /// and `Err` when a driver claimed the device but applying failed (e.g. the
 /// mouse is asleep or disconnected).
 ///
-/// Brands with a dependency-free native Rust driver (currently just Pulsar)
+/// Brands with a dependency-free native Rust driver (currently Pulsar and Delux)
 /// are handled directly; everything else falls back to the bundled Node.js
 /// helper, which reuses `@openmouse/protocol`'s own hardware-verified
 /// driver classes rather than Bridge reimplementing each vendor's protocol
@@ -45,6 +46,13 @@ pub fn apply_profile(profile: &ApplicationProfile) -> Result<bool> {
         pulsar::BRAND => {
             pulsar::apply(profile)?;
             Ok(true)
+        }
+        delux::BRAND => {
+            if delux::apply(profile)? {
+                Ok(true)
+            } else {
+                native_hid::apply(profile)
+            }
         }
         _ => native_hid::apply(profile),
     }

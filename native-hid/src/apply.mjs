@@ -105,6 +105,9 @@ async function main() {
   try {
     if (Number.isFinite(input.dpi)) {
       await withTimeout(client.setDpi(input.dpi), PROBE_TIMEOUT_MS, "setDpi");
+      if (Number.isFinite(input.pollingRateHz)) {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+      }
     }
     if (Number.isFinite(input.pollingRateHz)) {
       await withTimeout(client.setPollingRate(input.pollingRateHz), PROBE_TIMEOUT_MS, "setPollingRate");

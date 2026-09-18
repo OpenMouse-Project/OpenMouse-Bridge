@@ -53,12 +53,22 @@ export class HidDeviceAdapter {
 
   async open() {
     if (this.opened) return;
-    this._devices = this._infos.map((info) => {
-      const device = new HID(info.path);
-      device.on("data", this._onData);
-      device.on("error", this._onError);
-      return device;
-    });
+    const openedDevices = [];
+    let lastError = null;
+    for (const info of this._infos) {
+      try {
+        const device = new HID(info.path);
+        device.on("data", this._onData);
+        device.on("error", this._onError);
+        openedDevices.push(device);
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    if (openedDevices.length === 0) {
+      throw lastError ?? new Error("Could not open any HID device path");
+    }
+    this._devices = openedDevices;
     this.opened = true;
   }
 
@@ -197,6 +207,10 @@ export function candidateDevices(vendorId) {
   const groups = new Map();
   for (const info of devices()) {
     if (info.vendorId !== vendorId) continue;
+    // Skip keyboard collections (macOS denies IOHIDDeviceOpen with privilege violation 0xE00002C1)
+    if (info.usagePage === 1 && info.usage === 6) continue;
+    // Skip standard boot mouse collections (exclusive system cursor access 0xE00002C5, no vendor feature reports)
+    if (info.usagePage === 1 && (info.usage === 1 || info.usage === 2)) continue;
     const key = `${info.productId}:${info.interface}`;
     const group = groups.get(key);
     if (group) group.push(info);
