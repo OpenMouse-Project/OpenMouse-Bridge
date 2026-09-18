@@ -207,9 +207,34 @@ struct Candidate {
 }
 
 struct OpenPath {
+    #[cfg(target_os = "windows")]
     path: CString,
     device: Arc<Mutex<HidDevice>>,
     layout: ReportLayout,
+}
+
+enum ReaderHandle {
+    #[cfg(target_os = "windows")]
+    Owned(HidDevice),
+    #[cfg(not(target_os = "windows"))]
+    Shared(Arc<Mutex<HidDevice>>),
+}
+
+impl ReaderHandle {
+    fn read_timeout(&self, buffer: &mut [u8], timeout_ms: i32) -> Result<usize, String> {
+        match self {
+            #[cfg(target_os = "windows")]
+            Self::Owned(device) => device
+                .read_timeout(buffer, timeout_ms)
+                .map_err(|error| error.to_string()),
+            #[cfg(not(target_os = "windows"))]
+            Self::Shared(device) => device
+                .lock()
+                .map_err(|_| "native HID lock was poisoned".to_owned())?
+                .read_timeout(buffer, timeout_ms)
+                .map_err(|error| error.to_string()),
+        }
+    }
 }
 
 struct OpenDevice {
@@ -426,6 +451,7 @@ impl HidSession {
         for candidate_path in &candidate.paths {
             match self.api.open_path(&candidate_path.path) {
                 Ok(device) => paths.push(OpenPath {
+                    #[cfg(target_os = "windows")]
                     path: candidate_path.path.clone(),
                     device: Arc::new(Mutex::new(device)),
                     layout: candidate_path.layout.clone(),
@@ -495,10 +521,13 @@ impl HidSession {
             open.paths
                 .iter()
                 .map(|path| {
-                    let device = self
-                        .api
-                        .open_path(&path.path)
-                        .map_err(|error| format!("could not open HID input reader: {error}"))?;
+                    #[cfg(target_os = "windows")]
+                    let device =
+                        ReaderHandle::Owned(self.api.open_path(&path.path).map_err(|error| {
+                            format!("could not open HID input reader: {error}")
+                        })?);
+                    #[cfg(not(target_os = "windows"))]
+                    let device = ReaderHandle::Shared(Arc::clone(&path.device));
                     Ok((
                         device,
                         path.layout.input_buffer_len(),
