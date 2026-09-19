@@ -168,6 +168,7 @@ pub struct BridgeSnapshot {
     pub tracked_game_count: usize,
     pub battery_threshold_percent: u8,
     pub autostart_enabled: bool,
+    pub automatic_updates: bool,
     pub foreground_application: Option<ApplicationInfo>,
     pub active_profile: Option<ApplicationProfile>,
     pub visible_application_count: usize,
@@ -236,6 +237,7 @@ impl BridgeService {
             tracked_game_count: state.config.games.len(),
             battery_threshold_percent: state.config.battery_threshold_percent,
             autostart_enabled: platform::autostart_enabled(),
+            automatic_updates: state.config.automatic_updates,
             foreground_application,
             active_profile,
             visible_application_count: state.applications.len(),
@@ -305,11 +307,10 @@ impl BridgeService {
         config::save(&self.config_path, &config)
     }
 
-    pub async fn replace_games(&self, games: Vec<GameConfig>) -> Result<()> {
+    pub async fn set_automatic_updates(&self, enabled: bool) -> Result<()> {
         let config = {
             let mut state = self.inner.write().await;
-            state.config.games = games;
-            state.config = state.config.clone().normalized();
+            state.config.automatic_updates = enabled;
             state.config.clone()
         };
         config::save(&self.config_path, &config)

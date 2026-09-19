@@ -1,50 +1,51 @@
-use std::collections::BTreeSet;
+use std::{borrow::Cow, collections::BTreeSet, env, time::Duration};
 
+use anyhow::{Context, Result, ensure};
+use serde::Deserialize;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use crate::config::GameConfig;
 
-const BUILT_IN_CATALOG: &str = include_str!("../games.json");
+pub const GAMES_CDN_URL: &str =
+    "https://cdn.jsdelivr.net/gh/OpenMouse-Project/Desktop@main/public/games.json";
+const GAMES_URL_ENV: &str = "OPENMOUSE_BRIDGE_GAMES_URL";
+const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
-// Entries shipped in older catalogs that should no longer be seeded. Keeping
-// this migration list prevents them from living forever in existing configs.
-const RETIRED_BUILT_IN_GAMES: &[&str] = &[
-    "Grand Theft Auto V",
-    "Roblox",
-    "Destiny 2",
-    "Rust",
-    "Helldivers 2",
-    "Minecraft for Windows",
-    "Rocket League",
-    "War Thunder",
-    "Dead by Daylight",
-    "Halo Infinite",
-    "Street Fighter 6",
-    "Tekken 8",
-    "StarCraft II",
-];
-
-pub fn catalog() -> Vec<GameConfig> {
-    serde_json::from_str(BUILT_IN_CATALOG)
-        .expect("the built-in games.json catalog must contain valid game entries")
+#[derive(Deserialize)]
+struct CatalogResponse {
+    games: Vec<GameConfig>,
 }
 
-pub fn merge_catalog(games: &mut Vec<GameConfig>) {
-    games.retain(|game| {
-        !RETIRED_BUILT_IN_GAMES
-            .iter()
-            .any(|retired| game.name.eq_ignore_ascii_case(retired))
-    });
-    for catalog_game in catalog() {
-        if let Some(existing) = games
-            .iter_mut()
-            .find(|game| game.name.eq_ignore_ascii_case(&catalog_game.name))
-        {
-            existing.executables.extend(catalog_game.executables);
-        } else {
-            games.push(catalog_game);
-        }
-    }
+pub fn catalog_url() -> Cow<'static, str> {
+    env::var(GAMES_URL_ENV)
+        .map(Cow::Owned)
+        .unwrap_or(Cow::Borrowed(GAMES_CDN_URL))
+}
+
+pub async fn fetch_catalog() -> Result<Vec<GameConfig>> {
+    let url = catalog_url();
+    let client = reqwest::Client::builder()
+        .timeout(FETCH_TIMEOUT)
+        .build()
+        .context("could not create the game catalog client")?;
+    let bytes = client
+        .get(url.as_ref())
+        .send()
+        .await
+        .with_context(|| format!("could not download {url}"))?
+        .error_for_status()
+        .with_context(|| format!("game catalog request failed for {url}"))?
+        .bytes()
+        .await
+        .with_context(|| format!("could not read game catalog from {url}"))?;
+    parse_catalog(&bytes)
+}
+
+fn parse_catalog(bytes: &[u8]) -> Result<Vec<GameConfig>> {
+    let catalog: CatalogResponse =
+        serde_json::from_slice(bytes).context("could not parse the game catalog")?;
+    ensure!(!catalog.games.is_empty(), "game catalog contains no games");
+    Ok(catalog.games)
 }
 
 pub struct GameDetector {
@@ -125,42 +126,30 @@ mod tests {
     }
 
     #[test]
-    fn built_in_catalog_contains_requested_games() {
-        let games = catalog();
-        for name in [
-            "Rainbow Six Siege",
-            "Valorant",
-            "Overwatch 2",
-            "Apex Legends",
-            "Counter-Strike 2",
-            "Marvel Rivals",
-            "Fortnite",
-            "Escape from Tarkov",
-        ] {
-            assert!(games.iter().any(|game| game.name == name), "missing {name}");
-        }
+    fn desktop_catalog_shape_ignores_metadata() {
+        let games = parse_catalog(
+            br#"{
+                "games": [{
+                    "id": "counter-strike-2",
+                    "name": "Counter-Strike 2",
+                    "steamAppId": 730,
+                    "executables": ["cs2.exe", "cs2"]
+                }]
+            }"#,
+        )
+        .expect("Desktop catalog should parse");
+
+        assert_eq!(
+            games,
+            [GameConfig {
+                name: "Counter-Strike 2".into(),
+                executables: vec!["cs2.exe".into(), "cs2".into()],
+            }]
+        );
     }
 
     #[test]
-    fn retired_catalog_entries_are_removed_but_custom_games_survive() {
-        let mut games = vec![
-            GameConfig {
-                name: "Minecraft for Windows".into(),
-                executables: vec!["Minecraft.Windows.exe".into()],
-            },
-            GameConfig {
-                name: "Custom Arena".into(),
-                executables: vec!["arena.exe".into()],
-            },
-        ];
-
-        merge_catalog(&mut games);
-
-        assert!(
-            !games
-                .iter()
-                .any(|game| game.name == "Minecraft for Windows")
-        );
-        assert!(games.iter().any(|game| game.name == "Custom Arena"));
+    fn empty_desktop_catalog_is_rejected() {
+        assert!(parse_catalog(br#"{"games":[]}"#).is_err());
     }
 }

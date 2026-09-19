@@ -1,26 +1,26 @@
 # OpenMouse Bridge
 
 OpenMouse Bridge is a small per-user companion process for the OpenMouse web
-control panel. The first target is Windows. Its core and loopback protocol are
-portable so Linux and macOS adapters can follow without changing the web app.
+control panel on Windows and macOS. Its core and loopback protocol remain
+portable so additional desktop adapters do not require changes to the web app.
 
 The initial service provides:
 
-- a tray icon with **Run on Start**, **Open OpenMouse**, and **Exit** actions;
+- a compact tray panel for status, startup, battery, and update controls;
 - process-based detection for configured game executables;
 - discovery of visible Windows and macOS applications and the foreground application;
 - persistent application profiles tied to a specific mouse;
 - low-battery notifications with a configurable threshold and cooldown;
 - startup-at-login registration under the current user;
 - native HID access for devices and collections that browsers cannot expose;
+- manual or automatic updates from verified stable GitHub releases;
 - a versioned HTTP API bound only to `127.0.0.1:17846`;
 - an explicit browser-origin allowlist.
 
 It does not run as an elevated Windows Service. It runs in the signed-in user's
 session, which is required for the tray icon and desktop notifications and
-avoids administrator permissions. Bridge has no status or settings window; the
-tray menu is its complete native interface while device control remains in the
-OpenMouse web app.
+avoids administrator permissions. Bridge settings and status live in its
+custom tray panel while device control remains in the OpenMouse web app.
 
 ## Run locally
 
@@ -31,9 +31,10 @@ cargo run
 ```
 
 Bridge creates `config.json` in the operating system's per-user application
-configuration directory. It automatically seeds and updates its tracked games
-from the bundled [`games.json`](games.json) catalog. Custom entries written via
-the API or added to the config are preserved when new catalog entries ship.
+configuration directory. At startup it refreshes the tracked-game catalog from
+the canonical [OpenMouse Desktop list](https://github.com/OpenMouse-Project/Desktop/blob/main/public/games.json)
+through jsDelivr. The last successful catalog remains cached in `config.json`
+for offline startup.
 
 The relevant part of the generated config looks like this:
 
@@ -41,6 +42,7 @@ The relevant part of the generated config looks like this:
 {
   "batteryThresholdPercent": 20,
   "alertCooldownMinutes": 360,
+  "automaticUpdates": false,
   "games": [
     {
       "name": "Counter-Strike 2",
@@ -56,7 +58,17 @@ The relevant part of the generated config looks like this:
 ```
 
 For development and portable tests, `OPENMOUSE_BRIDGE_CONFIG` can point to an
-explicit configuration file.
+explicit configuration file, `OPENMOUSE_BRIDGE_GAMES_URL` can override the
+catalog endpoint, and `OPENMOUSE_BRIDGE_UPDATE_API_URL` can override the stable
+release API endpoint.
+
+## Updates
+
+The tray panel can check for a stable Bridge release on demand. Automatic
+updates are opt-in and use the same stable-release channel. Bridge downloads
+the platform archive and its published SHA-256 checksum, verifies the archive,
+then replaces the installed executable and bundled `native-hid` runtime after
+the current process exits. The updated Bridge relaunches automatically.
 
 ## Logs
 
@@ -75,13 +87,11 @@ enumeration details.
 ## Loopback API
 
 - `GET /v1/status` reports the Bridge version, platform, active games, battery
-  threshold, autostart state, and whether an OpenMouse client has completed a
-  recent handshake.
+  threshold, autostart and automatic-update preferences, and whether an
+  OpenMouse client has completed a recent handshake.
 - `PUT /v1/handshake` renews OpenMouse's 20-second connection lease. The client
   sends this heartbeat every five seconds while connected.
 - `GET /v1/games` returns the full executable catalog currently being tracked.
-- `PUT /v1/games` adds or updates custom tracked games and persists them. Bundled
-  catalog entries are retained so a client cannot accidentally disable detection.
 - `GET /v1/applications` lists running games and identifies the foreground
   game. Only applications from the registered catalog are
   returned. Each item includes an `iconId`; requesting
@@ -93,7 +103,6 @@ enumeration details.
   replaces and persists them.
 - `PUT /v1/battery` accepts `{ deviceId, deviceName, percent, charging }` and
   applies the notification threshold and cooldown.
-- `PUT /v1/autostart` accepts `{ enabled }`. It is implemented on Windows.
 - `GET /v1/hid` upgrades to the native HID WebSocket transport. It enumerates
   only vendor IDs requested by OpenMouse, reports parsed HID collections, and
   supports open, close, input, output, and feature-report operations. This lets

@@ -21,6 +21,8 @@ pub struct BridgeConfig {
     #[serde(default = "default_alert_cooldown")]
     pub alert_cooldown_minutes: u64,
     #[serde(default)]
+    pub automatic_updates: bool,
+    #[serde(default)]
     pub games: Vec<GameConfig>,
     #[serde(default)]
     pub profiles: Vec<ApplicationProfile>,
@@ -72,7 +74,8 @@ impl Default for BridgeConfig {
         Self {
             battery_threshold_percent: DEFAULT_BATTERY_THRESHOLD,
             alert_cooldown_minutes: DEFAULT_ALERT_COOLDOWN_MINUTES,
-            games: crate::games::catalog(),
+            automatic_updates: false,
+            games: Vec::new(),
             profiles: Vec::new(),
             default_profile: None,
             allowed_origins: default_origins(),
@@ -84,7 +87,6 @@ impl BridgeConfig {
     pub fn normalized(mut self) -> Self {
         self.battery_threshold_percent = self.battery_threshold_percent.min(100);
         self.alert_cooldown_minutes = self.alert_cooldown_minutes.max(1);
-        crate::games::merge_catalog(&mut self.games);
         for game in &mut self.games {
             game.name = game.name.trim().to_owned();
             game.executables = game
@@ -177,6 +179,34 @@ pub fn load_or_create() -> Result<(BridgeConfig, PathBuf)> {
     Ok((config, path))
 }
 
+pub async fn load_with_catalog() -> Result<(BridgeConfig, PathBuf)> {
+    let (mut config, path) = load_or_create()?;
+    match crate::games::fetch_catalog().await {
+        Ok(games) => {
+            let cached_games = std::mem::replace(&mut config.games, games);
+            config = config.normalized();
+            let changed = config.games != cached_games;
+            if changed {
+                save(&path, &config)?;
+            }
+            tracing::info!(
+                url = %crate::games::catalog_url(),
+                games = config.games.len(),
+                changed,
+                "game catalog loaded"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                cached_games = config.games.len(),
+                "game catalog unavailable; using cached catalog"
+            );
+        }
+    }
+    Ok((config, path))
+}
+
 pub fn save(path: &PathBuf, config: &BridgeConfig) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -218,6 +248,7 @@ mod tests {
                 name: " Valorant ".into(),
                 executables: vec![" VALORANT-Win64-Shipping.exe ".into(), "".into()],
             }],
+            automatic_updates: false,
             profiles: Vec::new(),
             default_profile: None,
             allowed_origins: Vec::new(),
@@ -229,7 +260,7 @@ mod tests {
             .games
             .iter()
             .find(|game| game.name == "Valorant")
-            .expect("Valorant should be in the built-in catalog");
+            .expect("configured game should survive normalization");
         assert_eq!(valorant.executables, ["valorant-win64-shipping.exe"]);
         assert!(
             config

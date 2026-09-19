@@ -19,6 +19,7 @@ use eframe::egui::{
 use openmouse_bridge::{
     BRIDGE_PORT, api, config, platform,
     service::{BridgeService, BridgeSnapshot},
+    updater::{self, UpdateInfo},
 };
 #[cfg(target_os = "windows")]
 use std::ptr::null_mut;
@@ -34,7 +35,7 @@ use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWN
 
 const OPENMOUSE_URL: &str = "https://control.openmouse.app";
 const WINDOW_WIDTH: f32 = 360.0;
-const WINDOW_HEIGHT: f32 = 560.0;
+const WINDOW_HEIGHT: f32 = 410.0;
 const BACKGROUND: Color32 = Color32::from_rgb(12, 14, 16);
 const SURFACE: Color32 = Color32::from_rgb(24, 27, 30);
 const SURFACE_HOVER: Color32 = Color32::from_rgb(31, 35, 39);
@@ -42,10 +43,53 @@ const TEXT: Color32 = Color32::from_rgb(239, 243, 241);
 const MUTED: Color32 = Color32::from_rgb(151, 160, 158);
 const ACCENT: Color32 = Color32::from_rgb(93, 222, 137);
 const DANGER: Color32 = Color32::from_rgb(248, 113, 113);
+const BORDER: Color32 = Color32::from_rgb(49, 54, 58);
 const BATTERY_THRESHOLDS: [u8; 7] = [10, 15, 20, 25, 30, 40, 50];
+
+fn toggle_control(ui: &mut egui::Ui, enabled: bool) -> bool {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(30.0, 18.0), Sense::click());
+    let track = if enabled { ACCENT } else { SURFACE_HOVER };
+    let knob = if enabled { BACKGROUND } else { MUTED };
+    ui.painter().rect_filled(rect, 9.0, track);
+    let knob_x = if enabled {
+        rect.right() - 9.0
+    } else {
+        rect.left() + 9.0
+    };
+    ui.painter()
+        .circle_filled(Pos2::new(knob_x, rect.center().y), 6.0, knob);
+    response.clicked()
+}
 
 enum BridgeCommand {
     SetBatteryThreshold(u8),
+    SetAutomaticUpdates(bool),
+    CheckForUpdates,
+    InstallUpdate(UpdateInfo),
+}
+
+enum UpdateEvent {
+    Checking,
+    UpToDate,
+    Available(UpdateInfo),
+    Downloading(String),
+    Restarting(String),
+    Failed(String),
+}
+
+enum UpdateState {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(UpdateInfo),
+    Downloading(String),
+    Restarting(String),
+    Failed(String),
+}
+
+enum UpdateUiAction {
+    Check,
+    Install(UpdateInfo),
 }
 
 #[derive(Clone, Copy)]
@@ -102,12 +146,16 @@ struct TrayApp {
     logo: egui::TextureHandle,
     snapshots: Receiver<BridgeSnapshot>,
     commands: tokio_mpsc::UnboundedSender<BridgeCommand>,
+    updates: Receiver<UpdateEvent>,
     snapshot: Option<BridgeSnapshot>,
     visible: bool,
     visibility_initialized: bool,
+    panel_had_focus: bool,
     exit_requested: bool,
     autostart: bool,
     battery_threshold: u8,
+    automatic_updates: bool,
+    update_state: UpdateState,
     last_error: Option<String>,
 }
 
@@ -116,6 +164,7 @@ impl TrayApp {
         context: &egui::Context,
         snapshots: Receiver<BridgeSnapshot>,
         commands: tokio_mpsc::UnboundedSender<BridgeCommand>,
+        updates: Receiver<UpdateEvent>,
         visible: bool,
     ) -> Result<Self> {
         configure_tray_only_application();
@@ -141,18 +190,23 @@ impl TrayApp {
             logo,
             snapshots,
             commands,
+            updates,
             snapshot: None,
             visible,
             visibility_initialized: false,
+            panel_had_focus: false,
             exit_requested: false,
             autostart: platform::autostart_enabled(),
             battery_threshold: 20,
+            automatic_updates: false,
+            update_state: UpdateState::Idle,
             last_error: None,
         })
     }
 
     fn set_visible(&mut self, context: &egui::Context, visible: bool) {
         self.visible = visible;
+        self.panel_had_focus = false;
         context.send_viewport_cmd(ViewportCommand::Visible(visible));
         if visible {
             context.send_viewport_cmd(ViewportCommand::Focus);
@@ -177,17 +231,43 @@ impl TrayApp {
         while let Ok(snapshot) = self.snapshots.try_recv() {
             self.autostart = snapshot.autostart_enabled;
             self.battery_threshold = snapshot.battery_threshold_percent;
+            self.automatic_updates = snapshot.automatic_updates;
             self.snapshot = Some(snapshot);
         }
+    }
+
+    fn refresh_updates(&mut self) -> bool {
+        let mut restart = false;
+        while let Ok(event) = self.updates.try_recv() {
+            self.update_state = match event {
+                UpdateEvent::Checking => UpdateState::Checking,
+                UpdateEvent::UpToDate => UpdateState::UpToDate,
+                UpdateEvent::Available(update) => UpdateState::Available(update),
+                UpdateEvent::Downloading(version) => UpdateState::Downloading(version),
+                UpdateEvent::Restarting(version) => {
+                    restart = true;
+                    UpdateState::Restarting(version)
+                }
+                UpdateEvent::Failed(error) => UpdateState::Failed(error),
+            };
+        }
+        restart
     }
 }
 
 impl eframe::App for TrayApp {
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.refresh_snapshot();
+        if self.refresh_updates() {
+            self.exit_requested = true;
+            context.send_viewport_cmd(ViewportCommand::Close);
+        }
         if !self.visibility_initialized {
             self.visibility_initialized = true;
             context.send_viewport_cmd(ViewportCommand::Visible(self.visible));
+            if self.visible {
+                context.send_viewport_cmd(ViewportCommand::Focus);
+            }
         }
         if let Some(rect) = self.tray.toggle_requested() {
             tracing::debug!(?rect, visible = self.visible, "handling tray toggle");
@@ -195,6 +275,13 @@ impl eframe::App for TrayApp {
                 self.set_visible(context, false);
             } else {
                 self.show_near_tray(context, rect);
+            }
+        }
+        if self.visible {
+            match context.input(|input| input.viewport().focused) {
+                Some(true) => self.panel_had_focus = true,
+                Some(false) if self.panel_had_focus => self.set_visible(context, false),
+                _ => {}
             }
         }
         if context.input(|input| input.viewport().close_requested()) && !self.exit_requested {
@@ -207,230 +294,258 @@ impl eframe::App for TrayApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         Frame::NONE
             .fill(BACKGROUND)
-            .inner_margin(20.0)
+            .inner_margin(16.0)
             .show(ui, |ui| {
                 let header = ui.horizontal(|ui| {
-                    let (logo_rect, _) = ui.allocate_exact_size(Vec2::splat(38.0), Sense::hover());
+                    let (logo_rect, _) =
+                        ui.allocate_exact_size(Vec2::new(28.0, 32.0), Sense::hover());
                     ui.put(
-                        egui::Rect::from_center_size(logo_rect.center(), Vec2::new(24.0, 35.5)),
-                        egui::Image::new((self.logo.id(), Vec2::new(24.0, 35.5))),
+                        egui::Rect::from_center_size(logo_rect.center(), Vec2::new(18.0, 26.5)),
+                        egui::Image::new((self.logo.id(), Vec2::new(18.0, 26.5))),
                     );
                     ui.vertical(|ui| {
                         ui.label(
                             RichText::new("OpenMouse Bridge")
-                                .size(17.0)
+                                .size(14.0)
                                 .strong()
                                 .color(TEXT),
                         );
                         ui.label(
-                            RichText::new(format!(
-                                "Native companion · v{}",
-                                openmouse_bridge::BRIDGE_VERSION
-                            ))
-                            .size(11.0)
-                            .color(MUTED),
+                            RichText::new(format!("Version {}", openmouse_bridge::BRIDGE_VERSION))
+                                .size(10.0)
+                                .color(MUTED),
                         );
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add(
-                                Button::new(RichText::new("×").size(20.0).color(MUTED))
-                                    .frame(false),
-                            )
-                            .clicked()
-                        {
-                            self.set_visible(ui.ctx(), false);
-                        }
                     });
                 });
                 if header.response.drag_started() {
                     ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
                 }
 
-                ui.add_space(18.0);
-                Frame::NONE
-                    .fill(SURFACE)
-                    .corner_radius(14.0)
-                    .inner_margin(16.0)
-                    .show(ui, |ui| {
-                        let connected = self
-                            .snapshot
-                            .as_ref()
-                            .is_some_and(|snapshot| snapshot.client_connected);
-                        ui.horizontal(|ui| {
-                            let (dot_rect, _) =
-                                ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
-                            ui.painter().circle_filled(dot_rect.center(), 4.0, ACCENT);
-                            ui.label(RichText::new("Bridge is running").strong().color(TEXT));
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(
-                                    RichText::new(format!("127.0.0.1:{BRIDGE_PORT}"))
-                                        .monospace()
-                                        .size(10.0)
-                                        .color(MUTED),
-                                );
-                            });
-                        });
-                        ui.add_space(10.0);
-                        ui.label(
-                            RichText::new(if connected {
-                                "Control panel connected"
-                            } else {
-                                "Waiting for the control panel"
-                            })
-                            .size(12.0)
-                            .color(MUTED),
-                        );
-                        if let Some(snapshot) = &self.snapshot {
-                            ui.add_space(12.0);
-                            ui.separator();
-                            ui.add_space(10.0);
-                            ui.horizontal(|ui| {
-                                ui.vertical(|ui| {
-                                    ui.label(
-                                        RichText::new("PROFILES").size(9.0).color(MUTED).strong(),
-                                    );
-                                    ui.label(
-                                        RichText::new(snapshot.profile_count.to_string())
-                                            .size(18.0)
-                                            .strong(),
-                                    );
-                                });
-                                ui.add_space(28.0);
-                                ui.vertical(|ui| {
-                                    ui.label(
-                                        RichText::new("TRACKED GAMES")
-                                            .size(9.0)
-                                            .color(MUTED)
-                                            .strong(),
-                                    );
-                                    ui.label(
-                                        RichText::new(snapshot.tracked_game_count.to_string())
-                                            .size(18.0)
-                                            .strong(),
-                                    );
-                                });
-                            });
-                        }
-                    });
-
                 ui.add_space(12.0);
-                Frame::NONE
-                    .fill(SURFACE)
-                    .corner_radius(14.0)
-                    .inner_margin(16.0)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.label(RichText::new("Run on startup").strong().color(TEXT));
-                                ui.label(
-                                    RichText::new("Start Bridge when you sign in")
-                                        .size(11.0)
-                                        .color(MUTED),
-                                );
-                            });
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                let label = if self.autostart { "ON" } else { "OFF" };
-                                let fill = if self.autostart {
-                                    ACCENT
-                                } else {
-                                    SURFACE_HOVER
-                                };
-                                let text = if self.autostart { BACKGROUND } else { MUTED };
-                                if ui
-                                    .add(
-                                        Button::new(
-                                            RichText::new(label).size(10.0).strong().color(text),
-                                        )
-                                        .fill(fill)
-                                        .stroke(Stroke::NONE)
-                                        .corner_radius(999.0)
-                                        .min_size(Vec2::new(48.0, 26.0)),
-                                    )
-                                    .clicked()
-                                {
-                                    let enabled = !self.autostart;
-                                    match platform::set_autostart(enabled) {
-                                        Ok(()) => {
-                                            self.autostart = enabled;
-                                            self.last_error = None;
-                                        }
-                                        Err(error) => self.last_error = Some(error.to_string()),
-                                    }
-                                }
-                            });
-                        });
-                    });
-
-                ui.add_space(8.0);
-                let mut requested_threshold = None;
-                Frame::NONE
-                    .fill(SURFACE)
-                    .corner_radius(14.0)
-                    .inner_margin(16.0)
-                    .show(ui, |ui| {
-                        ui.label(RichText::new("Battery alerts").strong().color(TEXT));
+                let connected = self
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.client_connected);
+                ui.horizontal(|ui| {
+                    let (dot_rect, _) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
+                    ui.painter().circle_filled(dot_rect.center(), 3.0, ACCENT);
+                    ui.label(RichText::new("Running").size(12.0).strong().color(TEXT));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
-                            RichText::new("Notify when mouse battery falls below")
+                            RichText::new(if connected { "Connected" } else { "No client" })
+                                .size(10.0)
+                                .color(if connected { ACCENT } else { MUTED }),
+                        );
+                    });
+                });
+                ui.add_space(4.0);
+                let (profiles, games) = self
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| (snapshot.profile_count, snapshot.tracked_game_count))
+                    .unwrap_or_default();
+                ui.label(
+                    RichText::new(format!(
+                        "127.0.0.1:{BRIDGE_PORT}  ·  {profiles} profiles  ·  {games} games"
+                    ))
+                    .monospace()
+                    .size(10.0)
+                    .color(MUTED),
+                );
+
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("Run on startup")
+                                .size(12.0)
+                                .strong()
+                                .color(TEXT),
+                        );
+                        ui.label(
+                            RichText::new("Start Bridge when you sign in")
                                 .size(11.0)
                                 .color(MUTED),
                         );
-                        ui.add_space(10.0);
-                        ui.horizontal(|ui| {
-                            for percent in BATTERY_THRESHOLDS {
-                                let selected = percent == self.battery_threshold;
-                                let fill = if selected { ACCENT } else { SURFACE_HOVER };
-                                let text = if selected { BACKGROUND } else { MUTED };
-                                if ui
-                                    .add(
-                                        Button::new(
-                                            RichText::new(format!("{percent}%"))
-                                                .size(10.0)
-                                                .strong()
-                                                .color(text),
-                                        )
-                                        .fill(fill)
-                                        .stroke(Stroke::NONE)
-                                        .corner_radius(8.0)
-                                        .min_size(Vec2::new(36.0, 26.0)),
-                                    )
-                                    .clicked()
-                                {
-                                    requested_threshold = Some(percent);
-                                }
-                            }
-                        });
                     });
-                if let Some(percent) = requested_threshold {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if toggle_control(ui, self.autostart) {
+                            let enabled = !self.autostart;
+                            match platform::set_autostart(enabled) {
+                                Ok(()) => {
+                                    self.autostart = enabled;
+                                    self.last_error = None;
+                                }
+                                Err(error) => self.last_error = Some(error.to_string()),
+                            }
+                        }
+                    });
+                });
+
+                ui.add_space(14.0);
+                let mut selected_threshold = self.battery_threshold;
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("Battery alert")
+                                .size(12.0)
+                                .strong()
+                                .color(TEXT),
+                        );
+                        ui.label(
+                            RichText::new("Notify when charge falls below")
+                                .size(11.0)
+                                .color(MUTED),
+                        );
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        egui::ComboBox::from_id_salt("battery-threshold")
+                            .width(58.0)
+                            .selected_text(format!("{}%", self.battery_threshold))
+                            .show_ui(ui, |ui| {
+                                for percent in BATTERY_THRESHOLDS {
+                                    ui.selectable_value(
+                                        &mut selected_threshold,
+                                        percent,
+                                        format!("{percent}%"),
+                                    );
+                                }
+                            });
+                    });
+                });
+                if selected_threshold != self.battery_threshold {
                     if self
                         .commands
-                        .send(BridgeCommand::SetBatteryThreshold(percent))
+                        .send(BridgeCommand::SetBatteryThreshold(selected_threshold))
                         .is_ok()
                     {
-                        self.battery_threshold = percent;
+                        self.battery_threshold = selected_threshold;
                         self.last_error = None;
                     } else {
                         self.last_error = Some("Bridge settings service is unavailable".into());
                     }
                 }
 
-                if let Some(error) = &self.last_error {
-                    ui.add_space(8.0);
-                    ui.label(RichText::new(error).size(11.0).color(DANGER));
+                ui.add_space(14.0);
+                let mut toggle_automatic_updates = false;
+                let mut update_action = None;
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("Automatic updates")
+                                .size(12.0)
+                                .strong()
+                                .color(TEXT),
+                        );
+                        ui.label(
+                            RichText::new("Install stable releases")
+                                .size(11.0)
+                                .color(MUTED),
+                        );
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if toggle_control(ui, self.automatic_updates) {
+                            toggle_automatic_updates = true;
+                        }
+                    });
+                });
+                ui.add_space(5.0);
+                ui.horizontal(|ui| {
+                    let (status, color, action_label) = match &self.update_state {
+                        UpdateState::Idle => ("Not checked".to_owned(), MUTED, Some("Check now")),
+                        UpdateState::Checking => ("Checking for updates…".to_owned(), MUTED, None),
+                        UpdateState::UpToDate => (
+                            "Bridge is up to date".to_owned(),
+                            ACCENT,
+                            Some("Check again"),
+                        ),
+                        UpdateState::Available(update) => (
+                            format!("Version {} available", update.version),
+                            ACCENT,
+                            Some("Install"),
+                        ),
+                        UpdateState::Downloading(version) => {
+                            (format!("Downloading {version}…"), MUTED, None)
+                        }
+                        UpdateState::Restarting(version) => {
+                            (format!("Restarting into {version}…"), ACCENT, None)
+                        }
+                        UpdateState::Failed(_) => {
+                            ("Update check failed".to_owned(), DANGER, Some("Try again"))
+                        }
+                    };
+                    let response = ui.label(RichText::new(status).size(10.0).color(color));
+                    if let UpdateState::Failed(error) = &self.update_state {
+                        response.on_hover_text(error);
+                    }
+                    if let Some(action_label) = action_label {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .add(
+                                    Button::new(
+                                        RichText::new(action_label)
+                                            .size(10.0)
+                                            .strong()
+                                            .color(ACCENT),
+                                    )
+                                    .frame(false),
+                                )
+                                .clicked()
+                            {
+                                update_action = Some(match &self.update_state {
+                                    UpdateState::Available(update) => {
+                                        UpdateUiAction::Install(update.clone())
+                                    }
+                                    _ => UpdateUiAction::Check,
+                                });
+                            }
+                        });
+                    }
+                });
+
+                if toggle_automatic_updates {
+                    let enabled = !self.automatic_updates;
+                    if self
+                        .commands
+                        .send(BridgeCommand::SetAutomaticUpdates(enabled))
+                        .is_ok()
+                    {
+                        self.automatic_updates = enabled;
+                        self.last_error = None;
+                    } else {
+                        self.last_error = Some("Bridge settings service is unavailable".into());
+                    }
+                }
+                if let Some(action) = update_action {
+                    let command = match action {
+                        UpdateUiAction::Check => BridgeCommand::CheckForUpdates,
+                        UpdateUiAction::Install(update) => BridgeCommand::InstallUpdate(update),
+                    };
+                    if self.commands.send(command).is_err() {
+                        self.last_error = Some("Bridge update service is unavailable".into());
+                    }
                 }
 
-                ui.add_space(16.0);
+                if let Some(error) = &self.last_error {
+                    ui.add_space(5.0);
+                    ui.label(RichText::new(error).size(10.0).color(DANGER));
+                }
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(10.0);
                 if ui
                     .add_sized(
-                        [ui.available_width(), 42.0],
+                        [ui.available_width(), 32.0],
                         Button::new(
                             RichText::new("Open control panel")
+                                .size(11.0)
                                 .strong()
-                                .color(BACKGROUND),
+                                .color(TEXT),
                         )
-                        .fill(ACCENT)
-                        .stroke(Stroke::NONE)
-                        .corner_radius(10.0),
+                        .fill(SURFACE)
+                        .stroke(Stroke::new(1.0, BORDER))
+                        .corner_radius(4.0),
                     )
                     .clicked()
                     && let Err(error) = open_openmouse()
@@ -438,7 +553,7 @@ impl eframe::App for TrayApp {
                     self.last_error = Some(error.to_string());
                 }
 
-                ui.add_space(8.0);
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(platform::platform_name())
@@ -448,7 +563,7 @@ impl eframe::App for TrayApp {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
                             .add(
-                                Button::new(RichText::new("Quit Bridge").color(DANGER))
+                                Button::new(RichText::new("Quit Bridge").size(10.0).color(DANGER))
                                     .frame(false),
                             )
                             .clicked()
@@ -467,20 +582,30 @@ struct BackgroundServer {
     thread: Option<thread::JoinHandle<Result<()>>>,
 }
 
+type BackgroundRuntime = (
+    BackgroundServer,
+    Receiver<BridgeSnapshot>,
+    tokio_mpsc::UnboundedSender<BridgeCommand>,
+    Receiver<UpdateEvent>,
+);
+
 impl BackgroundServer {
-    fn start() -> Result<(
-        Self,
-        Receiver<BridgeSnapshot>,
-        tokio_mpsc::UnboundedSender<BridgeCommand>,
-    )> {
+    fn start() -> Result<BackgroundRuntime> {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (snapshot_tx, snapshots) = mpsc::sync_channel(1);
         let (command_tx, command_rx) = tokio_mpsc::unbounded_channel();
+        let (update_tx, updates) = mpsc::sync_channel(8);
         let thread = thread::Builder::new()
             .name("openmouse-bridge-runtime".into())
             .spawn(move || {
-                let outcome = run_server(shutdown_rx, ready_tx.clone(), snapshot_tx, command_rx);
+                let outcome = run_server(
+                    shutdown_rx,
+                    ready_tx.clone(),
+                    snapshot_tx,
+                    command_rx,
+                    update_tx,
+                );
                 if let Err(error) = &outcome {
                     let _ = ready_tx.send(Err(format!("{error:#}")));
                 }
@@ -496,6 +621,7 @@ impl BackgroundServer {
                 },
                 snapshots,
                 command_tx,
+                updates,
             )),
             Ok(Err(error)) => {
                 let _ = shutdown_tx.send(());
@@ -523,7 +649,7 @@ impl BackgroundServer {
 }
 
 pub fn run() -> Result<()> {
-    let (server, snapshots, commands) = BackgroundServer::start()?;
+    let (server, snapshots, commands, updates) = BackgroundServer::start()?;
     let visible = env::var_os("OPENMOUSE_BRIDGE_SHOW_WINDOW").is_some();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -544,6 +670,7 @@ pub fn run() -> Result<()> {
                 &context.egui_ctx,
                 snapshots,
                 commands,
+                updates,
                 visible,
             )?))
         }),
@@ -558,13 +685,15 @@ fn run_server(
     ready: SyncSender<Result<(), String>>,
     snapshots: SyncSender<BridgeSnapshot>,
     mut commands: tokio_mpsc::UnboundedReceiver<BridgeCommand>,
+    update_events: SyncSender<UpdateEvent>,
 ) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("could not create the Bridge async runtime")?;
     runtime.block_on(async move {
-        let (bridge_config, path) = config::load_or_create()?;
+        let (bridge_config, path) = config::load_with_catalog().await?;
+        let automatic_updates = bridge_config.automatic_updates;
         let origins = bridge_config.allowed_origins.clone();
         let service = BridgeService::new(bridge_config, path.clone());
         service.start_game_monitor(Arc::new(AtomicBool::new(true)));
@@ -580,14 +709,31 @@ fn run_server(
 
         let command_service = service.clone();
         let command_handler = tokio::spawn(async move {
+            if automatic_updates {
+                check_for_updates(true, &update_events).await;
+            }
             while let Some(command) = commands.recv().await {
-                let result = match command {
+                match command {
                     BridgeCommand::SetBatteryThreshold(percent) => {
-                        command_service.set_battery_threshold(percent).await
+                        if let Err(error) = command_service.set_battery_threshold(percent).await {
+                            tracing::error!(%error, "could not save Bridge settings");
+                        }
                     }
-                };
-                if let Err(error) = result {
-                    tracing::error!(%error, "could not save Bridge settings");
+                    BridgeCommand::SetAutomaticUpdates(enabled) => {
+                        match command_service.set_automatic_updates(enabled).await {
+                            Ok(()) if enabled => check_for_updates(true, &update_events).await,
+                            Ok(()) => {}
+                            Err(error) => {
+                                tracing::error!(%error, "could not save Bridge settings");
+                            }
+                        }
+                    }
+                    BridgeCommand::CheckForUpdates => {
+                        check_for_updates(false, &update_events).await;
+                    }
+                    BridgeCommand::InstallUpdate(update) => {
+                        install_update(update, &update_events).await;
+                    }
                 }
             }
         });
@@ -608,6 +754,37 @@ fn run_server(
         outcome?;
         Ok(())
     })
+}
+
+async fn check_for_updates(install_automatically: bool, events: &SyncSender<UpdateEvent>) {
+    let _ = events.try_send(UpdateEvent::Checking);
+    match updater::check_for_update().await {
+        Ok(Some(update)) if install_automatically => install_update(update, events).await,
+        Ok(Some(update)) => {
+            let _ = events.try_send(UpdateEvent::Available(update));
+        }
+        Ok(None) => {
+            let _ = events.try_send(UpdateEvent::UpToDate);
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Bridge update check failed");
+            let _ = events.try_send(UpdateEvent::Failed(format!("{error:#}")));
+        }
+    }
+}
+
+async fn install_update(update: UpdateInfo, events: &SyncSender<UpdateEvent>) {
+    let version = update.version.clone();
+    let _ = events.try_send(UpdateEvent::Downloading(version.clone()));
+    match updater::download_and_stage(&update).await {
+        Ok(()) => {
+            let _ = events.try_send(UpdateEvent::Restarting(version));
+        }
+        Err(error) => {
+            tracing::error!(%error, "Bridge update failed");
+            let _ = events.try_send(UpdateEvent::Failed(format!("{error:#}")));
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]

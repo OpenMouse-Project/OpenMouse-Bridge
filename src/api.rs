@@ -23,12 +23,6 @@ struct ApiResult {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GamesPayload {
-    games: Vec<GameConfig>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ProfilesPayload {
     profiles: Vec<ApplicationProfile>,
 }
@@ -51,7 +45,7 @@ pub fn router(service: BridgeService, origins: &[String]) -> Router {
     Router::new()
         .route("/v1/status", get(status))
         .route("/v1/handshake", put(handshake))
-        .route("/v1/games", get(games).put(replace_games))
+        .route("/v1/games", get(games))
         .route("/v1/applications", get(applications))
         .route("/v1/applications/{icon_id}/icon", get(application_icon))
         .route("/v1/profiles", get(profiles).put(replace_profiles))
@@ -141,17 +135,6 @@ async fn set_default_profile(
 ) -> Result<Json<ApiResult>, (StatusCode, String)> {
     service
         .set_default_profile(profile)
-        .await
-        .map_err(internal_error)?;
-    Ok(Json(ApiResult { ok: true }))
-}
-
-async fn replace_games(
-    State(service): State<BridgeService>,
-    Json(payload): Json<GamesPayload>,
-) -> Result<Json<ApiResult>, (StatusCode, String)> {
-    service
-        .replace_games(payload.games)
         .await
         .map_err(internal_error)?;
     Ok(Json(ApiResult { ok: true }))

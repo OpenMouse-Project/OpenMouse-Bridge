@@ -50,7 +50,7 @@ async fn main() {
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 async fn run() -> Result<()> {
-    let (config, path) = config::load_or_create()?;
+    let (config, path) = config::load_with_catalog().await?;
     let origins = config.allowed_origins.clone();
     let service = BridgeService::new(config, path.clone());
     // Headless mode has no status window, but the web app still fetches
