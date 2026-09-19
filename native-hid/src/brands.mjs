@@ -114,6 +114,14 @@ export const BRAND_DRIVERS = {
       client("@openmouse/protocol/drivers/wallhack/keyboard-hid", "WallhackKeyboardHidClient"),
     ],
   },
+  delux: {
+    vendorIds: [0x1d57, 0x248a, 0x373e],
+    classes: [
+      client("@openmouse/protocol/drivers/delux/hid", "DeluxHidClient"),
+      client("@openmouse/protocol/drivers/attackshark/hid", "AttackSharkHidClient"),
+      client("@openmouse/protocol/drivers/lamzu/hid", "LamzuHidClient"),
+    ],
+  },
 };
 
 /** Normalizes a MouseStatus `brand` string / Bridge `device.id` prefix into
