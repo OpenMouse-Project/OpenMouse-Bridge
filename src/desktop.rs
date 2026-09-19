@@ -22,7 +22,10 @@ use openmouse_bridge::{
 };
 #[cfg(target_os = "windows")]
 use std::ptr::null_mut;
-use tokio::{net::TcpListener, sync::oneshot};
+use tokio::{
+    net::TcpListener,
+    sync::{mpsc as tokio_mpsc, oneshot},
+};
 use tray_icon::{
     Icon, MouseButton, MouseButtonState, Rect as TrayRect, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
@@ -31,7 +34,7 @@ use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWN
 
 const OPENMOUSE_URL: &str = "https://control.openmouse.app";
 const WINDOW_WIDTH: f32 = 360.0;
-const WINDOW_HEIGHT: f32 = 460.0;
+const WINDOW_HEIGHT: f32 = 560.0;
 const BACKGROUND: Color32 = Color32::from_rgb(12, 14, 16);
 const SURFACE: Color32 = Color32::from_rgb(24, 27, 30);
 const SURFACE_HOVER: Color32 = Color32::from_rgb(31, 35, 39);
@@ -39,6 +42,11 @@ const TEXT: Color32 = Color32::from_rgb(239, 243, 241);
 const MUTED: Color32 = Color32::from_rgb(151, 160, 158);
 const ACCENT: Color32 = Color32::from_rgb(93, 222, 137);
 const DANGER: Color32 = Color32::from_rgb(248, 113, 113);
+const BATTERY_THRESHOLDS: [u8; 7] = [10, 15, 20, 25, 30, 40, 50];
+
+enum BridgeCommand {
+    SetBatteryThreshold(u8),
+}
 
 #[derive(Clone, Copy)]
 enum TrayAction {
@@ -93,11 +101,13 @@ struct TrayApp {
     tray: TrayState,
     logo: egui::TextureHandle,
     snapshots: Receiver<BridgeSnapshot>,
+    commands: tokio_mpsc::UnboundedSender<BridgeCommand>,
     snapshot: Option<BridgeSnapshot>,
     visible: bool,
     visibility_initialized: bool,
     exit_requested: bool,
     autostart: bool,
+    battery_threshold: u8,
     last_error: Option<String>,
 }
 
@@ -105,6 +115,7 @@ impl TrayApp {
     fn new(
         context: &egui::Context,
         snapshots: Receiver<BridgeSnapshot>,
+        commands: tokio_mpsc::UnboundedSender<BridgeCommand>,
         visible: bool,
     ) -> Result<Self> {
         configure_tray_only_application();
@@ -129,11 +140,13 @@ impl TrayApp {
             tray: TrayState::new(context)?,
             logo,
             snapshots,
+            commands,
             snapshot: None,
             visible,
             visibility_initialized: false,
             exit_requested: false,
             autostart: platform::autostart_enabled(),
+            battery_threshold: 20,
             last_error: None,
         })
     }
@@ -163,6 +176,7 @@ impl TrayApp {
     fn refresh_snapshot(&mut self) {
         while let Ok(snapshot) = self.snapshots.try_recv() {
             self.autostart = snapshot.autostart_enabled;
+            self.battery_threshold = snapshot.battery_threshold_percent;
             self.snapshot = Some(snapshot);
         }
     }
@@ -348,6 +362,58 @@ impl eframe::App for TrayApp {
                         });
                     });
 
+                ui.add_space(8.0);
+                let mut requested_threshold = None;
+                Frame::NONE
+                    .fill(SURFACE)
+                    .corner_radius(14.0)
+                    .inner_margin(16.0)
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Battery alerts").strong().color(TEXT));
+                        ui.label(
+                            RichText::new("Notify when mouse battery falls below")
+                                .size(11.0)
+                                .color(MUTED),
+                        );
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            for percent in BATTERY_THRESHOLDS {
+                                let selected = percent == self.battery_threshold;
+                                let fill = if selected { ACCENT } else { SURFACE_HOVER };
+                                let text = if selected { BACKGROUND } else { MUTED };
+                                if ui
+                                    .add(
+                                        Button::new(
+                                            RichText::new(format!("{percent}%"))
+                                                .size(10.0)
+                                                .strong()
+                                                .color(text),
+                                        )
+                                        .fill(fill)
+                                        .stroke(Stroke::NONE)
+                                        .corner_radius(8.0)
+                                        .min_size(Vec2::new(36.0, 26.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    requested_threshold = Some(percent);
+                                }
+                            }
+                        });
+                    });
+                if let Some(percent) = requested_threshold {
+                    if self
+                        .commands
+                        .send(BridgeCommand::SetBatteryThreshold(percent))
+                        .is_ok()
+                    {
+                        self.battery_threshold = percent;
+                        self.last_error = None;
+                    } else {
+                        self.last_error = Some("Bridge settings service is unavailable".into());
+                    }
+                }
+
                 if let Some(error) = &self.last_error {
                     ui.add_space(8.0);
                     ui.label(RichText::new(error).size(11.0).color(DANGER));
@@ -402,14 +468,19 @@ struct BackgroundServer {
 }
 
 impl BackgroundServer {
-    fn start() -> Result<(Self, Receiver<BridgeSnapshot>)> {
+    fn start() -> Result<(
+        Self,
+        Receiver<BridgeSnapshot>,
+        tokio_mpsc::UnboundedSender<BridgeCommand>,
+    )> {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (snapshot_tx, snapshots) = mpsc::sync_channel(1);
+        let (command_tx, command_rx) = tokio_mpsc::unbounded_channel();
         let thread = thread::Builder::new()
             .name("openmouse-bridge-runtime".into())
             .spawn(move || {
-                let outcome = run_server(shutdown_rx, ready_tx.clone(), snapshot_tx);
+                let outcome = run_server(shutdown_rx, ready_tx.clone(), snapshot_tx, command_rx);
                 if let Err(error) = &outcome {
                     let _ = ready_tx.send(Err(format!("{error:#}")));
                 }
@@ -424,6 +495,7 @@ impl BackgroundServer {
                     thread: Some(thread),
                 },
                 snapshots,
+                command_tx,
             )),
             Ok(Err(error)) => {
                 let _ = shutdown_tx.send(());
@@ -451,7 +523,7 @@ impl BackgroundServer {
 }
 
 pub fn run() -> Result<()> {
-    let (server, snapshots) = BackgroundServer::start()?;
+    let (server, snapshots, commands) = BackgroundServer::start()?;
     let visible = env::var_os("OPENMOUSE_BRIDGE_SHOW_WINDOW").is_some();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -471,6 +543,7 @@ pub fn run() -> Result<()> {
             Ok(Box::new(TrayApp::new(
                 &context.egui_ctx,
                 snapshots,
+                commands,
                 visible,
             )?))
         }),
@@ -484,6 +557,7 @@ fn run_server(
     shutdown: oneshot::Receiver<()>,
     ready: SyncSender<Result<(), String>>,
     snapshots: SyncSender<BridgeSnapshot>,
+    mut commands: tokio_mpsc::UnboundedReceiver<BridgeCommand>,
 ) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -504,6 +578,20 @@ fn run_server(
             }
         });
 
+        let command_service = service.clone();
+        let command_handler = tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                let result = match command {
+                    BridgeCommand::SetBatteryThreshold(percent) => {
+                        command_service.set_battery_threshold(percent).await
+                    }
+                };
+                if let Err(error) = result {
+                    tracing::error!(%error, "could not save Bridge settings");
+                }
+            }
+        });
+
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), BRIDGE_PORT);
         let listener = TcpListener::bind(address).await.with_context(|| {
             format!("could not bind http://{address}; is Bridge already running?")
@@ -516,6 +604,7 @@ fn run_server(
             })
             .await;
         snapshot_publisher.abort();
+        command_handler.abort();
         outcome?;
         Ok(())
     })
