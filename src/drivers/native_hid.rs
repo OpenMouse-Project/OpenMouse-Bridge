@@ -4,6 +4,8 @@
 //! classes through a small adapter, instead of Bridge reimplementing every
 //! vendor's wire protocol from scratch — see `native-hid/README.md`.
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -13,6 +15,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 use crate::config::ApplicationProfile;
 
@@ -50,22 +54,24 @@ pub fn apply(profile: &ApplicationProfile) -> Result<bool> {
         serde_json::to_vec(&request).context("could not encode the native-hid request")?;
 
     let node = locate_node_binary();
-    let mut child = Command::new(node.as_deref().unwrap_or_else(|| Path::new("node")))
+    let mut command = Command::new(node.as_deref().unwrap_or_else(|| Path::new("node")));
+    command
         .arg(&script)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| match &node {
-            Some(bundled) => format!(
-                "could not start the bundled Node.js runtime at {}",
-                bundled.display()
-            ),
-            None => format!(
-                "could not start Node.js to run {} — is Node.js installed and on PATH?",
-                script.display()
-            ),
-        })?;
+        .stderr(Stdio::piped());
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+    let mut child = command.spawn().with_context(|| match &node {
+        Some(bundled) => format!(
+            "could not start the bundled Node.js runtime at {}",
+            bundled.display()
+        ),
+        None => format!(
+            "could not start Node.js to run {} — is Node.js installed and on PATH?",
+            script.display()
+        ),
+    })?;
 
     // Dropping the returned handle after this write closes stdin, which is
     // how apply.mjs's stdin-read loop knows the request is complete.

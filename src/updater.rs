@@ -1,3 +1,5 @@
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::{
     env,
     fs::{self, File},
@@ -11,6 +13,8 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 const LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/OpenMouse-Project/OpenMouse-Bridge/releases/latest";
@@ -280,7 +284,8 @@ Start-Process -FilePath (Join-Path $Destination $Binary) -WorkingDirectory $Dest
 "#;
     let script = staging.join("install-update.ps1");
     fs::write(&script, SCRIPT).context("could not write the update helper")?;
-    Command::new("powershell.exe")
+    let mut command = Command::new("powershell.exe");
+    command
         .args([
             "-NoProfile",
             "-WindowStyle",
@@ -301,7 +306,9 @@ Start-Process -FilePath (Join-Path $Destination $Binary) -WorkingDirectory $Dest
             executable
                 .file_name()
                 .context("Bridge executable has no file name")?,
-        )
+        );
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
         .spawn()
         .context("could not launch the update helper")?;
     Ok(())
