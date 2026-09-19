@@ -1,11 +1,12 @@
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use std::process::Command;
 use std::{
     env,
     fs::{self, File},
     io::{self, Cursor},
     path::Path,
-    process::Command,
     time::Duration,
 };
 
