@@ -110,6 +110,10 @@ export const BRAND_DRIVERS = {
     vendorIds: [0x31e3],
     classes: [client("@openmouse/protocol/drivers/wooting/hid", "WootingHidClient")],
   },
+  microsoft: {
+    vendorIds: [0x045e],
+    classes: [client("@openmouse/protocol/drivers/microsoft/hid", "MicrosoftHidClient")],
+  },
   wallhack: {
     vendorIds: [0x3879, 0x1caa],
     classes: [
