@@ -15,7 +15,12 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 const MAX_REPORT_BYTES: usize = MAX_REPORT_DESCRIPTOR_SIZE;
+#[cfg(target_os = "windows")]
 const READ_TIMEOUT_MS: i32 = 100;
+/// How long a shared-handle reader waits between empty polls. The wait happens
+/// with the device lock released, so a write never queues behind a read.
+#[cfg(not(target_os = "windows"))]
+const SHARED_READ_IDLE: std::time::Duration = std::time::Duration::from_millis(2);
 const LOGITECH_VENDOR_ID: u16 = 0x046D;
 const RAZER_VENDOR_ID: u16 = 0x1532;
 const RAZER_FEATURE_BUFFER_LEN: usize = 91;
@@ -221,18 +226,30 @@ enum ReaderHandle {
 }
 
 impl ReaderHandle {
-    fn read_timeout(&self, buffer: &mut [u8], timeout_ms: i32) -> Result<usize, String> {
+    fn read(&self, buffer: &mut [u8]) -> Result<usize, String> {
         match self {
             #[cfg(target_os = "windows")]
             Self::Owned(device) => device
-                .read_timeout(buffer, timeout_ms)
+                .read_timeout(buffer, READ_TIMEOUT_MS)
                 .map_err(|error| error.to_string()),
+            // The handle is shared with send_report, and std's Mutex is not
+            // fair: a reader that blocks in read_timeout while holding the
+            // lock, then immediately re-locks, can starve a writer for many
+            // seconds — and the writer holds the session lock meanwhile, so
+            // every other command (even `list`) stalls behind it. Read without
+            // blocking under the lock and idle with it released instead.
             #[cfg(not(target_os = "windows"))]
-            Self::Shared(device) => device
-                .lock()
-                .map_err(|_| "native HID lock was poisoned".to_owned())?
-                .read_timeout(buffer, timeout_ms)
-                .map_err(|error| error.to_string()),
+            Self::Shared(device) => {
+                let size = device
+                    .lock()
+                    .map_err(|_| "native HID lock was poisoned".to_owned())?
+                    .read_timeout(buffer, 0)
+                    .map_err(|error| error.to_string())?;
+                if size == 0 {
+                    thread::sleep(SHARED_READ_IDLE);
+                }
+                Ok(size)
+            }
         }
     }
 }
@@ -551,7 +568,7 @@ impl HidSession {
                 .spawn(move || {
                     let mut buffer = vec![0; buffer_len];
                     while !thread_stop.load(Ordering::Acquire) {
-                        match device.read_timeout(&mut buffer, READ_TIMEOUT_MS) {
+                        match device.read(&mut buffer) {
                             Ok(0) => {}
                             Ok(size) => {
                                 let (report_id, data) = if uses_report_ids {
