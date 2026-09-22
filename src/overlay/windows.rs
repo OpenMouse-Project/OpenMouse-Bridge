@@ -131,11 +131,10 @@ impl Window {
             }
             // Premultiplied RGBA to the premultiplied BGRA a layered window takes.
             let target = std::slice::from_raw_parts_mut(bits.cast::<u8>(), banner.pixels.len());
-            for (out, pixel) in target
-                .chunks_exact_mut(4)
-                .zip(banner.pixels.chunks_exact(4))
-            {
-                out.copy_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+            let (target, _) = target.as_chunks_mut::<4>();
+            let (source, _) = banner.pixels.as_chunks::<4>();
+            for (out, [red, green, blue, alpha]) in target.iter_mut().zip(source) {
+                *out = [*blue, *green, *red, *alpha];
             }
             let previous = SelectObject(dc, bitmap);
             let mut area = RECT::default();
