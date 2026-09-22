@@ -12,6 +12,8 @@
 //! (`src/drivers/mouse-types.ts`). First match wins, same as
 //! `mouse-protocol`'s own `src/drivers/registry.ts`.
 
+use std::sync::{Mutex, MutexGuard};
+
 use anyhow::Result;
 
 use crate::config::ApplicationProfile;
@@ -20,6 +22,20 @@ mod native_hid;
 pub mod pulsar;
 
 pub use native_hid::NativeBattery;
+
+/// Serializes Bridge's own device access. A profile switch and a battery read
+/// can start at the same moment (both run at startup), and on macOS the second
+/// open of a receiver fails with "exclusive access"; elsewhere the two would
+/// interleave requests on the same device.
+static DEVICE_ACCESS: Mutex<()> = Mutex::new(());
+
+fn device_access() -> MutexGuard<'static, ()> {
+    // The guarded value is (), so a panic while holding it leaves nothing
+    // inconsistent behind.
+    DEVICE_ACCESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Pushes a profile's DPI/polling rate to the mouse over native HID, if
 /// Bridge has a driver for that device.
@@ -43,6 +59,7 @@ pub fn apply_profile(profile: &ApplicationProfile) -> Result<bool> {
         .next()
         .unwrap_or_default()
         .to_ascii_lowercase();
+    let _access = device_access();
     match brand.as_str() {
         pulsar::BRAND => {
             pulsar::apply(profile)?;
@@ -63,6 +80,7 @@ pub fn read_battery(device_id: &str) -> Result<Option<NativeBattery>> {
     if brand.eq_ignore_ascii_case(pulsar::BRAND) {
         return Ok(None);
     }
+    let _access = device_access();
     native_hid::read_battery(brand)
 }
 
