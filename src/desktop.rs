@@ -3,14 +3,15 @@ use std::{
     io::Cursor,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::AtomicBool,
-        mpsc::{self, Receiver, SyncSender},
+        mpsc::{self, Receiver, Sender, SyncSender},
     },
     thread,
     time::Duration,
 };
 
+use crate::overlay::Overlay;
 use anyhow::{Context, Result, anyhow};
 use eframe::egui::{
     self, Align, Button, Color32, Frame, Layout, Pos2, RichText, Sense, Stroke, Vec2,
@@ -18,7 +19,7 @@ use eframe::egui::{
 };
 use openmouse_bridge::{
     BRIDGE_PORT, api, config, platform,
-    service::{BridgeService, BridgeSnapshot},
+    service::{BridgeService, BridgeSnapshot, ProfileSwitch},
     updater::{self, UpdateInfo},
 };
 #[cfg(target_os = "windows")]
@@ -234,6 +235,8 @@ struct TrayApp {
     snapshots: Receiver<BridgeSnapshot>,
     commands: tokio_mpsc::UnboundedSender<BridgeCommand>,
     updates: Receiver<UpdateEvent>,
+    switches: Receiver<ProfileSwitch>,
+    overlay: Option<Overlay>,
     snapshot: Option<BridgeSnapshot>,
     view: View,
     visible: bool,
@@ -253,9 +256,16 @@ impl TrayApp {
         snapshots: Receiver<BridgeSnapshot>,
         commands: tokio_mpsc::UnboundedSender<BridgeCommand>,
         updates: Receiver<UpdateEvent>,
+        switches: Receiver<ProfileSwitch>,
+        waker: &OnceLock<egui::Context>,
         visible: bool,
     ) -> Result<Self> {
         configure_tray_only_application();
+        let _ = waker.set(context.clone());
+        // Without the overlay, switches fall back to system notifications.
+        let overlay = Overlay::new()
+            .inspect_err(|error| tracing::warn!(%error, "Could not create the profile overlay"))
+            .ok();
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = BACKGROUND;
         visuals.window_fill = BACKGROUND;
@@ -297,6 +307,8 @@ impl TrayApp {
             snapshots,
             commands,
             updates,
+            switches,
+            overlay,
             snapshot: None,
             view: View::Home,
             visible,
@@ -342,6 +354,26 @@ impl TrayApp {
             self.automatic_updates = snapshot.automatic_updates;
             self.snapshot = Some(snapshot);
         }
+    }
+
+    /// Shows pending profile switches and advances the banner's fade.
+    /// Returns how soon the banner needs the next frame.
+    fn refresh_overlay(&mut self) -> Option<Duration> {
+        while let Ok(switch) = self.switches.try_recv() {
+            let shown = self
+                .overlay
+                .as_mut()
+                .map(|overlay| overlay.show(&switch.title, &switch.detail));
+            match shown {
+                Some(Ok(())) => {}
+                Some(Err(error)) => {
+                    tracing::warn!(%error, "Could not show the profile overlay");
+                    notify_switch(&switch);
+                }
+                None => notify_switch(&switch),
+            }
+        }
+        self.overlay.as_mut()?.tick()
     }
 
     fn refresh_updates(&mut self) -> bool {
@@ -396,7 +428,11 @@ impl eframe::App for TrayApp {
             context.send_viewport_cmd(ViewportCommand::CancelClose);
             self.set_visible(context, false);
         }
-        context.request_repaint_after(Duration::from_secs(1));
+        let mut next = Duration::from_secs(1);
+        if let Some(fade) = self.refresh_overlay() {
+            next = next.min(fade);
+        }
+        context.request_repaint_after(next);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -469,22 +505,12 @@ impl TrayApp {
         ui.add(egui::Label::new(RichText::new(subtitle).size(12.0).color(MUTED)).truncate());
 
         ui.add_space(18.0);
-        // A running game names the profile; otherwise an application profile
-        // does. The default profile carries the device name as its
-        // "application", so it is recognized by having no executable or path.
+        // Name the profile that is actually applied: a game's while it runs,
+        // an application's while it is in front, otherwise Default.
         let profile = snapshot
-            .and_then(|snapshot| {
-                snapshot.active_games.first().cloned().or_else(|| {
-                    snapshot
-                        .active_profile
-                        .as_ref()
-                        .filter(|profile| {
-                            !profile.application.executable.is_empty()
-                                || !profile.application.path.is_empty()
-                        })
-                        .map(|profile| profile.application.name.clone())
-                })
-            })
+            .filter(|snapshot| !snapshot.active_profile_is_default)
+            .and_then(|snapshot| snapshot.active_profile.as_ref())
+            .map(|profile| profile.application.name.clone())
             .unwrap_or_else(|| "Default".into());
         divider(ui);
         value_row(ui, "Profile", &profile, MUTED);
@@ -730,6 +756,10 @@ struct BackgroundServer {
     thread: Option<thread::JoinHandle<Result<()>>>,
 }
 
+/// Where the runtime sends profile switches, and the tray app's context to
+/// wake so it shows them even while its panel is hidden.
+type SwitchSink = (Sender<ProfileSwitch>, Arc<OnceLock<egui::Context>>);
+
 type BackgroundRuntime = (
     BackgroundServer,
     Receiver<BridgeSnapshot>,
@@ -738,7 +768,7 @@ type BackgroundRuntime = (
 );
 
 impl BackgroundServer {
-    fn start() -> Result<BackgroundRuntime> {
+    fn start(switches: SwitchSink) -> Result<BackgroundRuntime> {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (snapshot_tx, snapshots) = mpsc::sync_channel(1);
@@ -753,6 +783,7 @@ impl BackgroundServer {
                     snapshot_tx,
                     command_rx,
                     update_tx,
+                    switches,
                 );
                 if let Err(error) = &outcome {
                     let _ = ready_tx.send(Err(format!("{error:#}")));
@@ -797,7 +828,10 @@ impl BackgroundServer {
 }
 
 pub fn run() -> Result<()> {
-    let (server, snapshots, commands, updates) = BackgroundServer::start()?;
+    let (switch_tx, switches) = mpsc::channel();
+    let waker = Arc::new(OnceLock::new());
+    let (server, snapshots, commands, updates) =
+        BackgroundServer::start((switch_tx, Arc::clone(&waker)))?;
     let visible = env::var_os("OPENMOUSE_BRIDGE_SHOW_WINDOW").is_some();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -819,6 +853,8 @@ pub fn run() -> Result<()> {
                 snapshots,
                 commands,
                 updates,
+                switches,
+                &waker,
                 visible,
             )?))
         }),
@@ -834,6 +870,7 @@ fn run_server(
     snapshots: SyncSender<BridgeSnapshot>,
     mut commands: tokio_mpsc::UnboundedReceiver<BridgeCommand>,
     update_events: SyncSender<UpdateEvent>,
+    (switches, waker): SwitchSink,
 ) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -844,6 +881,19 @@ fn run_server(
         let automatic_updates = bridge_config.automatic_updates;
         let origins = bridge_config.allowed_origins.clone();
         let service = BridgeService::new(bridge_config, path.clone());
+        let switches = std::sync::Mutex::new(switches);
+        service.on_profile_switch(move |switch| {
+            let sent = switches
+                .lock()
+                .map(|sender| sender.send(switch).is_ok())
+                .unwrap_or(false);
+            if sent && let Some(context) = waker.get() {
+                context.request_repaint();
+            }
+        });
+        if let Err(error) = service.enable_autostart_once().await {
+            tracing::warn!(%error, "Could not turn on launch at login");
+        }
         service.start_game_monitor(Arc::new(AtomicBool::new(true)));
         service.start_battery_monitor();
 
@@ -953,6 +1003,12 @@ fn configure_tray_only_application() {
 
 #[cfg(target_os = "windows")]
 fn configure_tray_only_application() {}
+
+fn notify_switch(switch: &ProfileSwitch) {
+    if let Err(error) = platform::notify(&switch.title, &switch.detail) {
+        tracing::warn!(%error, "Could not show the profile notification");
+    }
+}
 
 fn openmouse_icon_rgba() -> Result<(Vec<u8>, u32, u32)> {
     let mut decoder =

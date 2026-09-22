@@ -30,6 +30,10 @@ pub struct BridgeConfig {
     pub default_profile: Option<ApplicationProfile>,
     #[serde(default = "default_origins")]
     pub allowed_origins: Vec<String>,
+    /// Whether Bridge has already turned launch-at-login on by default, so a
+    /// user who later turns it off keeps it off.
+    #[serde(default)]
+    pub autostart_configured: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -113,6 +117,7 @@ impl Default for BridgeConfig {
             profiles: Vec::new(),
             default_profile: None,
             allowed_origins: default_origins(),
+            autostart_configured: false,
         }
     }
 }
@@ -281,6 +286,7 @@ mod tests {
             profiles: Vec::new(),
             default_profile: None,
             allowed_origins: Vec::new(),
+            autostart_configured: false,
         }
         .normalized();
         assert_eq!(config.battery_threshold_percent, 100);

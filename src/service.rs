@@ -63,33 +63,52 @@ fn profile_devices(config: &BridgeConfig) -> Vec<(String, String)> {
     devices
 }
 
-/// The profile that applies to the current foreground application, falling back
-/// to the configured default profile. Shared by the snapshot and the monitor.
+/// The profile that applies right now: one for the application in front, else
+/// one for a game that is still running, so alt-tabbing out of a game keeps
+/// its profile until the game closes, else the configured default profile.
+/// Shared by the snapshot and the monitor.
 fn active_profile_for(
     config: &BridgeConfig,
     applications: &[ApplicationInfo],
+    active_games: &[String],
 ) -> Option<ApplicationProfile> {
-    applications
+    let enabled = || config.profiles.iter().filter(|profile| profile.enabled);
+    let foreground = applications
         .iter()
         .find(|application| application.foreground)
         .and_then(|application| {
-            config
-                .profiles
-                .iter()
-                .filter(|profile| profile.enabled)
-                .find(|profile| {
-                    // Game profiles leave some of these empty; an empty field
-                    // must not match an application that also reports none.
-                    let matches = |saved: &str, running: &str| {
-                        !saved.is_empty() && saved.eq_ignore_ascii_case(running)
-                    };
-                    matches(&profile.application.path, &application.path)
-                        || matches(&profile.application.name, &application.name)
-                        || matches(&profile.application.executable, &application.executable)
-                })
-                .cloned()
+            enabled().find(|profile| {
+                // Game profiles leave some of these empty; an empty field
+                // must not match an application that also reports none.
+                let matches = |saved: &str, running: &str| {
+                    !saved.is_empty() && saved.eq_ignore_ascii_case(running)
+                };
+                matches(&profile.application.path, &application.path)
+                    || matches(&profile.application.name, &application.name)
+                    || matches(&profile.application.executable, &application.executable)
+            })
+        });
+    let running_game = || {
+        active_games.iter().find_map(|name| {
+            let game = config.games.iter().find(|game| &game.name == name)?;
+            enabled().find(|profile| profile_matches_game(profile, game))
         })
+    };
+    foreground
+        .or_else(running_game)
+        .cloned()
         .or_else(|| config.default_profile.clone())
+}
+
+fn profile_matches_game(profile: &ApplicationProfile, game: &GameConfig) -> bool {
+    let application = &profile.application;
+    (!application.name.is_empty()
+        && normalized_name(&application.name) == normalized_name(&game.name))
+        || (!application.executable.is_empty()
+            && game
+                .executables
+                .iter()
+                .any(|executable| executable.eq_ignore_ascii_case(&application.executable)))
 }
 
 /// A stable identity for a profile, used to detect switches.
@@ -101,7 +120,28 @@ fn profile_key(profile: &ApplicationProfile) -> String {
     }
 }
 
-fn profile_notification_body(profile: &ApplicationProfile) -> String {
+/// A profile switch worth telling the user about, already worded: a title such
+/// as the game's name and a short detail line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProfileSwitch {
+    pub title: String,
+    pub detail: String,
+}
+
+/// Receives profile switches instead of the platform notification, e.g. the
+/// desktop app's on-screen overlay.
+pub type ProfileSwitchListener = Arc<dyn Fn(ProfileSwitch) + Send + Sync>;
+
+/// How pushing a profile to the mouse over native HID went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApplyOutcome {
+    Applied,
+    NoDriver,
+    Failed,
+}
+
+/// The settings a profile sets, e.g. "1600 DPI · 1000 Hz".
+fn settings_summary(profile: &ApplicationProfile) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(dpi) = profile.settings.dpi {
         parts.push(format!("{dpi} DPI"));
@@ -109,17 +149,63 @@ fn profile_notification_body(profile: &ApplicationProfile) -> String {
     if let Some(rate) = profile.settings.polling_rate_hz {
         parts.push(format!("{rate} Hz"));
     }
-    if parts.is_empty() {
-        profile.application.name.clone()
-    } else {
-        format!("{} · {}", profile.application.name, parts.join(" · "))
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+fn with_settings(lead: String, profile: &ApplicationProfile) -> String {
+    match settings_summary(profile) {
+        Some(settings) => format!("{lead} · {settings}"),
+        None => lead,
     }
+}
+
+/// Words a switch from `previous` to `current`. Returns `None` when nothing
+/// the user cares about changed (e.g. default to default).
+///
+/// When the control panel is connected it applies the profile itself, so a
+/// native apply that could not reach the mouse is not worth mentioning then.
+fn switch_message(
+    previous: Option<&ApplicationProfile>,
+    current: Option<&ApplicationProfile>,
+    default: Option<&ApplicationProfile>,
+    outcome: Option<ApplyOutcome>,
+    panel_connected: bool,
+) -> Option<ProfileSwitch> {
+    let is_default = |profile: &ApplicationProfile| default == Some(profile);
+    let left = previous.filter(|profile| !is_default(profile));
+    let mut switch = match current {
+        Some(profile) if !is_default(profile) => ProfileSwitch {
+            title: profile.application.name.clone(),
+            detail: with_settings("Profile on".into(), profile),
+        },
+        Some(profile) => ProfileSwitch {
+            title: "Default profile".into(),
+            detail: with_settings(format!("{} closed", left?.application.name), profile),
+        },
+        None => ProfileSwitch {
+            title: format!("{} closed", left?.application.name),
+            detail: "Profile off".into(),
+        },
+    };
+    if current.is_some() && !panel_connected {
+        match outcome {
+            Some(ApplyOutcome::Failed) => {
+                switch.detail = "Couldn't reach the mouse — open OpenMouse to apply".into();
+            }
+            Some(ApplyOutcome::NoDriver) => {
+                switch.detail = "Open OpenMouse to apply this profile".into();
+            }
+            _ => {}
+        }
+    }
+    Some(switch)
 }
 
 #[derive(Clone)]
 pub struct BridgeService {
     inner: Arc<RwLock<BridgeState>>,
     config_path: Arc<PathBuf>,
+    switch_listener: Arc<std::sync::Mutex<Option<ProfileSwitchListener>>>,
 }
 
 struct BridgeState {
@@ -130,6 +216,7 @@ struct BridgeState {
     battery: HashMap<String, BatteryState>,
     // Debounced active-profile tracking for switch notifications.
     active_profile_key: Option<String>,
+    applied_profile: Option<ApplicationProfile>,
     pending_profile: Option<(Option<String>, Instant)>,
     profile_seeded: bool,
     started_at: Instant,
@@ -186,6 +273,7 @@ pub struct BridgeSnapshot {
     pub automatic_updates: bool,
     pub foreground_application: Option<ApplicationInfo>,
     pub active_profile: Option<ApplicationProfile>,
+    pub active_profile_is_default: bool,
     pub visible_application_count: usize,
     pub profile_count: usize,
     pub client_connected: bool,
@@ -202,13 +290,24 @@ impl BridgeService {
                 application_icons: HashMap::new(),
                 battery: HashMap::new(),
                 active_profile_key: None,
+                applied_profile: None,
                 pending_profile: None,
                 profile_seeded: false,
                 started_at: Instant::now(),
                 last_client_heartbeat: None,
             })),
             config_path: Arc::new(config_path),
+            switch_listener: Arc::default(),
         }
+    }
+
+    /// Sends profile switches to `listener` instead of showing a platform
+    /// notification for them.
+    pub fn on_profile_switch(&self, listener: impl Fn(ProfileSwitch) + Send + Sync + 'static) {
+        *self
+            .switch_listener
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(listener));
     }
 
     pub async fn snapshot(&self) -> BridgeSnapshot {
@@ -222,7 +321,10 @@ impl BridgeService {
             .iter()
             .find(|application| application.foreground)
             .cloned();
-        let active_profile = active_profile_for(&state.config, &state.applications);
+        let active_profile =
+            active_profile_for(&state.config, &state.applications, &state.active_games);
+        let active_profile_is_default =
+            active_profile.is_some() && active_profile == state.config.default_profile;
         let mut batteries = state
             .battery
             .iter()
@@ -256,6 +358,7 @@ impl BridgeService {
             automatic_updates: state.config.automatic_updates,
             foreground_application,
             active_profile,
+            active_profile_is_default,
             visible_application_count: state.applications.len(),
             profile_count: state.config.profiles.len(),
             client_connected,
@@ -308,6 +411,21 @@ impl BridgeService {
             let mut state = self.inner.write().await;
             state.config.default_profile = Some(profile);
             state.config = state.config.clone().normalized();
+            state.config.clone()
+        };
+        config::save(&self.config_path, &config)
+    }
+
+    /// Turns launch-at-login on the first time a release build runs; after
+    /// that the user's choice stands. Debug builds never register themselves.
+    pub async fn enable_autostart_once(&self) -> Result<()> {
+        if cfg!(debug_assertions) || self.inner.read().await.config.autostart_configured {
+            return Ok(());
+        }
+        platform::set_autostart(true)?;
+        let config = {
+            let mut state = self.inner.write().await;
+            state.config.autostart_configured = true;
             state.config.clone()
         };
         config::save(&self.config_path, &config)
@@ -469,20 +587,26 @@ impl BridgeService {
 
                 // Detect a debounced active-profile switch, push the new
                 // profile's DPI/polling rate to the mouse over native HID
-                // when Bridge has a driver for it, and notify once the new
-                // profile has stayed active long enough.
-                let current = active_profile_for(&state.config, &state.applications);
+                // when Bridge has a driver for it, and announce the switch
+                // once the new profile has stayed active long enough.
+                let current =
+                    active_profile_for(&state.config, &state.applications, &state.active_games);
                 let current_key = current.as_ref().map(profile_key);
-                // (profile to push to hardware, whether to notify about it)
-                let mut apply: Option<(ApplicationProfile, bool)> = None;
+                // (new profile, the one it replaces, whether to announce it)
+                let mut switch: Option<(
+                    Option<ApplicationProfile>,
+                    Option<ApplicationProfile>,
+                    bool,
+                )> = None;
                 if !state.profile_seeded {
                     // Adopt the initial profile silently so startup is quiet,
                     // but still push it to the mouse — Bridge should reflect
                     // the right settings from a cold start, not only switches.
                     state.active_profile_key = current_key;
+                    state.applied_profile = current.clone();
                     state.pending_profile = None;
                     state.profile_seeded = true;
-                    apply = current.clone().map(|profile| (profile, false));
+                    switch = Some((current, None, false));
                 } else if current_key == state.active_profile_key {
                     state.pending_profile = None;
                 } else {
@@ -495,62 +619,79 @@ impl BridgeService {
                     if ready {
                         state.active_profile_key = current_key;
                         state.pending_profile = None;
-                        apply = current.clone().map(|profile| (profile, true));
+                        let previous =
+                            std::mem::replace(&mut state.applied_profile, current.clone());
+                        switch = Some((current, previous, true));
                     } else if !waiting {
                         state.pending_profile = Some((current_key, Instant::now()));
                     }
                 }
+                let default = state.config.default_profile.clone();
                 drop(state);
-                if let Some((profile, announce)) = apply {
+                if let Some((current, previous, announce)) = switch {
+                    let listener = service
+                        .switch_listener
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
                     std::thread::spawn(move || {
-                        let outcome = crate::drivers::apply_profile(&profile);
-                        match &outcome {
-                            Ok(true) => tracing::info!(
-                                profile = %profile.application.name,
-                                device = %profile.device.name,
-                                "Applied the mouse profile natively"
-                            ),
-                            Ok(false) => tracing::debug!(
-                                profile = %profile.application.name,
-                                device = %profile.device.name,
-                                "No native driver for this device; not applying natively"
-                            ),
-                            Err(error) => tracing::warn!(
-                                %error,
-                                profile = %profile.application.name,
-                                device = %profile.device.name,
-                                "Could not apply the mouse profile natively"
-                            ),
-                        }
+                        let outcome = current.as_ref().map(apply_natively);
                         if !announce {
                             return;
                         }
-                        let (title, body) = match outcome {
-                            Ok(true) => {
-                                ("Mouse profile applied", profile_notification_body(&profile))
-                            }
-                            Ok(false) => (
-                                "Mouse profile selected",
-                                format!(
-                                    "{} — open OpenMouse to apply it to this mouse.",
-                                    profile.application.name
-                                ),
-                            ),
-                            Err(_) => (
-                                "Mouse profile selected",
-                                format!(
-                                    "{} — could not reach the mouse. Open OpenMouse to apply it.",
-                                    profile.application.name
-                                ),
-                            ),
+                        let Some(message) = switch_message(
+                            previous.as_ref(),
+                            current.as_ref(),
+                            default.as_ref(),
+                            outcome,
+                            crate::hid::client_session_active(),
+                        ) else {
+                            return;
                         };
-                        if let Err(error) = platform::notify(title, &body) {
-                            tracing::warn!(%error, "Could not show the profile notification");
+                        match listener {
+                            Some(listener) => listener(message),
+                            None => {
+                                if let Err(error) =
+                                    platform::notify(&message.title, &message.detail)
+                                {
+                                    tracing::warn!(%error, "Could not show the profile notification");
+                                }
+                            }
                         }
                     });
                 }
             }
         });
+    }
+}
+
+fn apply_natively(profile: &ApplicationProfile) -> ApplyOutcome {
+    match crate::drivers::apply_profile(profile) {
+        Ok(true) => {
+            tracing::info!(
+                profile = %profile.application.name,
+                device = %profile.device.name,
+                "Applied the mouse profile natively"
+            );
+            ApplyOutcome::Applied
+        }
+        Ok(false) => {
+            tracing::debug!(
+                profile = %profile.application.name,
+                device = %profile.device.name,
+                "No native driver for this device; not applying natively"
+            );
+            ApplyOutcome::NoDriver
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                profile = %profile.application.name,
+                device = %profile.device.name,
+                "Could not apply the mouse profile natively"
+            );
+            ApplyOutcome::Failed
+        }
     }
 }
 
@@ -632,7 +773,7 @@ mod tests {
 
         let mut unnamed = test_app("Other", "", true);
         unnamed.executable = String::new();
-        assert_eq!(active_profile_for(&config, &[unnamed]), None);
+        assert_eq!(active_profile_for(&config, &[unnamed], &[]), None);
     }
 
     #[test]
@@ -643,7 +784,7 @@ mod tests {
         config.profiles = vec![valorant];
 
         let apps = vec![test_app("Valorant", "/games/valorant", true)];
-        assert_eq!(active_profile_for(&config, &apps), None);
+        assert_eq!(active_profile_for(&config, &apps, &[]), None);
     }
 
     #[test]
@@ -657,34 +798,107 @@ mod tests {
             test_app("Chrome", "/apps/chrome", false),
             test_app("Valorant", "/games/valorant", true),
         ];
-        assert_eq!(active_profile_for(&config, &apps), Some(valorant));
+        assert_eq!(active_profile_for(&config, &apps, &[]), Some(valorant));
 
         let apps = vec![test_app("Chrome", "/apps/chrome", true)];
         assert_eq!(
-            active_profile_for(&config, &apps).unwrap().application.name,
+            active_profile_for(&config, &apps, &[])
+                .unwrap()
+                .application
+                .name,
             "Default"
         );
 
         let apps = vec![test_app("Chrome", "/apps/chrome", false)];
         assert_eq!(
-            active_profile_for(&config, &apps).unwrap().application.name,
+            active_profile_for(&config, &apps, &[])
+                .unwrap()
+                .application
+                .name,
             "Default"
         );
     }
 
     #[test]
-    fn profile_notification_body_lists_available_settings() {
+    fn running_game_keeps_its_profile_while_another_app_is_in_front() {
+        let mut cs2 = test_profile("Counter-Strike 2", "", Some(1600), None);
+        cs2.application.executable = "cs2.exe".into();
+        let config = BridgeConfig {
+            games: vec![GameConfig {
+                name: "Counter-Strike 2".into(),
+                executables: vec!["cs2".into(), "cs2.exe".into()],
+            }],
+            profiles: vec![cs2.clone()],
+            default_profile: Some(test_profile("Default", "", Some(800), None)),
+            ..BridgeConfig::default()
+        };
+        let running = ["Counter-Strike 2".to_owned()];
+
+        let browser = [test_app("Chrome", "/apps/chrome", true)];
+        assert_eq!(active_profile_for(&config, &browser, &running), Some(cs2));
         assert_eq!(
-            profile_notification_body(&test_profile("Valorant", "/g", Some(800), Some(1000))),
-            "Valorant · 800 DPI · 1000 Hz"
+            active_profile_for(&config, &browser, &[])
+                .unwrap()
+                .application
+                .name,
+            "Default"
+        );
+    }
+
+    #[test]
+    fn switch_messages_name_the_game_and_the_return_to_default() {
+        let default = test_profile("PRO X SUPERLIGHT 2c", "", Some(800), Some(1000));
+        let game = test_profile("Counter-Strike 2", "", Some(1600), None);
+        let applied = Some(ApplyOutcome::Applied);
+
+        assert_eq!(
+            switch_message(Some(&default), Some(&game), Some(&default), applied, false),
+            Some(ProfileSwitch {
+                title: "Counter-Strike 2".into(),
+                detail: "Profile on · 1600 DPI".into(),
+            })
         );
         assert_eq!(
-            profile_notification_body(&test_profile("CS", "/g", Some(400), None)),
-            "CS · 400 DPI"
+            switch_message(Some(&game), Some(&default), Some(&default), applied, false),
+            Some(ProfileSwitch {
+                title: "Default profile".into(),
+                detail: "Counter-Strike 2 closed · 800 DPI · 1000 Hz".into(),
+            })
         );
         assert_eq!(
-            profile_notification_body(&test_profile("App", "/g", None, None)),
-            "App"
+            switch_message(Some(&game), None, None, None, false),
+            Some(ProfileSwitch {
+                title: "Counter-Strike 2 closed".into(),
+                detail: "Profile off".into(),
+            })
+        );
+        assert_eq!(
+            switch_message(
+                Some(&default),
+                Some(&default),
+                Some(&default),
+                applied,
+                false
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn switch_messages_mention_an_unreachable_mouse_only_without_the_panel() {
+        let game = test_profile("Counter-Strike 2", "", Some(1600), None);
+        let failed = Some(ApplyOutcome::Failed);
+        assert_eq!(
+            switch_message(None, Some(&game), None, failed, false)
+                .unwrap()
+                .detail,
+            "Couldn't reach the mouse — open OpenMouse to apply"
+        );
+        assert_eq!(
+            switch_message(None, Some(&game), None, failed, true)
+                .unwrap()
+                .detail,
+            "Profile on · 1600 DPI"
         );
     }
 
