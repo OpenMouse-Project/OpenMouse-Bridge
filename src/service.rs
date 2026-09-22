@@ -635,7 +635,15 @@ impl BridgeService {
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .clone();
                     std::thread::spawn(move || {
-                        let outcome = current.as_ref().map(apply_natively);
+                        // A connected control panel applies the profile over its
+                        // own HID session; writing natively as well would
+                        // interleave two writers on the same mouse.
+                        let panel_connected = crate::hid::client_session_active();
+                        let outcome = if panel_connected {
+                            None
+                        } else {
+                            current.as_ref().map(apply_natively)
+                        };
                         if !announce {
                             return;
                         }
@@ -644,7 +652,7 @@ impl BridgeService {
                             current.as_ref(),
                             default.as_ref(),
                             outcome,
-                            crate::hid::client_session_active(),
+                            panel_connected,
                         ) else {
                             return;
                         };
