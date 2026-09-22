@@ -85,6 +85,7 @@ mod tests {
             settings: ProfileSettings {
                 dpi: Some(800),
                 polling_rate_hz: Some(1000),
+                snapshot: None,
             },
         }
     }

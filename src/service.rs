@@ -584,6 +584,7 @@ mod tests {
             settings: config::ProfileSettings {
                 dpi,
                 polling_rate_hz: hz,
+                snapshot: None,
             },
         }
     }

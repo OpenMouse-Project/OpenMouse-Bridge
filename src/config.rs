@@ -67,6 +67,12 @@ pub struct ProfileDevice {
 pub struct ProfileSettings {
     pub dpi: Option<u32>,
     pub polling_rate_hz: Option<u32>,
+    /// Every other device setting the profile carries, as the control
+    /// panel's `Partial<MouseStatus>` field map. Bridge never interprets it:
+    /// it only stores it and hands it back in `/v1/status`'s activeProfile so
+    /// an open OpenMouse tab can apply it over WebHID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<serde_json::Value>,
 }
 
 impl Default for BridgeConfig {
@@ -268,5 +274,23 @@ mod tests {
                 .iter()
                 .any(|origin| origin == "https://control.openmouse.app")
         );
+    }
+
+    #[test]
+    fn profile_settings_keep_the_snapshot_and_accept_profiles_without_one() {
+        let json =
+            r#"{"dpi":800,"pollingRateHz":null,"snapshot":{"lightforceSwitchMode":"Optical"}}"#;
+        let settings: ProfileSettings =
+            serde_json::from_str(json).expect("snapshot profile parses");
+        assert_eq!(
+            settings.snapshot,
+            Some(serde_json::json!({ "lightforceSwitchMode": "Optical" }))
+        );
+        assert_eq!(serde_json::to_string(&settings).unwrap(), json);
+
+        let legacy: ProfileSettings = serde_json::from_str(r#"{"dpi":800,"pollingRateHz":1000}"#)
+            .expect("legacy profile parses");
+        assert_eq!(legacy.snapshot, None);
+        assert!(!serde_json::to_string(&legacy).unwrap().contains("snapshot"));
     }
 }
