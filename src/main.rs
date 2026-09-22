@@ -56,6 +56,7 @@ async fn run() -> Result<()> {
     // Headless mode has no status window, but the web app still fetches
     // application icons over the API, so always keep them extracted.
     service.start_game_monitor(Arc::new(AtomicBool::new(true)));
+    service.start_battery_monitor();
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), BRIDGE_PORT);
     let listener = TcpListener::bind(address)
         .await

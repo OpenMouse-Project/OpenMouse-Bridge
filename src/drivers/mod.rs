@@ -19,6 +19,8 @@ use crate::config::ApplicationProfile;
 mod native_hid;
 pub mod pulsar;
 
+pub use native_hid::NativeBattery;
+
 /// Pushes a profile's DPI/polling rate to the mouse over native HID, if
 /// Bridge has a driver for that device.
 ///
@@ -48,6 +50,20 @@ pub fn apply_profile(profile: &ApplicationProfile) -> Result<bool> {
         }
         _ => native_hid::apply(profile),
     }
+}
+
+/// Reads the battery of the mouse `device_id` names (`"<brand>:<name>"`) over
+/// native HID. `Ok(None)` means Bridge has no battery reader for the brand or
+/// the mouse reports no battery; `Err` means a driver exists but the mouse
+/// did not answer (e.g. asleep or disconnected).
+///
+/// The Rust Pulsar driver only writes settings, so Pulsar has no reader yet.
+pub fn read_battery(device_id: &str) -> Result<Option<NativeBattery>> {
+    let brand = device_id.split(':').next().unwrap_or_default();
+    if brand.eq_ignore_ascii_case(pulsar::BRAND) {
+        return Ok(None);
+    }
+    native_hid::read_battery(brand)
 }
 
 #[cfg(test)]

@@ -35,7 +35,7 @@ use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWN
 
 const OPENMOUSE_URL: &str = "https://control.openmouse.app";
 const WINDOW_WIDTH: f32 = 320.0;
-const WINDOW_HEIGHT: f32 = 340.0;
+const WINDOW_HEIGHT: f32 = 306.0;
 const BACKGROUND: Color32 = Color32::from_rgb(16, 17, 19);
 const SURFACE: Color32 = Color32::from_rgb(26, 28, 31);
 const SURFACE_HOVER: Color32 = Color32::from_rgb(36, 39, 43);
@@ -447,31 +447,51 @@ impl TrayApp {
                     .strong(),
             );
         });
-        ui.label(
-            RichText::new(if connected {
-                "The control panel is using Bridge"
+        let device_name = snapshot.and_then(|snapshot| {
+            snapshot
+                .batteries
+                .first()
+                .map(|battery| battery.device_name.clone())
+                .or_else(|| {
+                    snapshot
+                        .active_profile
+                        .as_ref()
+                        .map(|profile| profile.device.name.clone())
+                })
+        });
+        let subtitle = device_name.unwrap_or_else(|| {
+            if connected {
+                "The control panel is using Bridge".into()
             } else {
-                "Open the control panel to connect"
-            })
-            .size(12.0)
-            .color(MUTED),
-        );
+                "Open the control panel to connect".into()
+            }
+        });
+        ui.add(egui::Label::new(RichText::new(subtitle).size(12.0).color(MUTED)).truncate());
 
         ui.add_space(18.0);
-        let game = snapshot
-            .and_then(|snapshot| snapshot.active_games.first().cloned())
-            .unwrap_or_else(|| "None".into());
+        // A running game names the profile; otherwise an application profile
+        // does. The default profile carries the device name as its
+        // "application", so it is recognized by having no executable or path.
         let profile = snapshot
-            .and_then(|snapshot| snapshot.active_profile.as_ref())
-            .map(|profile| profile.application.name.clone())
+            .and_then(|snapshot| {
+                snapshot.active_games.first().cloned().or_else(|| {
+                    snapshot
+                        .active_profile
+                        .as_ref()
+                        .filter(|profile| {
+                            !profile.application.executable.is_empty()
+                                || !profile.application.path.is_empty()
+                        })
+                        .map(|profile| profile.application.name.clone())
+                })
+            })
             .unwrap_or_else(|| "Default".into());
-        divider(ui);
-        value_row(ui, "Game", &game, MUTED);
         divider(ui);
         value_row(ui, "Profile", &profile, MUTED);
         divider(ui);
         match snapshot.map(|snapshot| snapshot.batteries.as_slice()) {
             Some(batteries) if !batteries.is_empty() => {
+                let single = batteries.len() == 1;
                 for battery in batteries.iter().take(MAX_BATTERY_ROWS) {
                     let value = if battery.charging {
                         format!("{}% · Charging", battery.percent)
@@ -485,12 +505,17 @@ impl TrayApp {
                     } else {
                         TEXT
                     };
-                    value_row(ui, &battery.device_name, &value, color);
+                    let label = if single {
+                        "Battery"
+                    } else {
+                        battery.device_name.as_str()
+                    };
+                    value_row(ui, label, &value, color);
                     divider(ui);
                 }
             }
             _ => {
-                value_row(ui, "Battery", "No device", MUTED);
+                value_row(ui, "Battery", "Unknown", MUTED);
                 divider(ui);
             }
         }
@@ -820,6 +845,7 @@ fn run_server(
         let origins = bridge_config.allowed_origins.clone();
         let service = BridgeService::new(bridge_config, path.clone());
         service.start_game_monitor(Arc::new(AtomicBool::new(true)));
+        service.start_battery_monitor();
 
         let snapshot_service = service.clone();
         let snapshot_publisher = tokio::spawn(async move {

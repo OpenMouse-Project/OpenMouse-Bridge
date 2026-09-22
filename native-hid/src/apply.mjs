@@ -3,12 +3,16 @@
 // rate to a mouse over native HID, reusing OpenMouse's own hardware-verified
 // WebHID driver classes instead of a bespoke reimplementation.
 //
-// Usage: node apply.mjs < profile.json
+// Usage: node apply.mjs < request.json
 //   stdin: {"brand": "Razer", "dpi": 800, "pollingRateHz": 1000}
 //   (dpi / pollingRateHz are each optional — omit to leave that setting alone)
+//   stdin: {"brand": "Razer", "action": "status"}
+//   reads the mouse's status instead and prints its battery fields as JSON on
+//   stdout: {"batteryPercent": 41, "batteryState": "Discharging"}
 //
-// Exit codes (Bridge's src/drivers/mod.rs depends on this contract):
-//   0  — a device was found and the requested settings were applied.
+// Exit codes (Bridge's src/drivers/native_hid.rs depends on this contract):
+//   0  — a device was found and the requested settings were applied (or, in
+//        status mode, its status was read and printed).
 //   3  — no native driver is registered for this brand (not an error: most
 //        devices are still driven by the OpenMouse web app over WebHID).
 //   1  — a driver is registered for this brand, but no matching device
@@ -52,8 +56,9 @@ function withTimeout(promise, ms, label) {
 }
 
 /** Tries one candidate class against one open device. Resolves with the
- * live, probed client on success; rejects (and closes the device) on any
- * failure, so the caller can move on to the next candidate. */
+ * live, probed client and the status it read on success; rejects (and closes
+ * the device) on any failure, so the caller can move on to the next
+ * candidate. */
 async function probe(device, candidate) {
   const module = await import(candidate.module);
   const Client = module[candidate.exportName];
@@ -63,8 +68,8 @@ async function probe(device, candidate) {
     // Every SupportedClient implements readStatus() (mouse-protocol's
     // shared client contract) — a cheap, read-only way to confirm this is
     // really the right class for this interface before writing anything.
-    await withTimeout(client.readStatus(), PROBE_TIMEOUT_MS, `${candidate.exportName}.readStatus()`);
-    return client;
+    const status = await withTimeout(client.readStatus(), PROBE_TIMEOUT_MS, `${candidate.exportName}.readStatus()`);
+    return { client, status };
   } catch (error) {
     await device.close().catch(() => undefined);
     throw error;
@@ -82,11 +87,12 @@ async function main() {
 
   const attempts = [];
   let client = null;
+  let status = null;
   outer: for (const vendorId of entry.vendorIds) {
     for (const device of candidateDevices(vendorId)) {
       for (const candidate of entry.classes) {
         try {
-          client = await probe(device, candidate);
+          ({ client, status } = await probe(device, candidate));
           break outer;
         } catch (error) {
           attempts.push(`${candidate.exportName} on ${device.productName || "unknown device"}: ${error.message}`);
@@ -100,6 +106,17 @@ async function main() {
       `[native-hid] no ${brand} device answered.` + (attempts.length ? ` Tried:\n  ${attempts.join("\n  ")}` : " No matching HID interface was found."),
     );
     process.exit(EXIT_FAILED);
+  }
+
+  if (input.action === "status") {
+    process.stdout.write(
+      JSON.stringify({
+        batteryPercent: status?.batteryPercent ?? null,
+        batteryState: status?.batteryState ?? null,
+      }),
+    );
+    await client.close().catch(() => undefined);
+    process.exit(EXIT_APPLIED);
   }
 
   try {

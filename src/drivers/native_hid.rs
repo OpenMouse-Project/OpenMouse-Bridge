@@ -14,7 +14,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
@@ -25,7 +25,7 @@ use crate::config::ApplicationProfile;
 /// interfaces at most).
 const HELPER_TIMEOUT: Duration = Duration::from_secs(10);
 
-const EXIT_APPLIED: i32 = 0;
+const EXIT_OK: i32 = 0;
 const EXIT_NO_DRIVER: i32 = 3;
 
 #[derive(Serialize)]
@@ -37,21 +37,77 @@ struct ApplyRequest<'a> {
     polling_rate_hz: Option<u32>,
 }
 
+#[derive(Serialize)]
+struct StatusRequest<'a> {
+    brand: &'a str,
+    action: &'static str,
+}
+
+/// The battery fields of `mouse-protocol`'s `MouseStatus`, as `apply.mjs`
+/// prints them in status mode.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StatusReply {
+    battery_percent: Option<f64>,
+    battery_state: Option<String>,
+}
+
+/// A battery level read from the mouse over native HID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeBattery {
+    pub percent: u8,
+    pub charging: bool,
+}
+
 /// Pushes a profile's DPI/polling rate to the mouse via the Node helper.
 /// Returns `Ok(true)` on a confirmed apply, `Ok(false)` when the helper has
 /// no driver for this brand (most devices are still driven by the OpenMouse
 /// web app over WebHID instead), and `Err` when a driver exists but the
 /// apply itself failed (including the helper or Node.js being unavailable).
 pub fn apply(profile: &ApplicationProfile) -> Result<bool> {
-    let script = locate_apply_script()?;
     let brand = profile.device.id.split(':').next().unwrap_or_default();
     let request = ApplyRequest {
         brand,
         dpi: profile.settings.dpi,
         polling_rate_hz: profile.settings.polling_rate_hz,
     };
-    let payload =
-        serde_json::to_vec(&request).context("could not encode the native-hid request")?;
+    Ok(run_helper(&request)?.is_some())
+}
+
+/// Reads the battery of a `brand` mouse via the Node helper. `Ok(None)` means
+/// the helper has no driver for the brand or the mouse reports no battery
+/// (a wired mouse); `Err` means a driver exists but no mouse answered.
+pub fn read_battery(brand: &str) -> Result<Option<NativeBattery>> {
+    let request = StatusRequest {
+        brand,
+        action: "status",
+    };
+    let Some(stdout) = run_helper(&request)? else {
+        return Ok(None);
+    };
+    let reply: StatusReply = serde_json::from_slice(&stdout)
+        .context("the native-hid helper returned an unreadable status")?;
+    Ok(parse_battery(reply))
+}
+
+fn parse_battery(reply: StatusReply) -> Option<NativeBattery> {
+    let percent = reply.battery_percent?;
+    if !percent.is_finite() {
+        return None;
+    }
+    Some(NativeBattery {
+        percent: percent.round().clamp(0.0, 100.0) as u8,
+        charging: reply
+            .battery_state
+            .is_some_and(|state| state.starts_with("Charging")),
+    })
+}
+
+/// Runs `apply.mjs` with `request` on stdin. Returns its stdout on success,
+/// `None` when it has no driver for the brand, and `Err` otherwise.
+fn run_helper(request: &impl Serialize) -> Result<Option<Vec<u8>>> {
+    let script = locate_apply_script()?;
+    let payload = serde_json::to_vec(request).context("could not encode the native-hid request")?;
 
     let node = locate_node_binary();
     let mut command = Command::new(node.as_deref().unwrap_or_else(|| Path::new("node")));
@@ -80,12 +136,12 @@ pub fn apply(profile: &ApplicationProfile) -> Result<bool> {
         .take()
         .context("the native-hid helper's stdin was unavailable")?
         .write_all(&payload)
-        .context("could not send the profile to the native-hid helper")?;
+        .context("could not send the request to the native-hid helper")?;
 
     let output = wait_with_timeout(child, HELPER_TIMEOUT)?;
     match output.status.code() {
-        Some(EXIT_APPLIED) => Ok(true),
-        Some(EXIT_NO_DRIVER) => Ok(false),
+        Some(EXIT_OK) => Ok(Some(output.stdout)),
+        Some(EXIT_NO_DRIVER) => Ok(None),
         Some(code) => bail!(
             "native-hid helper exited with status {code}: {}",
             String::from_utf8_lossy(&output.stderr).trim()
@@ -171,5 +227,40 @@ fn wait_with_timeout(mut child: Child, timeout: Duration) -> Result<Output> {
             );
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reply(percent: Option<f64>, state: Option<&str>) -> StatusReply {
+        StatusReply {
+            battery_percent: percent,
+            battery_state: state.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn parses_battery_from_status() {
+        assert_eq!(
+            parse_battery(reply(Some(41.0), Some("Discharging"))),
+            Some(NativeBattery {
+                percent: 41,
+                charging: false
+            })
+        );
+        assert_eq!(
+            parse_battery(reply(Some(87.6), Some("Charging slowly"))),
+            Some(NativeBattery {
+                percent: 88,
+                charging: true
+            })
+        );
+        assert_eq!(parse_battery(reply(None, Some("Unknown"))), None);
+        assert_eq!(
+            parse_battery(reply(Some(140.0), None)).map(|battery| battery.percent),
+            Some(100)
+        );
     }
 }

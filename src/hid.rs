@@ -3,7 +3,7 @@ use std::{
     ffi::CString,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
     time::Instant,
@@ -25,6 +25,7 @@ const LOGITECH_VENDOR_ID: u16 = 0x046D;
 const RAZER_VENDOR_ID: u16 = 0x1532;
 const RAZER_FEATURE_BUFFER_LEN: usize = 91;
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+static ACTIVE_SESSIONS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Deserialize)]
 struct ClientMessage {
@@ -1000,8 +1001,31 @@ fn build_collection(index: usize, nodes: &[CollectionNode]) -> CollectionInfo {
     info
 }
 
+/// Whether the control panel currently has a HID websocket open. Bridge treats
+/// that as a connected client, and background device reads stay off the
+/// hardware meanwhile so they never interleave with the panel's traffic.
+pub fn client_session_active() -> bool {
+    ACTIVE_SESSIONS.load(Ordering::Acquire) > 0
+}
+
+struct ActiveSessionGuard;
+
+impl ActiveSessionGuard {
+    fn new() -> Self {
+        ACTIVE_SESSIONS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for ActiveSessionGuard {
+    fn drop(&mut self) {
+        ACTIVE_SESSIONS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 pub async fn serve(mut socket: WebSocket) {
     let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+    let _active = ActiveSessionGuard::new();
     tracing::info!(session_id, "HID websocket connected");
     let (input_tx, mut input_rx) = mpsc::unbounded_channel();
     let session = match HidSession::new(session_id, input_tx) {

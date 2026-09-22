@@ -10,7 +10,9 @@ The initial service provides:
 - process-based detection for configured game executables;
 - discovery of visible Windows and macOS applications and the foreground application;
 - persistent application profiles tied to a specific mouse;
-- low-battery notifications with a configurable threshold and cooldown;
+- low-battery notifications with a configurable threshold and cooldown, from
+  battery levels Bridge reads itself every five minutes for the mice in saved
+  profiles, so alerts work without the control panel open;
 - startup-at-login registration under the current user;
 - native HID access for devices and collections that browsers cannot expose;
 - manual or automatic updates from verified stable GitHub releases;

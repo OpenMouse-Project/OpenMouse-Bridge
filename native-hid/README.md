@@ -1,8 +1,8 @@
 # native-hid
 
 A small Node.js helper Bridge spawns as a subprocess so it can push a saved
-profile's DPI/polling rate to a mouse over native HID, without a browser tab
-open holding a WebHID connection.
+profile's DPI/polling rate to a mouse over native HID, and read the mouse's
+battery, without a browser tab open holding a WebHID connection.
 
 ## Why Node, in a Rust project
 
@@ -41,7 +41,10 @@ it.
 
 ## Exit code contract (Bridge depends on this — see `src/drivers/native_hid.rs`)
 
-- `0` — a device was found and the requested settings were applied.
+- `0` — a device was found and the requested settings were applied. In
+  status mode (`{"brand": "…", "action": "status"}` on stdin) the device's
+  status was read instead, and its battery is printed on stdout as
+  `{"batteryPercent": 41, "batteryState": "Discharging"}`.
 - `3` — no driver is registered for this brand. Not an error.
 - `1` — a driver exists for this brand, but no device answered, or applying
   failed. Details on stderr.

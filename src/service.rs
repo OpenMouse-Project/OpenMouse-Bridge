@@ -45,6 +45,24 @@ fn is_registered_game(application: &ApplicationInfo, games: &[GameConfig]) -> bo
 /// fires, so rapid alt-tabbing does not spam notifications.
 const PROFILE_DEBOUNCE: Duration = Duration::from_millis(2500);
 
+/// How often Bridge reads mouse batteries itself, so low-battery alerts work
+/// without the control panel open. Each read spawns the native-hid helper.
+const BATTERY_POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// A reading older than this is shown as stale: more than two missed polls.
+const BATTERY_STALE_AFTER: Duration = Duration::from_secs(12 * 60);
+
+/// The distinct devices named by the saved profiles, as `(id, name)`.
+fn profile_devices(config: &BridgeConfig) -> Vec<(String, String)> {
+    let mut devices: Vec<(String, String)> = Vec::new();
+    for profile in config.default_profile.iter().chain(&config.profiles) {
+        if !devices.iter().any(|(id, _)| id == &profile.device.id) {
+            devices.push((profile.device.id.clone(), profile.device.name.clone()));
+        }
+    }
+    devices
+}
+
 /// The profile that applies to the current foreground application, falling back
 /// to the configured default profile. Shared by the snapshot and the monitor.
 fn active_profile_for(
@@ -198,9 +216,10 @@ impl BridgeService {
 
     pub async fn snapshot(&self) -> BridgeSnapshot {
         let state = self.inner.read().await;
-        let client_connected = state
-            .last_client_heartbeat
-            .is_some_and(|heartbeat| heartbeat.elapsed() < Duration::from_secs(20));
+        let client_connected = crate::hid::client_session_active()
+            || state
+                .last_client_heartbeat
+                .is_some_and(|heartbeat| heartbeat.elapsed() < Duration::from_secs(20));
         let foreground_application = state
             .applications
             .iter()
@@ -215,7 +234,7 @@ impl BridgeService {
                 device_name: entry.device_name.clone(),
                 percent: entry.percent,
                 charging: entry.charging,
-                stale: entry.updated_at.elapsed() >= Duration::from_secs(120),
+                stale: entry.updated_at.elapsed() >= BATTERY_STALE_AFTER,
             })
             .collect::<Vec<_>>();
         batteries.sort_by(|a, b| a.device_id.cmp(&b.device_id));
@@ -362,6 +381,53 @@ impl BridgeService {
             });
         }
         Ok(alert)
+    }
+
+    /// Reads the battery of every mouse in the saved profiles on an interval
+    /// and records it like a reading from the control panel, which raises the
+    /// low-battery notification. Polling pauses while the control panel holds
+    /// a HID session, so Bridge never talks to a mouse mid-session.
+    pub fn start_battery_monitor(&self) {
+        let service = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(BATTERY_POLL_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                if crate::hid::client_session_active() {
+                    continue;
+                }
+                let devices = profile_devices(&service.inner.read().await.config);
+                for (device_id, device_name) in devices {
+                    let id = device_id.clone();
+                    let outcome =
+                        tokio::task::spawn_blocking(move || crate::drivers::read_battery(&id))
+                            .await;
+                    match outcome {
+                        Ok(Ok(Some(battery))) => {
+                            let reading = BatteryReading {
+                                device_id,
+                                device_name,
+                                percent: battery.percent,
+                                charging: battery.charging,
+                            };
+                            if let Err(error) = service.record_battery(reading).await {
+                                tracing::warn!(%error, "Could not record the mouse battery");
+                            }
+                        }
+                        Ok(Ok(None)) => {
+                            tracing::debug!(%device_id, "No native battery reader for this device");
+                        }
+                        Ok(Err(error)) => {
+                            tracing::debug!(%error, %device_id, "Could not read the mouse battery");
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "The battery reader stopped unexpectedly");
+                        }
+                    }
+                }
+            }
+        });
     }
 
     pub fn start_game_monitor(&self, extract_icons: Arc<AtomicBool>) {
@@ -530,6 +596,32 @@ mod tests {
             foreground,
             icon_id: String::new(),
         }
+    }
+
+    #[test]
+    fn profile_devices_are_distinct_and_include_the_default() {
+        let mut config = BridgeConfig::default();
+        let mut default = test_profile("Default", "", None, None);
+        default.device.id = "Logitech:PRO X SUPERLIGHT 2c".into();
+        default.device.name = "PRO X SUPERLIGHT 2c".into();
+        let mut game = test_profile("Valorant", "/games/valorant", Some(800), None);
+        game.device = default.device.clone();
+        let mut other = test_profile("CS2", "/games/cs2", Some(400), None);
+        other.device.id = "Razer:Viper V3 Pro".into();
+        other.device.name = "Viper V3 Pro".into();
+        config.default_profile = Some(default);
+        config.profiles = vec![game, other];
+
+        assert_eq!(
+            profile_devices(&config),
+            vec![
+                (
+                    "Logitech:PRO X SUPERLIGHT 2c".to_owned(),
+                    "PRO X SUPERLIGHT 2c".to_owned()
+                ),
+                ("Razer:Viper V3 Pro".to_owned(), "Viper V3 Pro".to_owned()),
+            ]
+        );
     }
 
     #[test]
