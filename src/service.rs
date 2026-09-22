@@ -78,19 +78,14 @@ fn active_profile_for(
                 .iter()
                 .filter(|profile| profile.enabled)
                 .find(|profile| {
-                    (!profile.application.path.is_empty()
-                        && profile
-                            .application
-                            .path
-                            .eq_ignore_ascii_case(&application.path))
-                        || profile
-                            .application
-                            .name
-                            .eq_ignore_ascii_case(&application.name)
-                        || profile
-                            .application
-                            .executable
-                            .eq_ignore_ascii_case(&application.executable)
+                    // Game profiles leave some of these empty; an empty field
+                    // must not match an application that also reports none.
+                    let matches = |saved: &str, running: &str| {
+                        !saved.is_empty() && saved.eq_ignore_ascii_case(running)
+                    };
+                    matches(&profile.application.path, &application.path)
+                        || matches(&profile.application.name, &application.name)
+                        || matches(&profile.application.executable, &application.executable)
                 })
                 .cloned()
         })
@@ -626,6 +621,18 @@ mod tests {
                 ("Razer:Viper V3 Pro".to_owned(), "Viper V3 Pro".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn empty_profile_fields_never_match_empty_application_fields() {
+        let mut config = BridgeConfig::default();
+        let mut apex = test_profile("Apex Legends", "", Some(800), None);
+        apex.application.executable = String::new();
+        config.profiles = vec![apex];
+
+        let mut unnamed = test_app("Other", "", true);
+        unnamed.executable = String::new();
+        assert_eq!(active_profile_for(&config, &[unnamed]), None);
     }
 
     #[test]
