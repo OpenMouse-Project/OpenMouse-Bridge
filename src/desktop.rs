@@ -34,31 +34,118 @@ use tray_icon::{
 use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
 
 const OPENMOUSE_URL: &str = "https://control.openmouse.app";
-const WINDOW_WIDTH: f32 = 360.0;
-const WINDOW_HEIGHT: f32 = 410.0;
-const BACKGROUND: Color32 = Color32::from_rgb(12, 14, 16);
-const SURFACE: Color32 = Color32::from_rgb(24, 27, 30);
-const SURFACE_HOVER: Color32 = Color32::from_rgb(31, 35, 39);
-const TEXT: Color32 = Color32::from_rgb(239, 243, 241);
-const MUTED: Color32 = Color32::from_rgb(151, 160, 158);
+const WINDOW_WIDTH: f32 = 320.0;
+const WINDOW_HEIGHT: f32 = 340.0;
+const BACKGROUND: Color32 = Color32::from_rgb(16, 17, 19);
+const SURFACE: Color32 = Color32::from_rgb(26, 28, 31);
+const SURFACE_HOVER: Color32 = Color32::from_rgb(36, 39, 43);
+const DIVIDER: Color32 = Color32::from_rgb(34, 36, 40);
+const TEXT: Color32 = Color32::from_rgb(236, 238, 240);
+const MUTED: Color32 = Color32::from_rgb(132, 138, 145);
 const ACCENT: Color32 = Color32::from_rgb(93, 222, 137);
 const DANGER: Color32 = Color32::from_rgb(248, 113, 113);
-const BORDER: Color32 = Color32::from_rgb(49, 54, 58);
+const ROW_HEIGHT: f32 = 34.0;
+const MAX_BATTERY_ROWS: usize = 3;
 const BATTERY_THRESHOLDS: [u8; 7] = [10, 15, 20, 25, 30, 40, 50];
 
 fn toggle_control(ui: &mut egui::Ui, enabled: bool) -> bool {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(30.0, 18.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(28.0, 16.0), Sense::click());
     let track = if enabled { ACCENT } else { SURFACE_HOVER };
     let knob = if enabled { BACKGROUND } else { MUTED };
-    ui.painter().rect_filled(rect, 9.0, track);
+    ui.painter().rect_filled(rect, 8.0, track);
     let knob_x = if enabled {
-        rect.right() - 9.0
+        rect.right() - 8.0
     } else {
-        rect.left() + 9.0
+        rect.left() + 8.0
     };
     ui.painter()
-        .circle_filled(Pos2::new(knob_x, rect.center().y), 6.0, knob);
+        .circle_filled(Pos2::new(knob_x, rect.center().y), 5.0, knob);
     response.clicked()
+}
+
+#[derive(Clone, Copy)]
+enum Glyph {
+    Gear,
+    Back,
+}
+
+fn icon_button(ui: &mut egui::Ui, glyph: Glyph) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
+    let painter = ui.painter();
+    if response.hovered() {
+        painter.rect_filled(rect, 6.0, SURFACE_HOVER);
+    }
+    let color = if response.hovered() { TEXT } else { MUTED };
+    let center = rect.center();
+    match glyph {
+        Glyph::Gear => {
+            painter.circle_stroke(center, 3.5, Stroke::new(1.5, color));
+            for tooth in 0..8 {
+                let angle = tooth as f32 * std::f32::consts::FRAC_PI_4;
+                let direction = Vec2::angled(angle);
+                painter.line_segment(
+                    [center + direction * 5.5, center + direction * 7.5],
+                    Stroke::new(2.0, color),
+                );
+            }
+        }
+        Glyph::Back => {
+            painter.line(
+                vec![
+                    center + Vec2::new(2.5, -5.0),
+                    center + Vec2::new(-2.5, 0.0),
+                    center + Vec2::new(2.5, 5.0),
+                ],
+                Stroke::new(1.5, color),
+            );
+        }
+    }
+    response
+}
+
+fn divider(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+    ui.painter()
+        .hline(rect.x_range(), rect.center().y, Stroke::new(1.0, DIVIDER));
+}
+
+fn section_label(ui: &mut egui::Ui, label: &str) {
+    ui.add_space(14.0);
+    ui.label(
+        RichText::new(label.to_uppercase())
+            .size(10.0)
+            .strong()
+            .color(MUTED),
+    );
+    ui.add_space(2.0);
+}
+
+fn row(ui: &mut egui::Ui, label: &str, trailing: impl FnOnce(&mut egui::Ui)) {
+    ui.allocate_ui_with_layout(
+        Vec2::new(ui.available_width(), ROW_HEIGHT),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.label(RichText::new(label).size(12.0).color(TEXT));
+            ui.with_layout(Layout::right_to_left(Align::Center), trailing);
+        },
+    );
+}
+
+fn value_row(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
+    row(ui, label, |ui| {
+        ui.add(egui::Label::new(RichText::new(value).size(12.0).color(color)).truncate());
+    });
+}
+
+fn link_button(ui: &mut egui::Ui, label: &str, color: Color32) -> bool {
+    ui.add(Button::new(RichText::new(label).size(12.0).strong().color(color)).frame(false))
+        .clicked()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum View {
+    Home,
+    Settings,
 }
 
 enum BridgeCommand {
@@ -148,6 +235,7 @@ struct TrayApp {
     commands: tokio_mpsc::UnboundedSender<BridgeCommand>,
     updates: Receiver<UpdateEvent>,
     snapshot: Option<BridgeSnapshot>,
+    view: View,
     visible: bool,
     visibility_initialized: bool,
     panel_had_focus: bool,
@@ -172,9 +260,27 @@ impl TrayApp {
         visuals.panel_fill = BACKGROUND;
         visuals.window_fill = BACKGROUND;
         visuals.override_text_color = Some(TEXT);
-        visuals.widgets.inactive.bg_fill = SURFACE;
-        visuals.widgets.hovered.bg_fill = SURFACE_HOVER;
-        visuals.widgets.active.bg_fill = SURFACE_HOVER;
+        visuals.window_stroke = Stroke::NONE;
+        visuals.window_shadow = egui::Shadow::NONE;
+        visuals.popup_shadow = egui::Shadow::NONE;
+        visuals.window_corner_radius = 8.into();
+        visuals.menu_corner_radius = 8.into();
+        visuals.selection.bg_fill = SURFACE_HOVER;
+        visuals.selection.stroke = Stroke::new(1.0, TEXT);
+        for (widget, fill) in [
+            (&mut visuals.widgets.noninteractive, BACKGROUND),
+            (&mut visuals.widgets.inactive, SURFACE),
+            (&mut visuals.widgets.hovered, SURFACE_HOVER),
+            (&mut visuals.widgets.active, SURFACE_HOVER),
+            (&mut visuals.widgets.open, SURFACE_HOVER),
+        ] {
+            widget.bg_fill = fill;
+            widget.weak_bg_fill = fill;
+            widget.bg_stroke = Stroke::NONE;
+            widget.corner_radius = 6.into();
+            widget.expansion = 0.0;
+        }
+        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, DIVIDER);
         context.set_visuals(visuals);
         let (logo_pixels, logo_width, logo_height) = openmouse_icon_rgba()?;
         let logo = context.load_texture(
@@ -192,6 +298,7 @@ impl TrayApp {
             commands,
             updates,
             snapshot: None,
+            view: View::Home,
             visible,
             visibility_initialized: false,
             panel_had_focus: false,
@@ -209,6 +316,7 @@ impl TrayApp {
         self.panel_had_focus = false;
         context.send_viewport_cmd(ViewportCommand::Visible(visible));
         if visible {
+            self.view = View::Home;
             context.send_viewport_cmd(ViewportCommand::Focus);
         }
     }
@@ -294,286 +402,301 @@ impl eframe::App for TrayApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         Frame::NONE
             .fill(BACKGROUND)
-            .inner_margin(16.0)
-            .show(ui, |ui| {
-                let header = ui.horizontal(|ui| {
-                    let (logo_rect, _) =
-                        ui.allocate_exact_size(Vec2::new(28.0, 32.0), Sense::hover());
-                    ui.put(
-                        egui::Rect::from_center_size(logo_rect.center(), Vec2::new(18.0, 26.5)),
-                        egui::Image::new((self.logo.id(), Vec2::new(18.0, 26.5))),
-                    );
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new("OpenMouse Bridge")
-                                .size(14.0)
-                                .strong()
-                                .color(TEXT),
-                        );
-                        ui.label(
-                            RichText::new(format!("Version {}", openmouse_bridge::BRIDGE_VERSION))
-                                .size(10.0)
-                                .color(MUTED),
-                        );
-                    });
-                });
-                if header.response.drag_started() {
-                    ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
-                }
+            .inner_margin(egui::Margin::symmetric(18, 16))
+            .show(ui, |ui| match self.view {
+                View::Home => self.home_view(ui),
+                View::Settings => self.settings_view(ui),
+            });
+    }
+}
 
-                ui.add_space(12.0);
-                let connected = self
-                    .snapshot
-                    .as_ref()
-                    .is_some_and(|snapshot| snapshot.client_connected);
-                ui.horizontal(|ui| {
-                    let (dot_rect, _) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
-                    ui.painter().circle_filled(dot_rect.center(), 3.0, ACCENT);
-                    ui.label(RichText::new("Running").size(12.0).strong().color(TEXT));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(if connected { "Connected" } else { "No client" })
-                                .size(10.0)
-                                .color(if connected { ACCENT } else { MUTED }),
-                        );
+impl TrayApp {
+    fn home_view(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.set_height(24.0);
+            let (logo_rect, _) = ui.allocate_exact_size(Vec2::new(14.0, 20.0), Sense::hover());
+            ui.put(
+                logo_rect,
+                egui::Image::new((self.logo.id(), Vec2::new(13.0, 19.0))),
+            );
+            ui.add_space(2.0);
+            ui.label(RichText::new("OpenMouse Bridge").size(13.0).strong());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if icon_button(ui, Glyph::Gear)
+                    .on_hover_text("Settings")
+                    .clicked()
+                {
+                    self.view = View::Settings;
+                }
+            });
+        });
+
+        let snapshot = self.snapshot.as_ref();
+        let connected = snapshot.is_some_and(|snapshot| snapshot.client_connected);
+        ui.add_space(22.0);
+        ui.horizontal(|ui| {
+            let (dot_rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+            ui.painter().circle_filled(
+                dot_rect.center(),
+                4.0,
+                if connected { ACCENT } else { MUTED },
+            );
+            ui.label(
+                RichText::new(if connected { "Connected" } else { "Ready" })
+                    .size(20.0)
+                    .strong(),
+            );
+        });
+        ui.label(
+            RichText::new(if connected {
+                "The control panel is using Bridge"
+            } else {
+                "Open the control panel to connect"
+            })
+            .size(12.0)
+            .color(MUTED),
+        );
+
+        ui.add_space(18.0);
+        let game = snapshot
+            .and_then(|snapshot| snapshot.active_games.first().cloned())
+            .unwrap_or_else(|| "None".into());
+        let profile = snapshot
+            .and_then(|snapshot| snapshot.active_profile.as_ref())
+            .map(|profile| profile.application.name.clone())
+            .unwrap_or_else(|| "Default".into());
+        divider(ui);
+        value_row(ui, "Game", &game, MUTED);
+        divider(ui);
+        value_row(ui, "Profile", &profile, MUTED);
+        divider(ui);
+        match snapshot.map(|snapshot| snapshot.batteries.as_slice()) {
+            Some(batteries) if !batteries.is_empty() => {
+                for battery in batteries.iter().take(MAX_BATTERY_ROWS) {
+                    let value = if battery.charging {
+                        format!("{}% · Charging", battery.percent)
+                    } else {
+                        format!("{}%", battery.percent)
+                    };
+                    let color = if battery.stale {
+                        MUTED
+                    } else if battery.percent <= self.battery_threshold && !battery.charging {
+                        DANGER
+                    } else {
+                        TEXT
+                    };
+                    value_row(ui, &battery.device_name, &value, color);
+                    divider(ui);
+                }
+            }
+            _ => {
+                value_row(ui, "Battery", "No device", MUTED);
+                divider(ui);
+            }
+        }
+
+        let mut install = None;
+        let notice = match &self.update_state {
+            UpdateState::Available(update) => Some(format!("Update {} available", update.version)),
+            UpdateState::Downloading(version) => Some(format!("Downloading {version}…")),
+            UpdateState::Restarting(version) => Some(format!("Restarting into {version}…")),
+            _ => None,
+        };
+        if let Some(notice) = notice {
+            ui.add_space(12.0);
+            Frame::NONE
+                .fill(SURFACE)
+                .corner_radius(8.0)
+                .inner_margin(egui::Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(notice).size(12.0));
+                        if let UpdateState::Available(update) = &self.update_state {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if link_button(ui, "Install", ACCENT) {
+                                    install = Some(update.clone());
+                                }
+                            });
+                        }
                     });
                 });
-                ui.add_space(4.0);
-                let (profiles, games) = self
-                    .snapshot
-                    .as_ref()
-                    .map(|snapshot| (snapshot.profile_count, snapshot.tracked_game_count))
-                    .unwrap_or_default();
+        }
+        if let Some(update) = install {
+            self.send_command(
+                BridgeCommand::InstallUpdate(update),
+                "Bridge update service is unavailable",
+            );
+        }
+
+        ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+            if ui
+                .add_sized(
+                    [ui.available_width(), 36.0],
+                    Button::new(
+                        RichText::new("Open control panel")
+                            .size(12.0)
+                            .strong()
+                            .color(BACKGROUND),
+                    )
+                    .fill(ACCENT)
+                    .stroke(Stroke::NONE)
+                    .corner_radius(8.0),
+                )
+                .clicked()
+                && let Err(error) = open_openmouse()
+            {
+                self.last_error = Some(error.to_string());
+            }
+            if let Some(error) = &self.last_error {
+                ui.add_space(6.0);
+                ui.label(RichText::new(error).size(11.0).color(DANGER));
+            }
+        });
+    }
+
+    fn settings_view(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.set_height(24.0);
+            if icon_button(ui, Glyph::Back).on_hover_text("Back").clicked() {
+                self.view = View::Home;
+            }
+            ui.label(RichText::new("Settings").size(13.0).strong());
+        });
+
+        section_label(ui, "General");
+        let mut toggle_autostart = false;
+        row(ui, "Launch at login", |ui| {
+            toggle_autostart = toggle_control(ui, self.autostart);
+        });
+        if toggle_autostart {
+            let enabled = !self.autostart;
+            match platform::set_autostart(enabled) {
+                Ok(()) => {
+                    self.autostart = enabled;
+                    self.last_error = None;
+                }
+                Err(error) => self.last_error = Some(error.to_string()),
+            }
+        }
+        divider(ui);
+        let mut selected_threshold = self.battery_threshold;
+        row(ui, "Low battery alert", |ui| {
+            egui::ComboBox::from_id_salt("battery-threshold")
+                .width(64.0)
+                .selected_text(RichText::new(format!("{}%", self.battery_threshold)).size(12.0))
+                .show_ui(ui, |ui| {
+                    for percent in BATTERY_THRESHOLDS {
+                        ui.selectable_value(
+                            &mut selected_threshold,
+                            percent,
+                            format!("{percent}%"),
+                        );
+                    }
+                });
+        });
+        if selected_threshold != self.battery_threshold
+            && self.send_command(
+                BridgeCommand::SetBatteryThreshold(selected_threshold),
+                "Bridge settings service is unavailable",
+            )
+        {
+            self.battery_threshold = selected_threshold;
+        }
+
+        section_label(ui, "Updates");
+        let mut toggle_automatic_updates = false;
+        row(ui, "Automatic updates", |ui| {
+            toggle_automatic_updates = toggle_control(ui, self.automatic_updates);
+        });
+        if toggle_automatic_updates {
+            let enabled = !self.automatic_updates;
+            if self.send_command(
+                BridgeCommand::SetAutomaticUpdates(enabled),
+                "Bridge settings service is unavailable",
+            ) {
+                self.automatic_updates = enabled;
+            }
+        }
+        divider(ui);
+        let (status, color, action_label) = match &self.update_state {
+            UpdateState::Idle => ("Not checked yet".to_owned(), MUTED, Some("Check")),
+            UpdateState::Checking => ("Checking…".to_owned(), MUTED, None),
+            UpdateState::UpToDate => ("Up to date".to_owned(), MUTED, Some("Check")),
+            UpdateState::Available(update) => (
+                format!("{} available", update.version),
+                ACCENT,
+                Some("Install"),
+            ),
+            UpdateState::Downloading(version) => (format!("Downloading {version}…"), MUTED, None),
+            UpdateState::Restarting(version) => {
+                (format!("Restarting into {version}…"), ACCENT, None)
+            }
+            UpdateState::Failed(_) => ("Check failed".to_owned(), DANGER, Some("Retry")),
+        };
+        let mut update_action = None;
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), ROW_HEIGHT),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                let response = ui.label(RichText::new(status).size(12.0).color(color));
+                if let UpdateState::Failed(error) = &self.update_state {
+                    response.on_hover_text(error);
+                }
+                if let Some(action_label) = action_label {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if link_button(ui, action_label, ACCENT) {
+                            update_action = Some(match &self.update_state {
+                                UpdateState::Available(update) => {
+                                    UpdateUiAction::Install(update.clone())
+                                }
+                                _ => UpdateUiAction::Check,
+                            });
+                        }
+                    });
+                }
+            },
+        );
+        if let Some(action) = update_action {
+            let command = match action {
+                UpdateUiAction::Check => BridgeCommand::CheckForUpdates,
+                UpdateUiAction::Install(update) => BridgeCommand::InstallUpdate(update),
+            };
+            self.send_command(command, "Bridge update service is unavailable");
+        }
+
+        ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+            ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(format!(
-                        "127.0.0.1:{BRIDGE_PORT}  ·  {profiles} profiles  ·  {games} games"
+                        "v{}  ·  {}  ·  127.0.0.1:{BRIDGE_PORT}",
+                        openmouse_bridge::BRIDGE_VERSION,
+                        platform::platform_name()
                     ))
-                    .monospace()
                     .size(10.0)
                     .color(MUTED),
                 );
-
-                ui.add_space(14.0);
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new("Run on startup")
-                                .size(12.0)
-                                .strong()
-                                .color(TEXT),
-                        );
-                        ui.label(
-                            RichText::new("Start Bridge when you sign in")
-                                .size(11.0)
-                                .color(MUTED),
-                        );
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if toggle_control(ui, self.autostart) {
-                            let enabled = !self.autostart;
-                            match platform::set_autostart(enabled) {
-                                Ok(()) => {
-                                    self.autostart = enabled;
-                                    self.last_error = None;
-                                }
-                                Err(error) => self.last_error = Some(error.to_string()),
-                            }
-                        }
-                    });
-                });
-
-                ui.add_space(14.0);
-                let mut selected_threshold = self.battery_threshold;
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new("Battery alert")
-                                .size(12.0)
-                                .strong()
-                                .color(TEXT),
-                        );
-                        ui.label(
-                            RichText::new("Notify when charge falls below")
-                                .size(11.0)
-                                .color(MUTED),
-                        );
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        egui::ComboBox::from_id_salt("battery-threshold")
-                            .width(58.0)
-                            .selected_text(format!("{}%", self.battery_threshold))
-                            .show_ui(ui, |ui| {
-                                for percent in BATTERY_THRESHOLDS {
-                                    ui.selectable_value(
-                                        &mut selected_threshold,
-                                        percent,
-                                        format!("{percent}%"),
-                                    );
-                                }
-                            });
-                    });
-                });
-                if selected_threshold != self.battery_threshold {
-                    if self
-                        .commands
-                        .send(BridgeCommand::SetBatteryThreshold(selected_threshold))
-                        .is_ok()
-                    {
-                        self.battery_threshold = selected_threshold;
-                        self.last_error = None;
-                    } else {
-                        self.last_error = Some("Bridge settings service is unavailable".into());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if link_button(ui, "Quit", DANGER) {
+                        self.exit_requested = true;
+                        ui.ctx().send_viewport_cmd(ViewportCommand::Close);
                     }
-                }
-
-                ui.add_space(14.0);
-                let mut toggle_automatic_updates = false;
-                let mut update_action = None;
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new("Automatic updates")
-                                .size(12.0)
-                                .strong()
-                                .color(TEXT),
-                        );
-                        ui.label(
-                            RichText::new("Install stable releases")
-                                .size(11.0)
-                                .color(MUTED),
-                        );
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if toggle_control(ui, self.automatic_updates) {
-                            toggle_automatic_updates = true;
-                        }
-                    });
-                });
-                ui.add_space(5.0);
-                ui.horizontal(|ui| {
-                    let (status, color, action_label) = match &self.update_state {
-                        UpdateState::Idle => ("Not checked".to_owned(), MUTED, Some("Check now")),
-                        UpdateState::Checking => ("Checking for updates…".to_owned(), MUTED, None),
-                        UpdateState::UpToDate => (
-                            "Bridge is up to date".to_owned(),
-                            ACCENT,
-                            Some("Check again"),
-                        ),
-                        UpdateState::Available(update) => (
-                            format!("Version {} available", update.version),
-                            ACCENT,
-                            Some("Install"),
-                        ),
-                        UpdateState::Downloading(version) => {
-                            (format!("Downloading {version}…"), MUTED, None)
-                        }
-                        UpdateState::Restarting(version) => {
-                            (format!("Restarting into {version}…"), ACCENT, None)
-                        }
-                        UpdateState::Failed(_) => {
-                            ("Update check failed".to_owned(), DANGER, Some("Try again"))
-                        }
-                    };
-                    let response = ui.label(RichText::new(status).size(10.0).color(color));
-                    if let UpdateState::Failed(error) = &self.update_state {
-                        response.on_hover_text(error);
-                    }
-                    if let Some(action_label) = action_label {
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui
-                                .add(
-                                    Button::new(
-                                        RichText::new(action_label)
-                                            .size(10.0)
-                                            .strong()
-                                            .color(ACCENT),
-                                    )
-                                    .frame(false),
-                                )
-                                .clicked()
-                            {
-                                update_action = Some(match &self.update_state {
-                                    UpdateState::Available(update) => {
-                                        UpdateUiAction::Install(update.clone())
-                                    }
-                                    _ => UpdateUiAction::Check,
-                                });
-                            }
-                        });
-                    }
-                });
-
-                if toggle_automatic_updates {
-                    let enabled = !self.automatic_updates;
-                    if self
-                        .commands
-                        .send(BridgeCommand::SetAutomaticUpdates(enabled))
-                        .is_ok()
-                    {
-                        self.automatic_updates = enabled;
-                        self.last_error = None;
-                    } else {
-                        self.last_error = Some("Bridge settings service is unavailable".into());
-                    }
-                }
-                if let Some(action) = update_action {
-                    let command = match action {
-                        UpdateUiAction::Check => BridgeCommand::CheckForUpdates,
-                        UpdateUiAction::Install(update) => BridgeCommand::InstallUpdate(update),
-                    };
-                    if self.commands.send(command).is_err() {
-                        self.last_error = Some("Bridge update service is unavailable".into());
-                    }
-                }
-
-                if let Some(error) = &self.last_error {
-                    ui.add_space(5.0);
-                    ui.label(RichText::new(error).size(10.0).color(DANGER));
-                }
-
-                ui.add_space(12.0);
-                ui.separator();
-                ui.add_space(10.0);
-                if ui
-                    .add_sized(
-                        [ui.available_width(), 32.0],
-                        Button::new(
-                            RichText::new("Open control panel")
-                                .size(11.0)
-                                .strong()
-                                .color(TEXT),
-                        )
-                        .fill(SURFACE)
-                        .stroke(Stroke::new(1.0, BORDER))
-                        .corner_radius(4.0),
-                    )
-                    .clicked()
-                    && let Err(error) = open_openmouse()
-                {
-                    self.last_error = Some(error.to_string());
-                }
-
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(platform::platform_name())
-                            .size(10.0)
-                            .color(MUTED),
-                    );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add(
-                                Button::new(RichText::new("Quit Bridge").size(10.0).color(DANGER))
-                                    .frame(false),
-                            )
-                            .clicked()
-                        {
-                            self.exit_requested = true;
-                            ui.ctx().send_viewport_cmd(ViewportCommand::Close);
-                        }
-                    });
                 });
             });
+            if let Some(error) = &self.last_error {
+                ui.add_space(6.0);
+                ui.label(RichText::new(error).size(11.0).color(DANGER));
+            }
+        });
+    }
+
+    fn send_command(&mut self, command: BridgeCommand, unavailable: &str) -> bool {
+        if self.commands.send(command).is_ok() {
+            self.last_error = None;
+            true
+        } else {
+            self.last_error = Some(unavailable.into());
+            false
+        }
     }
 }
 
