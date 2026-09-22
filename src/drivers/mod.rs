@@ -87,6 +87,7 @@ mod tests {
                 polling_rate_hz: Some(1000),
                 snapshot: None,
             },
+            enabled: true,
         }
     }
 

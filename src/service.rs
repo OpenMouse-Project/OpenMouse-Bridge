@@ -76,11 +76,13 @@ fn active_profile_for(
             config
                 .profiles
                 .iter()
+                .filter(|profile| profile.enabled)
                 .find(|profile| {
-                    profile
-                        .application
-                        .path
-                        .eq_ignore_ascii_case(&application.path)
+                    (!profile.application.path.is_empty()
+                        && profile
+                            .application
+                            .path
+                            .eq_ignore_ascii_case(&application.path))
                         || profile
                             .application
                             .name
@@ -586,6 +588,7 @@ mod tests {
                 polling_rate_hz: hz,
                 snapshot: None,
             },
+            enabled: true,
         }
     }
 
@@ -623,6 +626,17 @@ mod tests {
                 ("Razer:Viper V3 Pro".to_owned(), "Viper V3 Pro".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn disabled_profiles_are_never_matched() {
+        let mut config = BridgeConfig::default();
+        let mut valorant = test_profile("Valorant", "", Some(800), None);
+        valorant.enabled = false;
+        config.profiles = vec![valorant];
+
+        let apps = vec![test_app("Valorant", "/games/valorant", true)];
+        assert_eq!(active_profile_for(&config, &apps), None);
     }
 
     #[test]

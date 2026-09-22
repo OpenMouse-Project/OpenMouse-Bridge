@@ -45,6 +45,34 @@ pub struct ApplicationProfile {
     pub application: ProfileApplication,
     pub device: ProfileDevice,
     pub settings: ProfileSettings,
+    /// A disabled profile is kept (so the control panel can store a game's
+    /// settings while its automatic apply is off) but never matched.
+    /// Configs written before this field existed only held active profiles.
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+}
+
+fn enabled_by_default() -> bool {
+    true
+}
+
+impl ApplicationProfile {
+    /// Which application the profile is for, as the matcher sees it: the full
+    /// path when there is one (Windows application profiles), otherwise the
+    /// executable, otherwise the name (game profiles from the control panel,
+    /// which only know a game's executables). Lowercased, as matching is.
+    pub fn application_key(&self) -> String {
+        let application = &self.application;
+        [
+            &application.path,
+            &application.executable,
+            &application.name,
+        ]
+        .into_iter()
+        .find(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -116,20 +144,15 @@ impl BridgeConfig {
             profile.device.id = profile.device.id.trim().to_owned();
             profile.device.name = profile.device.name.trim().to_owned();
         }
+        // Game profiles from the control panel carry no path (a game is known
+        // by its executables), so a profile only needs something to match on.
         self.profiles.retain(|profile| {
-            !profile.application.executable.is_empty()
-                && !profile.application.path.is_empty()
-                && !profile.device.id.is_empty()
+            !profile.application_key().is_empty() && !profile.device.id.is_empty()
         });
-        self.profiles.sort_by(|left, right| {
-            (&left.application.path, &left.device.id)
-                .cmp(&(&right.application.path, &right.device.id))
-        });
+        self.profiles
+            .sort_by_cached_key(|profile| (profile.application_key(), profile.device.id.clone()));
         self.profiles.dedup_by(|left, right| {
-            left.application
-                .path
-                .eq_ignore_ascii_case(&right.application.path)
-                && left.device.id == right.device.id
+            left.application_key() == right.application_key() && left.device.id == right.device.id
         });
         if let Some(profile) = &mut self.default_profile {
             profile.application.name = profile.application.name.trim().to_owned();
@@ -292,5 +315,53 @@ mod tests {
             .expect("legacy profile parses");
         assert_eq!(legacy.snapshot, None);
         assert!(!serde_json::to_string(&legacy).unwrap().contains("snapshot"));
+    }
+
+    fn game_profile(name: &str, executable: &str, device: &str) -> ApplicationProfile {
+        ApplicationProfile {
+            application: ProfileApplication {
+                name: name.into(),
+                executable: executable.into(),
+                path: String::new(),
+            },
+            device: ProfileDevice {
+                id: device.into(),
+                name: "Mouse".into(),
+            },
+            settings: ProfileSettings {
+                dpi: Some(800),
+                polling_rate_hz: None,
+                snapshot: None,
+            },
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn normalization_keeps_path_less_game_profiles_and_dedupes_by_executable() {
+        let config = BridgeConfig {
+            profiles: vec![
+                game_profile("Apex Legends", "r5apex.exe", "Logitech:Mouse"),
+                game_profile("Apex Legends", "R5Apex.exe", "Logitech:Mouse"),
+                game_profile("VALORANT", "valorant.exe", "Logitech:Mouse"),
+                game_profile("", "", "Logitech:Mouse"),
+            ],
+            ..BridgeConfig::default()
+        };
+        let names: Vec<_> = config
+            .normalized()
+            .profiles
+            .into_iter()
+            .map(|profile| profile.application.name)
+            .collect();
+        assert_eq!(names, ["Apex Legends", "VALORANT"]);
+    }
+
+    #[test]
+    fn profiles_saved_before_the_enabled_flag_load_as_enabled() {
+        let json = r#"{"application":{"name":"Apex Legends","executable":"r5apex.exe","path":""},"device":{"id":"d","name":"Mouse"},"settings":{"dpi":800,"pollingRateHz":null}}"#;
+        let profile: ApplicationProfile =
+            serde_json::from_str(json).expect("legacy profile parses");
+        assert!(profile.enabled);
     }
 }
