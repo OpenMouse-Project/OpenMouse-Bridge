@@ -410,6 +410,12 @@ impl TrayApp {
             notify_natively(notice);
             return;
         }
+        tracing::info!(
+            title = %notice.title,
+            sound = self.notification_sound,
+            volume = self.notification_volume,
+            "Showed a notice on the overlay"
+        );
         if self.notification_sound
             && let Err(error) = overlay.chime(self.notification_volume)
         {
