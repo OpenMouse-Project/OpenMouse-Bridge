@@ -21,7 +21,6 @@ const READ_TIMEOUT_MS: i32 = 100;
 /// with the device lock released, so a write never queues behind a read.
 #[cfg(not(target_os = "windows"))]
 const SHARED_READ_IDLE: std::time::Duration = std::time::Duration::from_millis(2);
-const LOGITECH_VENDOR_ID: u16 = 0x046D;
 const RAZER_VENDOR_ID: u16 = 0x1532;
 const RAZER_FEATURE_BUFFER_LEN: usize = 91;
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -746,22 +745,28 @@ fn grouped_device_key(vendor_id: u16, product_id: u16, serial: Option<&str>) -> 
     )
     .into_bytes()
 }
-fn should_group_interfaces(vendor_id: u16, has_serial: bool) -> bool {
-    // A serial-bearing device is a single physical product, so its HID report
-    // paths are one logical device on every platform. Without a serial, keep
-    // the historical always-group Windows Razer/Logitech receivers: those
-    // expose several report paths yet carry no serial string at all.
-    has_serial
-        || (cfg!(target_os = "windows")
-            && matches!(vendor_id, RAZER_VENDOR_ID | LOGITECH_VENDOR_ID))
+/// Whether a product's report paths collapse into one connect-page card.
+///
+/// Always true. hidapi's serial — the only true physical identity it exposes
+/// — is used when present, and vendor:product is the most specific no-serial
+/// fallback the platform offers, which is exactly the identity WebHID hands
+/// the app (no serial available there at all). Two identical serial-less
+/// mice of one model merge into a single logical device; that is the same,
+/// unavoidable trade-off the WebHID path makes. This is kept as a named
+/// decision point + the path fallback in `device_group_key` so a future
+/// platform rule (e.g. "never merge two distinct same-model dongles") has a
+/// single, documented place to live.
+fn should_group_interfaces(_vendor_id: u16, _has_serial: bool) -> bool {
+    true
 }
 
 fn device_group_key(info: &hidapi::DeviceInfo) -> Vec<u8> {
     let serial = info.serial_number().filter(|serial| !serial.is_empty());
     if should_group_interfaces(info.vendor_id(), serial.is_some()) {
-        return grouped_device_key(info.vendor_id(), info.product_id(), serial);
+        grouped_device_key(info.vendor_id(), info.product_id(), serial)
+    } else {
+        info.path().to_bytes().to_vec()
     }
-    info.path().to_bytes().to_vec()
 }
 
 fn inspect_candidate(
@@ -1091,6 +1096,10 @@ async fn send_json(socket: &mut WebSocket, value: &impl Serialize) -> Result<(),
 mod tests {
     use super::*;
 
+    /// Logitech receivers also split their report paths across several HID
+    /// entries; used only to pin the grouping rule for them here.
+    const LOGITECH_VENDOR_ID: u16 = 0x046D;
+
     #[test]
     fn descriptor_becomes_webhid_collections_and_report_lengths() {
         let descriptor = [
@@ -1121,23 +1130,20 @@ mod tests {
     }
 
     #[test]
-    fn multi_interface_devices_group_by_serial_number_on_every_platform() {
+    fn multi_interface_devices_group_into_one_logical_device_everywhere() {
         // A physical mouse that reports a serial number is one logical device
         // everywhere, so its interfaces never become separate connect cards.
         assert!(should_group_interfaces(0x1234, true));
         assert!(should_group_interfaces(RAZER_VENDOR_ID, true));
         assert!(should_group_interfaces(LOGITECH_VENDOR_ID, true));
-        // Without a serial, only the historical Windows Razer/Logitech
-        // receivers group their multiple report paths.
-        assert_eq!(
-            should_group_interfaces(RAZER_VENDOR_ID, false),
-            cfg!(target_os = "windows")
-        );
-        assert_eq!(
-            should_group_interfaces(LOGITECH_VENDOR_ID, false),
-            cfg!(target_os = "windows")
-        );
-        assert!(!should_group_interfaces(0x1234, false));
+        // Without a serial, one logical device per vendor:product on every
+        // platform too — the OS splits report paths into separate enumeration
+        // entries, so grouping them is what keeps a serial-less receiver from
+        // surfacing one card per path. Two identical serial-less mice of the
+        // same model merge; that is the same trade-off the WebHID path makes.
+        assert!(should_group_interfaces(RAZER_VENDOR_ID, false));
+        assert!(should_group_interfaces(LOGITECH_VENDOR_ID, false));
+        assert!(should_group_interfaces(0x1234, false));
         assert_eq!(
             grouped_device_key(RAZER_VENDOR_ID, 0x00b0, Some("receiver-123")),
             grouped_device_key(RAZER_VENDOR_ID, 0x00b0, Some("receiver-123"))
