@@ -746,17 +746,20 @@ fn grouped_device_key(vendor_id: u16, product_id: u16, serial: Option<&str>) -> 
     )
     .into_bytes()
 }
-fn should_group_interfaces(vendor_id: u16) -> bool {
-    cfg!(target_os = "windows") && matches!(vendor_id, RAZER_VENDOR_ID | LOGITECH_VENDOR_ID)
+fn should_group_interfaces(vendor_id: u16, has_serial: bool) -> bool {
+    // A serial-bearing device is a single physical product, so its HID report
+    // paths are one logical device on every platform. Without a serial, keep
+    // the historical always-group Windows Razer/Logitech receivers: those
+    // expose several report paths yet carry no serial string at all.
+    has_serial
+        || (cfg!(target_os = "windows")
+            && matches!(vendor_id, RAZER_VENDOR_ID | LOGITECH_VENDOR_ID))
 }
 
 fn device_group_key(info: &hidapi::DeviceInfo) -> Vec<u8> {
-    if should_group_interfaces(info.vendor_id()) {
-        return grouped_device_key(
-            info.vendor_id(),
-            info.product_id(),
-            info.serial_number().filter(|serial| !serial.is_empty()),
-        );
+    let serial = info.serial_number().filter(|serial| !serial.is_empty());
+    if should_group_interfaces(info.vendor_id(), serial.is_some()) {
+        return grouped_device_key(info.vendor_id(), info.product_id(), serial);
     }
     info.path().to_bytes().to_vec()
 }
@@ -1118,16 +1121,23 @@ mod tests {
     }
 
     #[test]
-    fn multi_interface_devices_group_only_on_windows() {
+    fn multi_interface_devices_group_by_serial_number_on_every_platform() {
+        // A physical mouse that reports a serial number is one logical device
+        // everywhere, so its interfaces never become separate connect cards.
+        assert!(should_group_interfaces(0x1234, true));
+        assert!(should_group_interfaces(RAZER_VENDOR_ID, true));
+        assert!(should_group_interfaces(LOGITECH_VENDOR_ID, true));
+        // Without a serial, only the historical Windows Razer/Logitech
+        // receivers group their multiple report paths.
         assert_eq!(
-            should_group_interfaces(RAZER_VENDOR_ID),
+            should_group_interfaces(RAZER_VENDOR_ID, false),
             cfg!(target_os = "windows")
         );
         assert_eq!(
-            should_group_interfaces(LOGITECH_VENDOR_ID),
+            should_group_interfaces(LOGITECH_VENDOR_ID, false),
             cfg!(target_os = "windows")
         );
-        assert!(!should_group_interfaces(0x1234));
+        assert!(!should_group_interfaces(0x1234, false));
         assert_eq!(
             grouped_device_key(RAZER_VENDOR_ID, 0x00b0, Some("receiver-123")),
             grouped_device_key(RAZER_VENDOR_ID, 0x00b0, Some("receiver-123"))
