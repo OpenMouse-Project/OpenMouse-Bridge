@@ -120,16 +120,36 @@ export class HidDeviceAdapter {
    * length they themselves expect back baked into their own retry/parsing
    * logic, so a generous fixed buffer (the largest report any known driver
    * here uses) is safe — short replies are simply the leading bytes of it.
+   *
+   * Classic Razer's control protocol is the largest: 90-byte feature reports
+   * on report id 0 (mouse-protocol/src/razer/codec.ts, RAZER_PACKET_LENGTH =
+   * 90; the Rust transport's per-vendor budget is 91 for it — see
+   * RAZER_FEATURE_BUFFER_LEN in src/hid.rs). Requesting the whole report one
+   * byte at a time would be wrong; request the id byte plus the largest
+   * payload up front: `getFeatureReport` fills its first byte with the
+   * requested report id and returns that id prefix as part of the buffer
+   * (node-hid's HID.cc passes buf[0] on to hidapi, which counts it — the
+   * exact same shape the Rust transport's receive_feature_report() accounts
+   * for with `data[1..size]`). Strip that id byte so the drivers see the
+   * payload they get from WebHID. Some backends omit the id byte entirely;
+   * keep those as-is.
+   *
    * Tries every split (the report id in question may only be declared on
    * one of them) and returns the first that answers.
    */
   async receiveFeatureReport(reportId) {
     this._requireOpen();
+    // Largest driver payload (Razer's 90-byte feature report) + the id byte.
+    const requestedLen = 91;
     let lastError;
     for (const device of this._devices) {
       try {
-        const bytes = device.getFeatureReport(reportId, 64);
-        return new DataView(Uint8Array.from(bytes).buffer);
+        // node-hid's sync HID.getFeatureReport returns a number[] (its
+        // HIDAsync variant returns a Buffer), so normalize to Uint8Array
+        // before slicing.
+        const raw = Uint8Array.from(device.getFeatureReport(reportId, requestedLen));
+        const payload = raw.length > 1 && raw[0] === reportId ? raw.subarray(1) : raw;
+        return new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
       } catch (error) {
         lastError = error;
       }

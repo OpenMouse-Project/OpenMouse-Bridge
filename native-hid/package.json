@@ -8,11 +8,11 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@openmouse/protocol": "github:OpenMouse-Project/mouse-protocol#44aa8af647af89251d12d8ee07bfa7c4ecdef598",
+    "@openmouse/protocol": "github:OpenMouse-Project/mouse-protocol#296ba2d2e9263fac2cba5e834ce6aa9cc269fe41",
     "node-hid": "^3.1.0"
   },
   "allowScripts": {
-    "github:OpenMouse-Project/mouse-protocol#44aa8af647af89251d12d8ee07bfa7c4ecdef598": true,
+    "github:OpenMouse-Project/mouse-protocol#296ba2d2e9263fac2cba5e834ce6aa9cc269fe41": true,
     "node-hid@3.4.0": true
   }
 }
