@@ -63,8 +63,10 @@ mod tests {
 
     fn peak(wav: &[u8]) -> i16 {
         wav[44..]
-            .chunks_exact(2)
-            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]).saturating_abs())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| i16::from_le_bytes(pair).saturating_abs())
             .max()
             .unwrap_or(0)
     }
