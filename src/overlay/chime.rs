@@ -1,6 +1,6 @@
 //! The banner's chime: two soft bell tones, synthesized as a WAV so it needs
 //! no bundled asset and the volume can be baked into the samples, which plays
-//! the same through NSSound and PlaySound.
+//! the same through NSSound and waveOut.
 
 const SAMPLE_RATE: u32 = 44_100;
 const LENGTH_SECONDS: f32 = 0.7;

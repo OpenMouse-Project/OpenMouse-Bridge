@@ -14,7 +14,14 @@ use windows_sys::Win32::{
         CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, HBITMAP, HDC,
         HGDIOBJ, SelectObject,
     },
-    Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT},
+    Media::{
+        Audio::{
+            CALLBACK_NULL, HWAVEOUT, WAVE_FORMAT_PCM, WAVE_MAPPER, WAVEFORMATEX, WAVEHDR,
+            waveOutClose, waveOutOpen, waveOutPrepareHeader, waveOutReset, waveOutUnprepareHeader,
+            waveOutWrite,
+        },
+        MMSYSERR_NOERROR,
+    },
     System::LibraryLoader::GetModuleHandleW,
     UI::{
         HiDpi::GetDpiForSystem,
@@ -218,39 +225,86 @@ fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
 }
 
-/// Plays the chime. PlaySound reads an in-memory sound while it plays, so the
-/// buffer is kept until the next chime (or drop) stops it first.
+/// Plays the chime through waveOut rather than PlaySound: PlaySound is mixed
+/// into the shared "System sounds" session, which many players mute, while
+/// waveOut plays in Bridge's own session with its own Volume Mixer slider.
 #[derive(Default)]
 pub struct Speaker {
-    wav: Option<Vec<u8>>,
+    playback: Option<Playback>,
 }
 
 impl Speaker {
     pub fn play(&mut self, wav: Vec<u8>) -> Result<()> {
-        self.stop();
-        let wav = self.wav.insert(wav);
-        let played = unsafe {
-            PlaySoundW(
-                wav.as_ptr().cast(),
-                null_mut(),
-                SND_MEMORY | SND_ASYNC | SND_NODEFAULT,
-            )
-        };
-        if played == 0 {
-            bail!("Windows could not play the chime");
-        }
+        self.playback = None;
+        self.playback = Some(Playback::start(wav)?);
         Ok(())
-    }
-
-    fn stop(&mut self) {
-        if self.wav.take().is_some() {
-            unsafe { PlaySoundW(std::ptr::null(), null_mut(), 0) };
-        }
     }
 }
 
-impl Drop for Speaker {
+/// One chime on an open waveOut device. waveOut reads the samples while they
+/// play, so the buffer and its header stay put until the playback is dropped,
+/// which cuts it off and closes the device.
+struct Playback {
+    device: HWAVEOUT,
+    header: Box<WAVEHDR>,
+    _wav: Vec<u8>,
+}
+
+impl Playback {
+    fn start(wav: Vec<u8>) -> Result<Self> {
+        // The chime is always the canonical 44-byte-header PCM WAV that
+        // chime::wav writes, so its format sits at fixed offsets.
+        let field = |offset: usize| u16::from_le_bytes([wav[offset], wav[offset + 1]]);
+        let channels = field(22);
+        let sample_rate = u32::from_le_bytes(wav[24..28].try_into()?);
+        let bits = field(34);
+        let block_align = channels * bits / 8;
+        let format = WAVEFORMATEX {
+            wFormatTag: WAVE_FORMAT_PCM as u16,
+            nChannels: channels,
+            nSamplesPerSec: sample_rate,
+            nAvgBytesPerSec: sample_rate * u32::from(block_align),
+            nBlockAlign: block_align,
+            wBitsPerSample: bits,
+            cbSize: 0,
+        };
+
+        let mut device: HWAVEOUT = null_mut();
+        let opened = unsafe { waveOutOpen(&mut device, WAVE_MAPPER, &format, 0, 0, CALLBACK_NULL) };
+        if opened != MMSYSERR_NOERROR {
+            bail!("Windows could not open an audio device for the chime (error {opened})");
+        }
+        let samples = &wav[44..];
+        let mut playback = Self {
+            device,
+            header: Box::new(WAVEHDR {
+                lpData: samples.as_ptr().cast_mut(),
+                dwBufferLength: samples.len() as u32,
+                ..Default::default()
+            }),
+            _wav: wav,
+        };
+        let header: *mut WAVEHDR = &mut *playback.header;
+        let size = size_of::<WAVEHDR>() as u32;
+        let prepared = unsafe { waveOutPrepareHeader(device, header, size) };
+        if prepared != MMSYSERR_NOERROR {
+            bail!("Windows could not prepare the chime (error {prepared})");
+        }
+        let written = unsafe { waveOutWrite(device, header, size) };
+        if written != MMSYSERR_NOERROR {
+            bail!("Windows could not play the chime (error {written})");
+        }
+        Ok(playback)
+    }
+}
+
+impl Drop for Playback {
     fn drop(&mut self) {
-        self.stop();
+        let header: *mut WAVEHDR = &mut *self.header;
+        unsafe {
+            waveOutReset(self.device);
+            waveOutUnprepareHeader(self.device, header, size_of::<WAVEHDR>() as u32);
+            waveOutClose(self.device);
+        }
     }
 }
