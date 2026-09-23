@@ -41,6 +41,32 @@ fn is_registered_game(application: &ApplicationInfo, games: &[GameConfig]) -> bo
     })
 }
 
+/// The running applications that are registered games. Profile matching only
+/// looks at these; the unfiltered list feeds the game-request picker.
+fn registered_applications(
+    running: &[ApplicationInfo],
+    games: &[GameConfig],
+) -> Vec<ApplicationInfo> {
+    running
+        .iter()
+        .filter(|application| is_registered_game(application, games))
+        .cloned()
+        .collect()
+}
+
+/// Drops cached icons for applications that are no longer running, so the
+/// cache stays the size of the running list instead of every app ever seen.
+fn prune_application_icons(
+    icons: &mut HashMap<String, Option<Vec<u8>>>,
+    running: &[ApplicationInfo],
+) {
+    icons.retain(|icon_id, _| {
+        running
+            .iter()
+            .any(|application| &application.icon_id == icon_id)
+    });
+}
+
 /// How long a new active profile must persist before a switch notification
 /// fires, so rapid alt-tabbing does not spam notifications.
 const PROFILE_DEBOUNCE: Duration = Duration::from_millis(2500);
@@ -212,6 +238,9 @@ struct BridgeState {
     config: BridgeConfig,
     active_games: Vec<String>,
     applications: Vec<ApplicationInfo>,
+    // Every visible application, registered game or not — what a control
+    // panel offers when someone requests a new game or app be added.
+    running_applications: Vec<ApplicationInfo>,
     application_icons: HashMap<String, Option<Vec<u8>>>,
     battery: HashMap<String, BatteryState>,
     // Debounced active-profile tracking for switch notifications.
@@ -287,6 +316,7 @@ impl BridgeService {
                 config,
                 active_games: Vec::new(),
                 applications: Vec::new(),
+                running_applications: Vec::new(),
                 application_icons: HashMap::new(),
                 battery: HashMap::new(),
                 active_profile_key: None,
@@ -376,6 +406,10 @@ impl BridgeService {
 
     pub async fn applications(&self) -> Vec<ApplicationInfo> {
         self.inner.read().await.applications.clone()
+    }
+
+    pub async fn running_applications(&self) -> Vec<ApplicationInfo> {
+        self.inner.read().await.running_applications.clone()
     }
 
     pub async fn application_icon(&self, icon_id: &str) -> Option<Vec<u8>> {
@@ -554,16 +588,14 @@ impl BridgeService {
                 interval.tick().await;
                 let games = service.inner.read().await.config.games.clone();
                 let active = detector.detect(&games);
-                let applications = applications::visible_applications()
-                    .into_iter()
-                    .filter(|application| is_registered_game(application, &games))
-                    .collect::<Vec<_>>();
+                let running = applications::visible_applications();
+                let applications = registered_applications(&running, &games);
                 // Icon extraction can be disabled by callers that never serve
                 // the application's icon endpoint.
                 let icons = if extract_icons.load(Ordering::Acquire) {
                     let missing_icons = {
                         let state = service.inner.read().await;
-                        applications
+                        running
                             .iter()
                             .filter(|application| {
                                 !state.application_icons.contains_key(&application.icon_id)
@@ -584,6 +616,8 @@ impl BridgeService {
                 state.active_games = active;
                 state.applications = applications;
                 state.application_icons.extend(icons);
+                prune_application_icons(&mut state.application_icons, &running);
+                state.running_applications = running;
 
                 // Detect a debounced active-profile switch, push the new
                 // profile's DPI/polling rate to the mouse over native HID
@@ -963,6 +997,51 @@ mod tests {
             &application("Google Chrome", "chrome.exe"),
             &games
         ));
+    }
+
+    #[test]
+    fn running_applications_include_unregistered_apps() {
+        let games = vec![GameConfig {
+            name: "Counter-Strike 2".into(),
+            executables: vec!["cs2.exe".into()],
+        }];
+        let application = |name: &str, executable: &str| ApplicationInfo {
+            name: name.into(),
+            executable: executable.into(),
+            path: executable.into(),
+            foreground: false,
+            icon_id: executable.into(),
+        };
+        let running = vec![
+            application("Counter-Strike 2", "cs2.exe"),
+            application("Some New Game", "newgame.exe"),
+        ];
+
+        let registered = registered_applications(&running, &games);
+
+        assert_eq!(registered, vec![running[0].clone()]);
+        assert!(running.iter().any(|app| app.executable == "newgame.exe"));
+        assert!(!registered.iter().any(|app| app.executable == "newgame.exe"));
+    }
+
+    #[test]
+    fn application_icons_are_pruned_to_running_applications() {
+        let running = vec![ApplicationInfo {
+            name: "Some New Game".into(),
+            executable: "newgame.exe".into(),
+            path: "newgame.exe".into(),
+            foreground: true,
+            icon_id: "running".into(),
+        }];
+        let mut icons = HashMap::from([
+            ("running".to_string(), Some(vec![1])),
+            ("closed".to_string(), None),
+        ]);
+
+        prune_application_icons(&mut icons, &running);
+
+        assert_eq!(icons.len(), 1);
+        assert!(icons.contains_key("running"));
     }
 
     #[tokio::test]

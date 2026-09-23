@@ -48,6 +48,7 @@ pub fn router(service: BridgeService, origins: &[String]) -> Router {
         .route("/v1/games", get(games))
         .route("/v1/applications", get(applications))
         .route("/v1/applications/{icon_id}/icon", get(application_icon))
+        .route("/v1/running-applications", get(running_applications))
         .route("/v1/profiles", get(profiles).put(replace_profiles))
         .route("/v1/default-profile", put(set_default_profile))
         .route("/v1/battery", put(record_battery))
@@ -93,6 +94,12 @@ async fn applications(
     State(service): State<BridgeService>,
 ) -> Json<Vec<crate::applications::ApplicationInfo>> {
     Json(service.applications().await)
+}
+
+async fn running_applications(
+    State(service): State<BridgeService>,
+) -> Json<Vec<crate::applications::ApplicationInfo>> {
+    Json(service.running_applications().await)
 }
 
 async fn application_icon(
