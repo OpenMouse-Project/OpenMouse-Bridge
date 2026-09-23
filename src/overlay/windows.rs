@@ -14,6 +14,7 @@ use windows_sys::Win32::{
         CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, HBITMAP, HDC,
         HGDIOBJ, SelectObject,
     },
+    Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT},
     System::LibraryLoader::GetModuleHandleW,
     UI::{
         HiDpi::GetDpiForSystem,
@@ -215,4 +216,41 @@ impl Drop for Window {
 
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
+}
+
+/// Plays the chime. PlaySound reads an in-memory sound while it plays, so the
+/// buffer is kept until the next chime (or drop) stops it first.
+#[derive(Default)]
+pub struct Speaker {
+    wav: Option<Vec<u8>>,
+}
+
+impl Speaker {
+    pub fn play(&mut self, wav: Vec<u8>) -> Result<()> {
+        self.stop();
+        let wav = self.wav.insert(wav);
+        let played = unsafe {
+            PlaySoundW(
+                wav.as_ptr().cast(),
+                null_mut(),
+                SND_MEMORY | SND_ASYNC | SND_NODEFAULT,
+            )
+        };
+        if played == 0 {
+            bail!("Windows could not play the chime");
+        }
+        Ok(())
+    }
+
+    fn stop(&mut self) {
+        if self.wav.take().is_some() {
+            unsafe { PlaySoundW(std::ptr::null(), null_mut(), 0) };
+        }
+    }
+}
+
+impl Drop for Speaker {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }

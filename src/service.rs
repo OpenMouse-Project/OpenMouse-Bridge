@@ -146,17 +146,17 @@ fn profile_key(profile: &ApplicationProfile) -> String {
     }
 }
 
-/// A profile switch worth telling the user about, already worded: a title such
-/// as the game's name and a short detail line.
+/// Something worth telling the user about, already worded: a title such as the
+/// game's name and a short detail line.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProfileSwitch {
+pub struct Notice {
     pub title: String,
     pub detail: String,
 }
 
-/// Receives profile switches instead of the platform notification, e.g. the
-/// desktop app's on-screen overlay.
-pub type ProfileSwitchListener = Arc<dyn Fn(ProfileSwitch) + Send + Sync>;
+/// Receives notices instead of the platform notification, e.g. the desktop
+/// app's on-screen overlay.
+pub type NoticeListener = Arc<dyn Fn(Notice) + Send + Sync>;
 
 /// How pushing a profile to the mouse over native HID went.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,19 +196,19 @@ fn switch_message(
     default: Option<&ApplicationProfile>,
     outcome: Option<ApplyOutcome>,
     panel_connected: bool,
-) -> Option<ProfileSwitch> {
+) -> Option<Notice> {
     let is_default = |profile: &ApplicationProfile| default == Some(profile);
     let left = previous.filter(|profile| !is_default(profile));
     let mut switch = match current {
-        Some(profile) if !is_default(profile) => ProfileSwitch {
+        Some(profile) if !is_default(profile) => Notice {
             title: profile.application.name.clone(),
             detail: with_settings("Profile on".into(), profile),
         },
-        Some(profile) => ProfileSwitch {
+        Some(profile) => Notice {
             title: "Default profile".into(),
             detail: with_settings(format!("{} closed", left?.application.name), profile),
         },
-        None => ProfileSwitch {
+        None => Notice {
             title: format!("{} closed", left?.application.name),
             detail: "Profile off".into(),
         },
@@ -231,7 +231,7 @@ fn switch_message(
 pub struct BridgeService {
     inner: Arc<RwLock<BridgeState>>,
     config_path: Arc<PathBuf>,
-    switch_listener: Arc<std::sync::Mutex<Option<ProfileSwitchListener>>>,
+    notice_listener: Arc<std::sync::Mutex<Option<NoticeListener>>>,
 }
 
 struct BridgeState {
@@ -300,6 +300,8 @@ pub struct BridgeSnapshot {
     pub battery_threshold_percent: u8,
     pub autostart_enabled: bool,
     pub automatic_updates: bool,
+    pub notification_sound: bool,
+    pub notification_volume: u8,
     pub foreground_application: Option<ApplicationInfo>,
     pub active_profile: Option<ApplicationProfile>,
     pub active_profile_is_default: bool,
@@ -327,17 +329,39 @@ impl BridgeService {
                 last_client_heartbeat: None,
             })),
             config_path: Arc::new(config_path),
-            switch_listener: Arc::default(),
+            notice_listener: Arc::default(),
         }
     }
 
-    /// Sends profile switches to `listener` instead of showing a platform
-    /// notification for them.
-    pub fn on_profile_switch(&self, listener: impl Fn(ProfileSwitch) + Send + Sync + 'static) {
+    /// Sends profile switches and low-battery alerts to `listener` instead of
+    /// showing a platform notification for them.
+    pub fn on_notice(&self, listener: impl Fn(Notice) + Send + Sync + 'static) {
         *self
-            .switch_listener
+            .notice_listener
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(listener));
+    }
+
+    /// Hands `notice` to the listener, or shows it as a platform notification
+    /// when there is none. Showing a notification can block (e.g. an unbundled
+    /// macOS binary pops a chooser dialog), so that runs detached: never stall
+    /// the caller, and never let a notification failure fail it.
+    fn announce(&self, notice: Notice) {
+        let listener = self
+            .notice_listener
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        match listener {
+            Some(listener) => listener(notice),
+            None => {
+                std::thread::spawn(move || {
+                    if let Err(error) = platform::notify(&notice.title, &notice.detail) {
+                        tracing::warn!(%error, "Could not show the notification");
+                    }
+                });
+            }
+        }
     }
 
     pub async fn snapshot(&self) -> BridgeSnapshot {
@@ -386,6 +410,8 @@ impl BridgeService {
             battery_threshold_percent: state.config.battery_threshold_percent,
             autostart_enabled: platform::autostart_enabled(),
             automatic_updates: state.config.automatic_updates,
+            notification_sound: state.config.notification_sound,
+            notification_volume: state.config.notification_volume,
             foreground_application,
             active_profile,
             active_profile_is_default,
@@ -484,6 +510,25 @@ impl BridgeService {
         config::save(&self.config_path, &config)
     }
 
+    pub async fn set_notification_sound(&self, enabled: bool) -> Result<()> {
+        let config = {
+            let mut state = self.inner.write().await;
+            state.config.notification_sound = enabled;
+            state.config.clone()
+        };
+        config::save(&self.config_path, &config)
+    }
+
+    pub async fn set_notification_volume(&self, percent: u8) -> Result<()> {
+        let config = {
+            let mut state = self.inner.write().await;
+            state.config.notification_volume = percent;
+            state.config = state.config.clone().normalized();
+            state.config.clone()
+        };
+        config::save(&self.config_path, &config)
+    }
+
     pub async fn record_battery(&self, reading: BatteryReading) -> Result<bool> {
         let percent = reading.percent.min(100);
         let mut reading = reading;
@@ -516,17 +561,12 @@ impl BridgeService {
             should_alert
         };
         if alert {
-            let body = format!(
-                "{} has {}% battery remaining.",
-                reading.device_name, reading.percent
-            );
-            // Showing a notification can block (e.g. an unbundled macOS binary
-            // pops a chooser dialog), so run it detached: never stall the request
-            // or the runtime, and never let a notification failure fail the write.
-            std::thread::spawn(move || {
-                if let Err(error) = platform::notify("Mouse battery is low", &body) {
-                    tracing::warn!(%error, "Could not show the low-battery notification");
-                }
+            self.announce(Notice {
+                title: "Mouse battery is low".into(),
+                detail: format!(
+                    "{} has {}% battery remaining",
+                    reading.device_name, reading.percent
+                ),
             });
         }
         Ok(alert)
@@ -663,11 +703,7 @@ impl BridgeService {
                 let default = state.config.default_profile.clone();
                 drop(state);
                 if let Some((current, previous, announce)) = switch {
-                    let listener = service
-                        .switch_listener
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clone();
+                    let service = service.clone();
                     std::thread::spawn(move || {
                         // A connected control panel applies the profile over its
                         // own HID session; writing natively as well would
@@ -690,16 +726,7 @@ impl BridgeService {
                         ) else {
                             return;
                         };
-                        match listener {
-                            Some(listener) => listener(message),
-                            None => {
-                                if let Err(error) =
-                                    platform::notify(&message.title, &message.detail)
-                                {
-                                    tracing::warn!(%error, "Could not show the profile notification");
-                                }
-                            }
-                        }
+                        service.announce(message);
                     });
                 }
             }
@@ -895,21 +922,21 @@ mod tests {
 
         assert_eq!(
             switch_message(Some(&default), Some(&game), Some(&default), applied, false),
-            Some(ProfileSwitch {
+            Some(Notice {
                 title: "Counter-Strike 2".into(),
                 detail: "Profile on · 1600 DPI".into(),
             })
         );
         assert_eq!(
             switch_message(Some(&game), Some(&default), Some(&default), applied, false),
-            Some(ProfileSwitch {
+            Some(Notice {
                 title: "Default profile".into(),
                 detail: "Counter-Strike 2 closed · 800 DPI · 1000 Hz".into(),
             })
         );
         assert_eq!(
             switch_message(Some(&game), None, None, None, false),
-            Some(ProfileSwitch {
+            Some(Notice {
                 title: "Counter-Strike 2 closed".into(),
                 detail: "Profile off".into(),
             })

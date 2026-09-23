@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_BATTERY_THRESHOLD: u8 = 20;
 const DEFAULT_ALERT_COOLDOWN_MINUTES: u64 = 360;
+const DEFAULT_NOTIFICATION_VOLUME: u8 = 60;
 const OFFICIAL_ORIGINS: &[&str] = &[
     "https://control.openmouse.app",
     "https://dev.openmouse.app",
@@ -22,6 +23,11 @@ pub struct BridgeConfig {
     pub alert_cooldown_minutes: u64,
     #[serde(default)]
     pub automatic_updates: bool,
+    /// Whether the on-screen banner plays a chime, and how loud (0–100).
+    #[serde(default = "enabled_by_default")]
+    pub notification_sound: bool,
+    #[serde(default = "default_notification_volume")]
+    pub notification_volume: u8,
     #[serde(default)]
     pub games: Vec<GameConfig>,
     #[serde(default)]
@@ -113,6 +119,8 @@ impl Default for BridgeConfig {
             battery_threshold_percent: DEFAULT_BATTERY_THRESHOLD,
             alert_cooldown_minutes: DEFAULT_ALERT_COOLDOWN_MINUTES,
             automatic_updates: false,
+            notification_sound: true,
+            notification_volume: DEFAULT_NOTIFICATION_VOLUME,
             games: Vec::new(),
             profiles: Vec::new(),
             default_profile: None,
@@ -125,6 +133,7 @@ impl Default for BridgeConfig {
 impl BridgeConfig {
     pub fn normalized(mut self) -> Self {
         self.battery_threshold_percent = self.battery_threshold_percent.min(100);
+        self.notification_volume = self.notification_volume.min(100);
         self.alert_cooldown_minutes = self.alert_cooldown_minutes.max(1);
         for game in &mut self.games {
             game.name = game.name.trim().to_owned();
@@ -258,6 +267,10 @@ const fn default_alert_cooldown() -> u64 {
     DEFAULT_ALERT_COOLDOWN_MINUTES
 }
 
+const fn default_notification_volume() -> u8 {
+    DEFAULT_NOTIFICATION_VOLUME
+}
+
 fn default_origins() -> Vec<String> {
     vec![
         "https://control.openmouse.app".to_owned(),
@@ -283,6 +296,8 @@ mod tests {
                 executables: vec![" VALORANT-Win64-Shipping.exe ".into(), "".into()],
             }],
             automatic_updates: false,
+            notification_sound: true,
+            notification_volume: 180,
             profiles: Vec::new(),
             default_profile: None,
             allowed_origins: Vec::new(),
@@ -291,6 +306,7 @@ mod tests {
         .normalized();
         assert_eq!(config.battery_threshold_percent, 100);
         assert_eq!(config.alert_cooldown_minutes, 1);
+        assert_eq!(config.notification_volume, 100);
         let valorant = config
             .games
             .iter()

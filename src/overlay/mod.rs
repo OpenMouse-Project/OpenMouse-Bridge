@@ -1,8 +1,10 @@
-//! The on-screen banner shown when a game's profile switches on or off.
+//! The on-screen banner, and its chime, for profile switches and low-battery
+//! alerts.
 //!
 //! It is drawn by Bridge itself rather than sent as a system notification, so
 //! it appears over a borderless game immediately and never takes its focus.
 
+mod chime;
 mod render;
 
 #[cfg(target_os = "macos")]
@@ -22,6 +24,7 @@ const FRAME: Duration = Duration::from_millis(16);
 
 pub struct Overlay {
     window: platform::Window,
+    speaker: platform::Speaker,
     shown_at: Option<Instant>,
 }
 
@@ -29,6 +32,7 @@ impl Overlay {
     pub fn new() -> Result<Self> {
         Ok(Self {
             window: platform::Window::new()?,
+            speaker: platform::Speaker::default(),
             shown_at: None,
         })
     }
@@ -39,6 +43,11 @@ impl Overlay {
         self.window.present(&banner)?;
         self.shown_at = Some(Instant::now());
         Ok(())
+    }
+
+    /// Plays the chime at `volume` (0–100), cutting off one still playing.
+    pub fn chime(&mut self, volume: u8) -> Result<()> {
+        self.speaker.play(chime::wav(volume))
     }
 
     /// Advances the fade in, hold and fade out. Returns how soon it needs the

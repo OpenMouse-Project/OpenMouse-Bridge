@@ -52,16 +52,18 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
   "NSResponder",
   "NSRunningApplication",
   "NSScreen",
+  "NSSound",
   "NSView",
   "NSWindow",
   "NSWorkspace",
 ] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSGeometry", "NSString"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSData", "NSGeometry", "NSString"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
+  "Win32_Media_Audio",
   "Win32_Storage_FileSystem",
   "Win32_System_LibraryLoader",
   "Win32_System_Registry",

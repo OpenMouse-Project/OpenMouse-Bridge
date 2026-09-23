@@ -6,10 +6,10 @@ use anyhow::{Context, Result};
 use objc2::{AnyThread as _, MainThreadMarker, MainThreadOnly as _, rc::Retained};
 use objc2_app_kit::{
     NSBackingStoreType, NSBitmapFormat, NSBitmapImageRep, NSColor, NSDeviceRGBColorSpace, NSImage,
-    NSImageView, NSPanel, NSScreen, NSStatusWindowLevel, NSWindowCollectionBehavior,
+    NSImageView, NSPanel, NSScreen, NSSound, NSStatusWindowLevel, NSWindowCollectionBehavior,
     NSWindowStyleMask,
 };
-use objc2_foundation::{NSPoint, NSRect, NSSize};
+use objc2_foundation::{NSData, NSPoint, NSRect, NSSize};
 
 use super::render::Banner;
 
@@ -122,5 +122,26 @@ impl Window {
 
     pub fn hide(&mut self) {
         self.panel.orderOut(None);
+    }
+}
+
+/// Plays the chime. The sound is kept until the next one replaces it, as
+/// NSSound stops once it is released.
+#[derive(Default)]
+pub struct Speaker {
+    sound: Option<Retained<NSSound>>,
+}
+
+impl Speaker {
+    pub fn play(&mut self, wav: Vec<u8>) -> Result<()> {
+        if let Some(previous) = self.sound.take() {
+            previous.stop();
+        }
+        let data = NSData::from_vec(wav);
+        let sound = NSSound::initWithData(NSSound::alloc(), &data)
+            .context("macOS could not decode the chime")?;
+        sound.play();
+        self.sound = Some(sound);
+        Ok(())
     }
 }

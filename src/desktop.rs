@@ -19,7 +19,7 @@ use eframe::egui::{
 };
 use openmouse_bridge::{
     BRIDGE_PORT, api, config, platform,
-    service::{BridgeService, BridgeSnapshot, ProfileSwitch},
+    service::{BridgeService, BridgeSnapshot, Notice},
     updater::{self, UpdateInfo},
 };
 #[cfg(target_os = "windows")]
@@ -37,6 +37,8 @@ use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWN
 const OPENMOUSE_URL: &str = "https://control.openmouse.app";
 const WINDOW_WIDTH: f32 = 320.0;
 const WINDOW_HEIGHT: f32 = 306.0;
+/// Settings holds more rows than home, so the panel grows while it is open.
+const SETTINGS_HEIGHT: f32 = 452.0;
 const BACKGROUND: Color32 = Color32::from_rgb(16, 17, 19);
 const SURFACE: Color32 = Color32::from_rgb(26, 28, 31);
 const SURFACE_HOVER: Color32 = Color32::from_rgb(36, 39, 43);
@@ -151,6 +153,8 @@ enum View {
 
 enum BridgeCommand {
     SetBatteryThreshold(u8),
+    SetNotificationSound(bool),
+    SetNotificationVolume(u8),
     SetAutomaticUpdates(bool),
     CheckForUpdates,
     InstallUpdate(UpdateInfo),
@@ -235,7 +239,7 @@ struct TrayApp {
     snapshots: Receiver<BridgeSnapshot>,
     commands: tokio_mpsc::UnboundedSender<BridgeCommand>,
     updates: Receiver<UpdateEvent>,
-    switches: Receiver<ProfileSwitch>,
+    notices: Receiver<Notice>,
     overlay: Option<Overlay>,
     snapshot: Option<BridgeSnapshot>,
     view: View,
@@ -246,6 +250,12 @@ struct TrayApp {
     autostart: bool,
     battery_threshold: u8,
     automatic_updates: bool,
+    notification_sound: bool,
+    notification_volume: u8,
+    // While the volume slider is dragged, snapshots would snap it back to the
+    // saved value; it is saved once released.
+    adjusting_volume: bool,
+    tray_rect: Option<TrayRect>,
     update_state: UpdateState,
     last_error: Option<String>,
 }
@@ -256,15 +266,15 @@ impl TrayApp {
         snapshots: Receiver<BridgeSnapshot>,
         commands: tokio_mpsc::UnboundedSender<BridgeCommand>,
         updates: Receiver<UpdateEvent>,
-        switches: Receiver<ProfileSwitch>,
+        notices: Receiver<Notice>,
         waker: &OnceLock<egui::Context>,
         visible: bool,
     ) -> Result<Self> {
         configure_tray_only_application();
         let _ = waker.set(context.clone());
-        // Without the overlay, switches fall back to system notifications.
+        // Without the overlay, notices fall back to system notifications.
         let overlay = Overlay::new()
-            .inspect_err(|error| tracing::warn!(%error, "Could not create the profile overlay"))
+            .inspect_err(|error| tracing::warn!(%error, "Could not create the overlay"))
             .ok();
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = BACKGROUND;
@@ -307,7 +317,7 @@ impl TrayApp {
             snapshots,
             commands,
             updates,
-            switches,
+            notices,
             overlay,
             snapshot: None,
             view: View::Home,
@@ -318,6 +328,10 @@ impl TrayApp {
             autostart: platform::autostart_enabled(),
             battery_threshold: 20,
             automatic_updates: false,
+            notification_sound: true,
+            notification_volume: 60,
+            adjusting_volume: false,
+            tray_rect: None,
             update_state: UpdateState::Idle,
             last_error: None,
         })
@@ -328,23 +342,38 @@ impl TrayApp {
         self.panel_had_focus = false;
         context.send_viewport_cmd(ViewportCommand::Visible(visible));
         if visible {
-            self.view = View::Home;
+            self.show_view(context, View::Home);
             context.send_viewport_cmd(ViewportCommand::Focus);
         }
     }
 
     fn show_near_tray(&mut self, context: &egui::Context, rect: TrayRect) {
+        self.tray_rect = Some(rect);
+        self.set_visible(context, true);
+    }
+
+    /// Switches to `view`, sizing the panel for it and keeping it against the
+    /// tray icon: below it on macOS, above the taskbar on Windows.
+    fn show_view(&mut self, context: &egui::Context, view: View) {
+        self.view = view;
+        let height = match view {
+            View::Home => WINDOW_HEIGHT,
+            View::Settings => SETTINGS_HEIGHT,
+        };
+        context.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(WINDOW_WIDTH, height)));
+        let Some(rect) = self.tray_rect else {
+            return;
+        };
         let scale = f64::from(context.pixels_per_point());
         let x = (rect.position.x + f64::from(rect.size.width)) / scale - f64::from(WINDOW_WIDTH);
         #[cfg(target_os = "macos")]
         let y = (rect.position.y + f64::from(rect.size.height)) / scale + 8.0;
         #[cfg(target_os = "windows")]
-        let y = rect.position.y / scale - f64::from(WINDOW_HEIGHT) - 8.0;
+        let y = rect.position.y / scale - f64::from(height) - 8.0;
         context.send_viewport_cmd(ViewportCommand::OuterPosition(Pos2::new(
             x as f32,
             y.max(8.0) as f32,
         )));
-        self.set_visible(context, true);
     }
 
     fn refresh_snapshot(&mut self) {
@@ -352,28 +381,40 @@ impl TrayApp {
             self.autostart = snapshot.autostart_enabled;
             self.battery_threshold = snapshot.battery_threshold_percent;
             self.automatic_updates = snapshot.automatic_updates;
+            self.notification_sound = snapshot.notification_sound;
+            if !self.adjusting_volume {
+                self.notification_volume = snapshot.notification_volume;
+            }
             self.snapshot = Some(snapshot);
         }
     }
 
-    /// Shows pending profile switches and advances the banner's fade.
+    /// Shows pending notices and advances the banner's fade.
     /// Returns how soon the banner needs the next frame.
     fn refresh_overlay(&mut self) -> Option<Duration> {
-        while let Ok(switch) = self.switches.try_recv() {
-            let shown = self
-                .overlay
-                .as_mut()
-                .map(|overlay| overlay.show(&switch.title, &switch.detail));
-            match shown {
-                Some(Ok(())) => {}
-                Some(Err(error)) => {
-                    tracing::warn!(%error, "Could not show the profile overlay");
-                    notify_switch(&switch);
-                }
-                None => notify_switch(&switch),
-            }
+        while let Ok(notice) = self.notices.try_recv() {
+            self.present(&notice);
         }
         self.overlay.as_mut()?.tick()
+    }
+
+    /// Shows `notice` on the overlay with its chime, or as a system
+    /// notification (with the system's own sound) when there is no overlay.
+    fn present(&mut self, notice: &Notice) {
+        let Some(overlay) = self.overlay.as_mut() else {
+            notify_natively(notice);
+            return;
+        };
+        if let Err(error) = overlay.show(&notice.title, &notice.detail) {
+            tracing::warn!(%error, "Could not show the overlay");
+            notify_natively(notice);
+            return;
+        }
+        if self.notification_sound
+            && let Err(error) = overlay.chime(self.notification_volume)
+        {
+            tracing::warn!(%error, "Could not play the notification sound");
+        }
     }
 
     fn refresh_updates(&mut self) -> bool {
@@ -462,7 +503,7 @@ impl TrayApp {
                     .on_hover_text("Settings")
                     .clicked()
                 {
-                    self.view = View::Settings;
+                    self.show_view(ui.ctx(), View::Settings);
                 }
             });
         });
@@ -609,7 +650,7 @@ impl TrayApp {
         ui.horizontal(|ui| {
             ui.set_height(24.0);
             if icon_button(ui, Glyph::Back).on_hover_text("Back").clicked() {
-                self.view = View::Home;
+                self.show_view(ui.ctx(), View::Home);
             }
             ui.label(RichText::new("Settings").size(13.0).strong());
         });
@@ -629,7 +670,8 @@ impl TrayApp {
                 Err(error) => self.last_error = Some(error.to_string()),
             }
         }
-        divider(ui);
+
+        section_label(ui, "Notifications");
         let mut selected_threshold = self.battery_threshold;
         row(ui, "Low battery alert", |ui| {
             egui::ComboBox::from_id_salt("battery-threshold")
@@ -652,6 +694,59 @@ impl TrayApp {
             )
         {
             self.battery_threshold = selected_threshold;
+        }
+        divider(ui);
+        let mut toggle_sound = false;
+        row(ui, "Sound", |ui| {
+            toggle_sound = toggle_control(ui, self.notification_sound);
+        });
+        if toggle_sound {
+            let enabled = !self.notification_sound;
+            if self.send_command(
+                BridgeCommand::SetNotificationSound(enabled),
+                "Bridge settings service is unavailable",
+            ) {
+                self.notification_sound = enabled;
+            }
+        }
+        divider(ui);
+        let mut volume_released = false;
+        row(ui, "Volume", |ui| {
+            ui.add_enabled_ui(self.notification_sound, |ui| {
+                ui.label(
+                    RichText::new(format!("{}%", self.notification_volume))
+                        .size(12.0)
+                        .color(MUTED),
+                );
+                ui.spacing_mut().slider_width = 120.0;
+                ui.visuals_mut().selection.bg_fill = ACCENT;
+                let response = ui.add(
+                    egui::Slider::new(&mut self.notification_volume, 0..=100)
+                        .show_value(false)
+                        .trailing_fill(true),
+                );
+                self.adjusting_volume = response.is_pointer_button_down_on();
+                volume_released =
+                    response.drag_stopped() || (response.changed() && !self.adjusting_volume);
+            });
+        });
+        if volume_released {
+            self.send_command(
+                BridgeCommand::SetNotificationVolume(self.notification_volume),
+                "Bridge settings service is unavailable",
+            );
+        }
+        divider(ui);
+        let mut test = false;
+        row(ui, "Test notification", |ui| {
+            test = link_button(ui, "Test", ACCENT);
+        });
+        if test {
+            self.present(&Notice {
+                title: "OpenMouse Bridge".into(),
+                detail: "This is how notifications look".into(),
+            });
+            ui.ctx().request_repaint();
         }
 
         section_label(ui, "Updates");
@@ -756,9 +851,9 @@ struct BackgroundServer {
     thread: Option<thread::JoinHandle<Result<()>>>,
 }
 
-/// Where the runtime sends profile switches, and the tray app's context to
+/// Where the runtime sends notices, and the tray app's context to
 /// wake so it shows them even while its panel is hidden.
-type SwitchSink = (Sender<ProfileSwitch>, Arc<OnceLock<egui::Context>>);
+type NoticeSink = (Sender<Notice>, Arc<OnceLock<egui::Context>>);
 
 type BackgroundRuntime = (
     BackgroundServer,
@@ -768,7 +863,7 @@ type BackgroundRuntime = (
 );
 
 impl BackgroundServer {
-    fn start(switches: SwitchSink) -> Result<BackgroundRuntime> {
+    fn start(notices: NoticeSink) -> Result<BackgroundRuntime> {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (snapshot_tx, snapshots) = mpsc::sync_channel(1);
@@ -783,7 +878,7 @@ impl BackgroundServer {
                     snapshot_tx,
                     command_rx,
                     update_tx,
-                    switches,
+                    notices,
                 );
                 if let Err(error) = &outcome {
                     let _ = ready_tx.send(Err(format!("{error:#}")));
@@ -828,10 +923,10 @@ impl BackgroundServer {
 }
 
 pub fn run() -> Result<()> {
-    let (switch_tx, switches) = mpsc::channel();
+    let (notice_tx, notices) = mpsc::channel();
     let waker = Arc::new(OnceLock::new());
     let (server, snapshots, commands, updates) =
-        BackgroundServer::start((switch_tx, Arc::clone(&waker)))?;
+        BackgroundServer::start((notice_tx, Arc::clone(&waker)))?;
     let visible = env::var_os("OPENMOUSE_BRIDGE_SHOW_WINDOW").is_some();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -853,7 +948,7 @@ pub fn run() -> Result<()> {
                 snapshots,
                 commands,
                 updates,
-                switches,
+                notices,
                 &waker,
                 visible,
             )?))
@@ -870,7 +965,7 @@ fn run_server(
     snapshots: SyncSender<BridgeSnapshot>,
     mut commands: tokio_mpsc::UnboundedReceiver<BridgeCommand>,
     update_events: SyncSender<UpdateEvent>,
-    (switches, waker): SwitchSink,
+    (notices, waker): NoticeSink,
 ) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -881,11 +976,11 @@ fn run_server(
         let automatic_updates = bridge_config.automatic_updates;
         let origins = bridge_config.allowed_origins.clone();
         let service = BridgeService::new(bridge_config, path.clone());
-        let switches = std::sync::Mutex::new(switches);
-        service.on_profile_switch(move |switch| {
-            let sent = switches
+        let notices = std::sync::Mutex::new(notices);
+        service.on_notice(move |notice| {
+            let sent = notices
                 .lock()
-                .map(|sender| sender.send(switch).is_ok())
+                .map(|sender| sender.send(notice).is_ok())
                 .unwrap_or(false);
             if sent && let Some(context) = waker.get() {
                 context.request_repaint();
@@ -915,6 +1010,16 @@ fn run_server(
                 match command {
                     BridgeCommand::SetBatteryThreshold(percent) => {
                         if let Err(error) = command_service.set_battery_threshold(percent).await {
+                            tracing::error!(%error, "could not save Bridge settings");
+                        }
+                    }
+                    BridgeCommand::SetNotificationSound(enabled) => {
+                        if let Err(error) = command_service.set_notification_sound(enabled).await {
+                            tracing::error!(%error, "could not save Bridge settings");
+                        }
+                    }
+                    BridgeCommand::SetNotificationVolume(percent) => {
+                        if let Err(error) = command_service.set_notification_volume(percent).await {
                             tracing::error!(%error, "could not save Bridge settings");
                         }
                     }
@@ -1004,9 +1109,9 @@ fn configure_tray_only_application() {
 #[cfg(target_os = "windows")]
 fn configure_tray_only_application() {}
 
-fn notify_switch(switch: &ProfileSwitch) {
-    if let Err(error) = platform::notify(&switch.title, &switch.detail) {
-        tracing::warn!(%error, "Could not show the profile notification");
+fn notify_natively(notice: &Notice) {
+    if let Err(error) = platform::notify(&notice.title, &notice.detail) {
+        tracing::warn!(%error, "Could not show the notification");
     }
 }
 
