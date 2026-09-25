@@ -51,7 +51,10 @@ export const BRAND_DRIVERS = {
   },
   wlmouse: {
     vendorIds: [0x36a7],
-    classes: [client("@openmouse/protocol/drivers/wlmouse/hid", "WLMouseHidClient")],
+    classes: [
+      client("@openmouse/protocol/drivers/wlmouse/beast-x-4k-hid", "WLMouseBeastX4kHidClient"),
+      client("@openmouse/protocol/drivers/wlmouse/hid", "WLMouseHidClient"),
+    ],
   },
   lamzu: {
     vendorIds: [0x373e],
