@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::CString,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
@@ -740,12 +740,7 @@ impl HidSession {
                         second_byte = data.get(1).unwrap_or(&0),
                         "DEBUG get_input_report result"
                     );
-                    let response = if size == 0 {
-                        Vec::new()
-                    } else {
-                        data[1..size.min(buffer_len)].to_vec()
-                    };
-                    return Ok(response);
+                    return Ok(report_payload(&data, size));
                 }
                 Err(error) => last_error = Some(error),
             }
@@ -790,11 +785,7 @@ impl HidSession {
                 });
             match result {
                 Ok(size) => {
-                    let response = if size == 0 {
-                        Vec::new()
-                    } else {
-                        data[1..size].to_vec()
-                    };
+                    let response = report_payload(&data, size);
                     if open.vendor_id != RAZER_VENDOR_ID || response.iter().any(|byte| *byte != 0) {
                         return Ok(response);
                     }
@@ -816,6 +807,15 @@ impl HidSession {
             last_error.unwrap_or_else(|| "no HID path was open".to_owned())
         ))
     }
+}
+
+/// The bytes after the report-id byte of a read into `data`. hidapi on Windows
+/// adds one to the count when the first byte is 0 (an unnumbered report), so a
+/// read that fills the buffer reports one byte more than the buffer holds.
+fn report_payload(data: &[u8], size: usize) -> Vec<u8> {
+    data.get(1..size.min(data.len()))
+        .unwrap_or_default()
+        .to_vec()
 }
 
 fn grouped_device_key(vendor_id: u16, product_id: u16, serial: Option<&str>) -> Vec<u8> {
@@ -1143,16 +1143,22 @@ pub async fn serve(mut socket: WebSocket) {
                         continue;
                     }
                 };
+                let request_id = request.id;
+                let command = request.command.kind();
                 let worker = Arc::clone(&session);
                 let reply = match tokio::task::spawn_blocking(move || {
+                    // A panicked command is answered below with its own error. Left
+                    // poisoned, the lock would fail every later command, `list` too.
                     worker
                         .lock()
-                        .map_err(|_| "native HID session lock was poisoned".to_owned())
-                        .map(|mut session| session.execute(request))
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .execute(request)
                 }).await {
-                    Ok(Ok(reply)) => reply,
-                    Ok(Err(error)) => Reply::error(0, error),
-                    Err(error) => Reply::error(0, format!("native HID worker stopped: {error}")),
+                    Ok(reply) => reply,
+                    Err(error) => {
+                        tracing::error!(session_id, request_id, command, %error, "HID command panicked");
+                        Reply::error(request_id, format!("native HID worker stopped: {error}"))
+                    }
                 };
                 if send_json(&mut socket, &reply).await.is_err() { break; }
             }
@@ -1244,6 +1250,18 @@ mod tests {
             grouped_device_key(LOGITECH_VENDOR_ID, 0xc54d, None),
             grouped_device_key(LOGITECH_VENDOR_ID, 0xc548, None)
         );
+    }
+
+    #[test]
+    fn report_payload_never_reads_past_the_buffer() {
+        // A full unnumbered Razer read: hidapi on Windows reports 92 bytes.
+        let full = [0; RAZER_FEATURE_BUFFER_LEN];
+        assert_eq!(
+            report_payload(&full, RAZER_FEATURE_BUFFER_LEN + 1).len(),
+            RAZER_FEATURE_BUFFER_LEN - 1
+        );
+        assert_eq!(report_payload(&[5, 1, 2, 3], 3), vec![1, 2]);
+        assert!(report_payload(&full, 0).is_empty());
     }
 
     #[test]
