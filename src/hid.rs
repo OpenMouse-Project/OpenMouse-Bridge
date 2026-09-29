@@ -21,6 +21,7 @@ const READ_TIMEOUT_MS: i32 = 100;
 /// with the device lock released, so a write never queues behind a read.
 #[cfg(not(target_os = "windows"))]
 const SHARED_READ_IDLE: std::time::Duration = std::time::Duration::from_millis(2);
+const MICROSOFT_VENDOR_ID: u16 = 0x045E;
 const RAZER_VENDOR_ID: u16 = 0x1532;
 const RAZER_FEATURE_BUFFER_LEN: usize = 91;
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -69,6 +70,11 @@ enum Command {
         #[serde(rename = "reportId")]
         report_id: u8,
     },
+    ReceiveInputReport {
+        device: String,
+        #[serde(rename = "reportId")]
+        report_id: u8,
+    },
 }
 
 impl Command {
@@ -82,6 +88,7 @@ impl Command {
             Self::SendReport { .. } => "sendReport",
             Self::SendFeatureReport { .. } => "sendFeatureReport",
             Self::ReceiveFeatureReport { .. } => "receiveFeatureReport",
+            Self::ReceiveInputReport { .. } => "receiveInputReport",
         }
     }
 }
@@ -176,6 +183,16 @@ impl ReportLayout {
     fn feature_buffer_len(&self, report_id: u8) -> Result<usize, String> {
         let bits = self.feature_bits.get(&report_id).copied().ok_or_else(|| {
             format!("feature report {report_id} is not declared by this interface")
+        })?;
+        Ok(bits
+            .div_ceil(8)
+            .saturating_add(1)
+            .clamp(2, MAX_REPORT_BYTES))
+    }
+
+    fn input_buffer_len_for(&self, report_id: u8) -> Result<usize, String> {
+        let bits = self.input_bits.get(&report_id).copied().ok_or_else(|| {
+            format!("input report {report_id} is not declared by this interface")
         })?;
         Ok(bits
             .div_ceil(8)
@@ -341,6 +358,12 @@ impl HidSession {
                 .map(|()| Reply::ok(id)),
             Command::ReceiveFeatureReport { device, report_id } => self
                 .receive_feature_report(&device, report_id)
+                .map(|data| Reply {
+                    data: Some(data),
+                    ..Reply::ok(id)
+                }),
+            Command::ReceiveInputReport { device, report_id } => self
+                .receive_input_report(&device, report_id)
                 .map(|data| Reply {
                     data: Some(data),
                     ..Reply::ok(id)
@@ -682,6 +705,62 @@ impl HidSession {
         }
     }
 
+    fn receive_input_report(&self, key: &str, report_id: u8) -> Result<Vec<u8>, String> {
+        let open = self
+            .open_devices
+            .get(key)
+            .ok_or_else(|| "the HID interface is not open".to_owned())?;
+        let mut available = false;
+        let mut last_error = None;
+        for path in &open.paths {
+            let buffer_len = match path.layout.input_buffer_len_for(report_id) {
+                Ok(length) => length,
+                Err(_) if open.vendor_id == MICROSOFT_VENDOR_ID => 73,
+                Err(_) => continue,
+            };
+            available = true;
+            let mut data = vec![0; buffer_len];
+            data[0] = report_id;
+            let result = path
+                .device
+                .lock()
+                .map_err(|_| "native HID lock was poisoned".to_owned())
+                .and_then(|device| {
+                    device
+                        .get_input_report(&mut data)
+                        .map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(size) => {
+                    tracing::info!(
+                        session_id = self.session_id,
+                        report_id,
+                        size,
+                        first_byte = data[0],
+                        second_byte = data.get(1).unwrap_or(&0),
+                        "DEBUG get_input_report result"
+                    );
+                    let response = if size == 0 {
+                        Vec::new()
+                    } else {
+                        data[1..size.min(buffer_len)].to_vec()
+                    };
+                    return Ok(response);
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        if !available {
+            return Err(format!(
+                "input report {report_id} is not declared by this interface"
+            ));
+        }
+        Err(format!(
+            "could not receive input report {report_id}: {}",
+            last_error.unwrap_or_else(|| "no HID path was open".to_owned())
+        ))
+    }
+
     fn receive_feature_report(&self, key: &str, report_id: u8) -> Result<Vec<u8>, String> {
         let open = self
             .open_devices
@@ -694,6 +773,7 @@ impl HidSession {
             let buffer_len = match path.layout.feature_buffer_len(report_id) {
                 Ok(length) => length,
                 Err(_) if open.vendor_id == RAZER_VENDOR_ID => RAZER_FEATURE_BUFFER_LEN,
+                Err(_) if open.vendor_id == MICROSOFT_VENDOR_ID => 64,
                 Err(_) => continue,
             };
             available = true;
