@@ -4,7 +4,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         Arc, OnceLock,
-        atomic::AtomicBool,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender, SyncSender},
     },
     thread,
@@ -29,7 +29,9 @@ use tokio::{
     sync::{mpsc as tokio_mpsc, oneshot},
 };
 use tray_icon::{
-    Icon, MouseButton, MouseButtonState, Rect as TrayRect, TrayIcon, TrayIconBuilder, TrayIconEvent,
+    Icon, MouseButton, MouseButtonState, Rect as TrayRect, TrayIcon, TrayIconBuilder,
+    TrayIconEvent,
+    menu::{Menu, MenuEvent, MenuItem},
 };
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
@@ -187,6 +189,8 @@ enum UpdateUiAction {
 #[derive(Clone, Copy)]
 enum TrayAction {
     ToggleWindow { rect: TrayRect },
+    Restart,
+    Exit,
 }
 
 struct TrayState {
@@ -196,14 +200,27 @@ struct TrayState {
 
 impl TrayState {
     fn new(context: &egui::Context) -> Result<Self> {
+        let menu = Menu::new();
+        let restart_item = MenuItem::new("Restart", true, None);
+        let exit_item = MenuItem::new("Exit", true, None);
+        menu.append(&restart_item)
+            .context("could not add Restart to the tray menu")?;
+        menu.append(&exit_item)
+            .context("could not add Exit to the tray menu")?;
+        let restart_id = restart_item.id().clone();
+        let exit_id = exit_item.id().clone();
+
         let icon = TrayIconBuilder::new()
             .with_tooltip("OpenMouse Bridge")
             .with_icon(tray_icon().context("could not create the tray icon image")?)
+            .with_menu(Box::new(menu))
+            .with_menu_on_left_click(false)
             .build()
             .context("could not create the system tray icon")?;
 
         let (event_tx, events) = mpsc::channel();
-        let repaint = context.clone();
+        let tray_event_tx = event_tx.clone();
+        let tray_repaint = context.clone();
         TrayIconEvent::set_event_handler(Some(move |event| {
             tracing::debug!(?event, "received tray event");
             if let TrayIconEvent::Click {
@@ -213,9 +230,23 @@ impl TrayState {
                 ..
             } = event
             {
-                let _ = event_tx.send(TrayAction::ToggleWindow { rect });
-                repaint.request_repaint();
+                let _ = tray_event_tx.send(TrayAction::ToggleWindow { rect });
+                tray_repaint.request_repaint();
             }
+        }));
+
+        let menu_repaint = context.clone();
+        MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+            tracing::debug!(?event, "received tray menu event");
+            let action = if event.id == restart_id {
+                TrayAction::Restart
+            } else if event.id == exit_id {
+                TrayAction::Exit
+            } else {
+                return;
+            };
+            let _ = event_tx.send(action);
+            menu_repaint.request_repaint();
         }));
 
         Ok(Self {
@@ -224,12 +255,8 @@ impl TrayState {
         })
     }
 
-    fn toggle_requested(&self) -> Option<TrayRect> {
-        let mut request = None;
-        while let Ok(TrayAction::ToggleWindow { rect }) = self.events.try_recv() {
-            request = if request.is_some() { None } else { Some(rect) };
-        }
-        request
+    fn next_action(&self) -> Option<TrayAction> {
+        self.events.try_recv().ok()
     }
 }
 
@@ -247,6 +274,7 @@ struct TrayApp {
     visibility_initialized: bool,
     panel_had_focus: bool,
     exit_requested: bool,
+    restart_requested: Arc<AtomicBool>,
     autostart: bool,
     battery_threshold: u8,
     automatic_updates: bool,
@@ -268,6 +296,7 @@ impl TrayApp {
         updates: Receiver<UpdateEvent>,
         notices: Receiver<Notice>,
         waker: &OnceLock<egui::Context>,
+        restart_requested: Arc<AtomicBool>,
         visible: bool,
     ) -> Result<Self> {
         configure_tray_only_application();
@@ -325,6 +354,7 @@ impl TrayApp {
             visibility_initialized: false,
             panel_had_focus: false,
             exit_requested: false,
+            restart_requested,
             autostart: platform::autostart_enabled(),
             battery_threshold: 20,
             automatic_updates: false,
@@ -345,6 +375,11 @@ impl TrayApp {
             self.show_view(context, View::Home);
             context.send_viewport_cmd(ViewportCommand::Focus);
         }
+    }
+
+    fn request_exit(&mut self, context: &egui::Context) {
+        self.exit_requested = true;
+        context.send_viewport_cmd(ViewportCommand::Close);
     }
 
     fn show_near_tray(&mut self, context: &egui::Context, rect: TrayRect) {
@@ -446,8 +481,10 @@ impl eframe::App for TrayApp {
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.refresh_snapshot();
         if self.refresh_updates() {
-            self.exit_requested = true;
-            context.send_viewport_cmd(ViewportCommand::Close);
+            // The updater has already spawned its own post-exit relaunch helper.
+            self.restart_requested.store(false, Ordering::Relaxed);
+            self.request_exit(context);
+            return;
         }
         if !self.visibility_initialized {
             self.visibility_initialized = true;
@@ -456,12 +493,25 @@ impl eframe::App for TrayApp {
                 context.send_viewport_cmd(ViewportCommand::Focus);
             }
         }
-        if let Some(rect) = self.tray.toggle_requested() {
-            tracing::debug!(?rect, visible = self.visible, "handling tray toggle");
-            if self.visible {
-                self.set_visible(context, false);
-            } else {
-                self.show_near_tray(context, rect);
+        while let Some(action) = self.tray.next_action() {
+            match action {
+                TrayAction::ToggleWindow { rect } => {
+                    tracing::debug!(?rect, visible = self.visible, "handling tray toggle");
+                    if self.visible {
+                        self.set_visible(context, false);
+                    } else {
+                        self.show_near_tray(context, rect);
+                    }
+                }
+                TrayAction::Restart => {
+                    self.restart_requested.store(true, Ordering::Relaxed);
+                    self.request_exit(context);
+                    break;
+                }
+                TrayAction::Exit => {
+                    self.request_exit(context);
+                    break;
+                }
             }
         }
         if self.visible {
@@ -829,8 +879,7 @@ impl TrayApp {
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if link_button(ui, "Quit", DANGER) {
-                        self.exit_requested = true;
-                        ui.ctx().send_viewport_cmd(ViewportCommand::Close);
+                        self.request_exit(ui.ctx());
                     }
                 });
             });
@@ -933,6 +982,8 @@ pub fn run() -> Result<()> {
     let waker = Arc::new(OnceLock::new());
     let (server, snapshots, commands, updates) =
         BackgroundServer::start((notice_tx, Arc::clone(&waker)))?;
+    let restart_requested = Arc::new(AtomicBool::new(false));
+    let app_restart_requested = Arc::clone(&restart_requested);
     let visible = env::var_os("OPENMOUSE_BRIDGE_SHOW_WINDOW").is_some();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -956,13 +1007,31 @@ pub fn run() -> Result<()> {
                 updates,
                 notices,
                 &waker,
+                app_restart_requested,
                 visible,
             )?))
         }),
     )
     .map_err(|error| anyhow!(error.to_string()));
     let server_result = server.stop();
-    tray_result.and(server_result)
+    tray_result.and(server_result)?;
+
+    if restart_requested.load(Ordering::Relaxed) {
+        restart_bridge()?;
+    }
+    Ok(())
+}
+
+fn restart_bridge() -> Result<()> {
+    let executable = env::current_exe().context("could not locate the Bridge executable")?;
+    let working_directory = executable
+        .parent()
+        .context("Bridge executable has no parent directory")?;
+    std::process::Command::new(&executable)
+        .current_dir(working_directory)
+        .spawn()
+        .context("could not restart OpenMouse Bridge")?;
+    Ok(())
 }
 
 fn run_server(
