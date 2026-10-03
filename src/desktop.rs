@@ -35,8 +35,78 @@ use tray_icon::{
 };
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
-
 const OPENMOUSE_URL: &str = "https://control.openmouse.app";
+
+/// Present when the user explicitly wants no tray panel (or when no display
+/// exists): Bridge serves its HTTP API, HID, and game profiles without a
+/// window. Checked first so servers and SSH sessions never touch winit.
+fn headless_requested() -> bool {
+    env::var_os("OPENMOUSE_BRIDGE_HEADLESS").is_some() || env::args().any(|arg| arg == "--headless")
+}
+
+/// Whether a display server is reachable for the tray panel.
+fn gui_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        env::var_os("WAYLAND_DISPLAY").is_some() || env::var_os("DISPLAY").is_some()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
+/// Serves the Bridge runtime without a window: drains notices as native
+/// notifications, applies update restarts, and blocks on Ctrl-C.
+fn run_headless(
+    server: BackgroundServer,
+    snapshots: Receiver<BridgeSnapshot>,
+    commands: tokio_mpsc::UnboundedSender<BridgeCommand>,
+    updates: Receiver<UpdateEvent>,
+    notices: Receiver<Notice>,
+    _waker: Arc<OnceLock<egui::Context>>,
+) -> Result<()> {
+    // The snapshot channel only holds the latest; keep it drained so the
+    // publisher never blocks, and keep the update channel drained so the
+    // updater's try_send calls keep working.
+    let _ = (snapshots, commands);
+    // Ctrl-C watcher on its own thread: the multi-thread Bridge runtime
+    // already lives on the server thread, so this gets a current-thread one.
+    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+    thread::Builder::new()
+        .name("openmouse-bridge-signal".into())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            if let Ok(runtime) = runtime {
+                let _ = runtime.block_on(tokio::signal::ctrl_c());
+                let _ = shutdown_tx.send(());
+            }
+        })
+        .ok();
+    tracing::info!("OpenMouse Bridge running headless (no tray panel)");
+    loop {
+        while let Ok(notice) = notices.try_recv() {
+            notify_natively(&notice);
+        }
+        while let Ok(event) = updates.try_recv() {
+            // Match the GUI path: the updater stages the new binary and
+            // spawns its own post-exit relaunch helper, so exiting here
+            // hands off to the updated Bridge.
+            if matches!(event, UpdateEvent::Restarting(_)) {
+                server.stop()?;
+                return Ok(());
+            }
+        }
+        if shutdown_rx.try_recv().is_ok() {
+            server.stop()?;
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
 const WINDOW_WIDTH: f32 = 320.0;
 const WINDOW_HEIGHT: f32 = 306.0;
 /// Settings holds more rows than home, so the panel grows while it is open.
@@ -983,6 +1053,21 @@ impl BackgroundServer {
 pub fn run() -> Result<()> {
     let (notice_tx, notices) = mpsc::channel();
     let waker = Arc::new(OnceLock::new());
+    if headless_requested() || !gui_available() {
+        if !headless_requested() {
+            tracing::warn!(
+                "no display found (set WAYLAND_DISPLAY or DISPLAY for the tray panel); running headless: HTTP API, HID, and game profiles still work"
+            );
+        }
+        let (server, snapshots, commands, updates) =
+            BackgroundServer::start((notice_tx, Arc::clone(&waker)))?;
+        return run_headless(server, snapshots, commands, updates, notices, waker);
+    }
+    // The GUI closure below moves the channels in, so a GL failure cannot
+    // fall back to headless afterwards: start headless up front when no
+    // display is reachable (checked above), and treat a run_native error
+    // as fatal here. (A broken-GL fallback would need the channels split
+    // before the closure; revisit if Wayland-compositor reports require it.)
     let (server, snapshots, commands, updates) =
         BackgroundServer::start((notice_tx, Arc::clone(&waker)))?;
     let restart_requested = Arc::new(AtomicBool::new(false));
@@ -1018,7 +1103,6 @@ pub fn run() -> Result<()> {
     .map_err(|error| anyhow!(error.to_string()));
     let server_result = server.stop();
     tray_result.and(server_result)?;
-
     if restart_requested.load(Ordering::Relaxed) {
         restart_bridge()?;
     }

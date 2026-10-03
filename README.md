@@ -44,6 +44,9 @@ GNOME shows nothing without an AppIndicator extension; the panel still opens
 with `OPENMOUSE_BRIDGE_SHOW_WINDOW=1`), the overlay banner and foreground
 detection need X11 (on Wayland the banner falls back to a system notification
 and `foreground` is always false), and the chime needs `paplay` or `aplay`.
+With no `WAYLAND_DISPLAY` or `DISPLAY` (servers, SSH sessions), or with
+`OPENMOUSE_BRIDGE_HEADLESS=1` / `--headless`, Bridge skips the tray panel
+and serves its HTTP API, HID, and game profiles headless (Ctrl-C stops it).
 Startup at login writes `~/.config/autostart/io.openmouse.bridge.desktop`.
 
 Bridge creates `config.json` in the operating system's per-user application
