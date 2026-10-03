@@ -1,6 +1,6 @@
 [package]
 name = "openmouse-bridge"
-version = "1.0.0-beta.13"
+version = "1.0.0-beta.14"
 edition = "2024"
 description = "Local native HID and desktop companion for the OpenMouse control panel"
 license = "MIT"

@@ -328,6 +328,9 @@ while kill -0 "$pid" 2>/dev/null; do sleep 1; done
 cp -f "$stage/$binary" "$destination/$binary.update" || exit 1
 chmod +x "$destination/$binary.update" || exit 1
 mv -f "$destination/$binary.update" "$destination/$binary" || exit 1
+if [ -f "$stage/openmouse-app-icon.png" ]; then
+  cp -f "$stage/openmouse-app-icon.png" "$destination/openmouse-app-icon.png" || exit 1
+fi
 if [ -d "$stage/native-hid" ]; then
   rm -rf "$destination/native-hid.update"
   cp -R "$stage/native-hid" "$destination/native-hid.update" || exit 1
