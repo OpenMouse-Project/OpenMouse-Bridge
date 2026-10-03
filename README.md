@@ -36,7 +36,7 @@ On Linux, install the system libraries for the tray icon and window first
 (Ubuntu 24.04):
 
 ```sh
-sudo apt-get update && sudo apt-get install -y libudev-dev libgtk-3-dev libayatana-appindicator3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libgl1-mesa-dev libxdo-dev pkg-config
+sudo apt-get update && sudo apt-get install -y libudev-dev libgtk-3-dev libayatana-appindicator3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libgl1-mesa-dev pkg-config
 ```
 
 Linux notes: the tray icon needs a StatusNotifier/AppIndicator host (stock

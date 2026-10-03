@@ -1,6 +1,6 @@
 [package]
 name = "openmouse-bridge"
-version = "1.0.0-beta.10"
+version = "1.0.0-beta.11"
 edition = "2024"
 description = "Local native HID and desktop companion for the OpenMouse control panel"
 license = "MIT"
@@ -35,7 +35,12 @@ eframe = { version = "0.36.1", default-features = false, features = ["accesskit"
 epaint_default_fonts = "0.36.1"
 skrifa = { version = "0.44", default-features = false, features = ["std"] }
 vello_cpu = { version = "0.1", default-features = false, features = ["std", "u8_pipeline"] }
-tray-icon = "0.24.2"
+# No libxdo: tray-icon's default features link libxdo (via muda) for the
+# predefined Copy/Cut/Paste/SelectAll menu items, which Bridge never uses
+# (desktop.rs only builds plain MenuItems). The gtk feature alone keeps the
+# AppIndicator menu working and removes the libxdo.so.3 runtime requirement,
+# which Arch/CachyOS cannot satisfy (their xdotool ships libxdo.so.4).
+tray-icon = { version = "0.24.2", default-features = false, features = ["gtk"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # X11 overlay banner and foreground-window lookup. Pure Rust; no system
