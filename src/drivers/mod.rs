@@ -18,8 +18,8 @@ use anyhow::Result;
 
 use crate::config::ApplicationProfile;
 
-mod native_hid;
 pub mod delux;
+mod native_hid;
 pub mod pulsar;
 
 pub use native_hid::NativeBattery;

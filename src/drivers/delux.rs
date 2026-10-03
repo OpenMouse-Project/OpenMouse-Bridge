@@ -130,10 +130,12 @@ impl Delux1d57Device {
             250 => 0x04,
             500 => 0x02,
             1000 => 0x01,
-            _ => bail!("{rate_hz} Hz is not supported for Delux M800 Mini (supports 125, 250, 500, 1000 Hz)"),
+            _ => bail!(
+                "{rate_hz} Hz is not supported for Delux M800 Mini (supports 125, 250, 500, 1000 Hz)"
+            ),
         };
 
-        let checksum = (0xff - rate_byte) & 0xff;
+        let checksum = 0xff - rate_byte;
         let payload = [
             POLLING_REPORT_ID_1D57,
             0x09,
@@ -206,7 +208,9 @@ impl Delux248aDevice {
             250 => 0x04,
             500 => 0x02,
             1000 => 0x01,
-            _ => bail!("{rate_hz} Hz is not supported for Delux M800 Pro (supports 125, 250, 500, 1000 Hz)"),
+            _ => bail!(
+                "{rate_hz} Hz is not supported for Delux M800 Pro (supports 125, 250, 500, 1000 Hz)"
+            ),
         };
 
         let mut payload = [0u8; 33];
@@ -323,8 +327,8 @@ fn build_1d57_dpi_report(active_dpi: u32, is_wired: bool) -> Vec<u8> {
     buffer[49] = 0x02;
 
     let mut sum: u16 = 0;
-    for i in 3..=49 {
-        sum = sum.wrapping_add(buffer[i] as u16);
+    for byte in buffer.iter().take(50).skip(3) {
+        sum = sum.wrapping_add(u16::from(*byte));
     }
     buffer[50] = ((sum >> 8) & 0xff) as u8;
     buffer[51] = (sum & 0xff) as u8;

@@ -191,9 +191,10 @@ impl ReportLayout {
     }
 
     fn input_buffer_len_for(&self, report_id: u8) -> Result<usize, String> {
-        let bits = self.input_bits.get(&report_id).copied().ok_or_else(|| {
-            format!("input report {report_id} is not declared by this interface")
-        })?;
+        let bits =
+            self.input_bits.get(&report_id).copied().ok_or_else(|| {
+                format!("input report {report_id} is not declared by this interface")
+            })?;
         Ok(bits
             .div_ceil(8)
             .saturating_add(1)
