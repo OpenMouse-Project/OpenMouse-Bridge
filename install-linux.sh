@@ -327,14 +327,33 @@ main() {
         unzip -oq "$tmp/$ASSET" -d "$INSTALL_DIR"
         chmod +x "$binary"
     fi
-    if [ ! -w "$BIN_LINK_DIR" ] && [ ! -L "$link" ]; then
+    # ~/.local/bin may be root-owned from an older install that used sudo
+    # for it; reclaim with sudo and hand ownership back so reruns work.
+    # (The old `[ ! -w dir ] && [ ! -L link ]` test took the non-sudo path
+    # whenever the link already existed, failing on a root-owned dir.)
+    local link_sudo
+    link_sudo=""
+    if { [ -e "$BIN_LINK_DIR" ] && [ ! -w "$BIN_LINK_DIR" ]; } || { [ ! -e "$BIN_LINK_DIR" ] && [ ! -w "$(dirname "$BIN_LINK_DIR")" ]; }; then
         [ "$sudo" = "none" ] && die "cannot write to $BIN_LINK_DIR; rerun with sudo"
-        $sudo mkdir -p "$BIN_LINK_DIR"
-        $sudo ln -sf "$binary" "$link"
+        link_sudo="$sudo"
+    fi
+    if [ -n "$link_sudo" ]; then
+        # shellcheck disable=SC2086
+        $link_sudo mkdir -p "$BIN_LINK_DIR"
+        # shellcheck disable=SC2086
+        $link_sudo ln -sf "$binary" "$link"
     else
         mkdir -p "$BIN_LINK_DIR"
         ln -sf "$binary" "$link"
     fi
+    case "$BIN_LINK_DIR" in
+        "$HOME"/*)
+            if [ -n "$link_sudo" ]; then
+                # shellcheck disable=SC2086
+                $link_sudo chown -R "$(id -u):$(id -g)" "$BIN_LINK_DIR" 2>/dev/null || true
+            fi
+            ;;
+    esac
     log "Binary ready: $link"
 
     # 4. Confirm the loader resolves everything (catches distro renames
