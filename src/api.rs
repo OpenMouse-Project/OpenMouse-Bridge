@@ -12,6 +12,7 @@ use tower_http::{cors::CorsLayer, set_header::SetResponseHeaderLayer, trace::Tra
 
 use crate::{
     config::{ApplicationProfile, GameConfig},
+    drivers, platform,
     service::{BatteryReading, BridgeService},
 };
 
@@ -20,11 +21,24 @@ use crate::{
 struct ApiResult {
     ok: bool,
 }
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AutostartPayload {
+    enabled: bool,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProfilesPayload {
     profiles: Vec<ApplicationProfile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeSettingsPayload {
+    brand: String,
+    dpi: Option<u32>,
+    polling_rate_hz: Option<u32>,
 }
 
 pub fn router(service: BridgeService, origins: &[String]) -> Router {
@@ -51,7 +65,9 @@ pub fn router(service: BridgeService, origins: &[String]) -> Router {
         .route("/v1/running-applications", get(running_applications))
         .route("/v1/profiles", get(profiles).put(replace_profiles))
         .route("/v1/default-profile", put(set_default_profile))
+        .route("/v1/native/settings", put(apply_native_settings))
         .route("/v1/battery", put(record_battery))
+        .route("/v1/autostart", put(set_autostart))
         .merge(hid_route)
         .layer(SetResponseHeaderLayer::if_not_present(
             axum::http::HeaderName::from_static("access-control-allow-private-network"),
@@ -155,6 +171,44 @@ async fn record_battery(
         .record_battery(reading)
         .await
         .map_err(internal_error)?;
+    Ok(Json(ApiResult { ok: true }))
+}
+
+async fn set_autostart(
+    Json(payload): Json<AutostartPayload>,
+) -> Result<Json<ApiResult>, (StatusCode, String)> {
+    platform::set_autostart(payload.enabled).map_err(internal_error)?;
+    Ok(Json(ApiResult { ok: true }))
+}
+
+async fn apply_native_settings(
+    Json(payload): Json<NativeSettingsPayload>,
+) -> Result<Json<ApiResult>, (StatusCode, String)> {
+    if payload.dpi.is_none() && payload.polling_rate_hz.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "at least one of dpi or pollingRateHz is required".into(),
+        ));
+    }
+
+    let NativeSettingsPayload {
+        brand,
+        dpi,
+        polling_rate_hz,
+    } = payload;
+    let error_brand = brand.clone();
+    let applied =
+        tokio::task::spawn_blocking(move || drivers::apply_settings(&brand, dpi, polling_rate_hz))
+            .await
+            .map_err(|error| internal_error(anyhow::anyhow!(error)))?
+            .map_err(internal_error)?;
+
+    if !applied {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("no native driver is registered for {error_brand}"),
+        ));
+    }
     Ok(Json(ApiResult { ok: true }))
 }
 
