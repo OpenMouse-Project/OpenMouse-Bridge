@@ -13,6 +13,9 @@ mod platform;
 #[cfg(target_os = "windows")]
 #[path = "windows.rs"]
 mod platform;
+#[cfg(target_os = "linux")]
+#[path = "linux.rs"]
+mod platform;
 
 use std::time::{Duration, Instant};
 

@@ -15,7 +15,10 @@ pub struct ApplicationInfo {
     pub icon_id: String,
 }
 
-#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "windows", target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 fn icon_id(path: &str) -> String {
     let mut hasher = DefaultHasher::new();
     path.to_ascii_lowercase().hash(&mut hasher);
@@ -287,7 +290,126 @@ mod imp {
     }
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(target_os = "linux")]
+mod imp {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
+
+    use super::{ApplicationInfo, icon_id};
+
+    /// Lists one entry per running process: `sysinfo` sees every process, but
+    /// X11 only knows mapped windows, and matching the two for every process
+    /// each poll costs a round trip per PID. Like macOS, only the foreground
+    /// entry is matched to a window; on Wayland (no X connection) every
+    /// entry reports `foreground: false`, so game-profile fallback still
+    /// works but focus matching does not.
+    pub fn visible_applications() -> Vec<ApplicationInfo> {
+        let foreground_pid = active_window_pid();
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
+        );
+        let mut applications = BTreeMap::new();
+        for process in system.processes().values() {
+            let Some(path) = process
+                .exe()
+                .map(|path| path.to_string_lossy().into_owned())
+            else {
+                continue;
+            };
+            let executable = Path::new(&path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if executable.is_empty() {
+                continue;
+            }
+            let name = process_name(process);
+            if name.is_empty() {
+                continue;
+            }
+            let foreground = foreground_pid.is_some_and(|pid| Pid::from_u32(pid) == process.pid());
+            let key = path.to_lowercase();
+            applications
+                .entry(key)
+                .and_modify(|application: &mut ApplicationInfo| {
+                    application.foreground |= foreground;
+                })
+                .or_insert(ApplicationInfo {
+                    name,
+                    executable,
+                    icon_id: icon_id(&path),
+                    path,
+                    foreground,
+                });
+        }
+        applications.into_values().collect()
+    }
+
+    fn process_name(process: &sysinfo::Process) -> String {
+        let name = process.name().to_string_lossy().into_owned();
+        if name.is_empty() {
+            return String::new();
+        }
+        // sysinfo truncates process names to 15 bytes on Linux (comm); prefer
+        // the executable stem when it carries more of the name.
+        if name.len() < 15 {
+            return name;
+        }
+        process
+            .exe()
+            .and_then(|path| path.file_stem())
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or(name)
+    }
+
+    pub fn application_icon(_path: &str) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// The PID owning the active X11 window, via `_NET_ACTIVE_WINDOW` and
+    /// `_NET_WM_PID`. `None` without an X connection (e.g. on Wayland) or
+    /// when the window manager reports no active window.
+    fn active_window_pid() -> Option<u32> {
+        let (conn, screen) = x11rb::connect(None).ok()?;
+        let root = conn.setup().roots[screen].root;
+        let active_window = intern(&conn, b"_NET_ACTIVE_WINDOW")?;
+        let pid_atom = intern(&conn, b"_NET_WM_PID")?;
+        let reply = conn
+            .get_property(false, root, active_window, AtomEnum::WINDOW, 0, 1)
+            .ok()?
+            .reply()
+            .ok()?;
+        let window = reply.value32()?.next()?;
+        if window == 0 {
+            return None;
+        }
+        let reply = conn
+            .get_property(false, window, pid_atom, AtomEnum::CARDINAL, 0, 1)
+            .ok()?
+            .reply()
+            .ok()?;
+        let pid = reply.value32()?.next()?;
+        (pid != 0).then_some(pid)
+    }
+
+    fn intern(conn: &x11rb::rust_connection::RustConnection, name: &[u8]) -> Option<u32> {
+        conn.intern_atom(false, name)
+            .ok()?
+            .reply()
+            .ok()
+            .map(|reply| reply.atom)
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 mod imp {
     use super::ApplicationInfo;
 

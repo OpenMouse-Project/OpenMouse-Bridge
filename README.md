@@ -1,14 +1,14 @@
 # OpenMouse Bridge
 
 OpenMouse Bridge is a small per-user companion process for the OpenMouse web
-control panel on Windows and macOS. Its core and loopback protocol remain
+control panel on Windows, macOS, and Linux. Its core and loopback protocol remain
 portable so additional desktop adapters do not require changes to the web app.
 
 The initial service provides:
 
 - a compact tray panel for status, startup, battery, and update controls;
 - process-based detection for configured game executables;
-- discovery of visible Windows and macOS applications and the foreground application;
+- discovery of visible applications and the foreground application (on Linux, foreground detection needs X11; on Wayland every entry reports `foreground: false`);
 - persistent application profiles tied to a specific mouse;
 - low-battery notifications with a configurable threshold and cooldown, from
   battery levels Bridge reads itself every five minutes for the mice in saved
@@ -31,6 +31,20 @@ Install stable Rust, then run:
 ```sh
 cargo run
 ```
+
+On Linux, install the system libraries for the tray icon and window first
+(Ubuntu 24.04):
+
+```sh
+sudo apt-get update && sudo apt-get install -y libudev-dev libgtk-3-dev libayatana-appindicator3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libgl1-mesa-dev pkg-config
+```
+
+Linux notes: the tray icon needs a StatusNotifier/AppIndicator host (stock
+GNOME shows nothing without an AppIndicator extension; the panel still opens
+with `OPENMOUSE_BRIDGE_SHOW_WINDOW=1`), the overlay banner and foreground
+detection need X11 (on Wayland the banner falls back to a system notification
+and `foreground` is always false), and the chime needs `paplay` or `aplay`.
+Startup at login writes `~/.config/autostart/io.openmouse.bridge.desktop`.
 
 Bridge creates `config.json` in the operating system's per-user application
 configuration directory. At startup it refreshes the tracked-game catalog from
@@ -129,16 +143,30 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-## Automated builds
+## Install on Linux
 
-GitHub Actions tests and lints the service on Windows, macOS, and Linux. Every
-successful push to `main` updates the rolling `dev-build` prerelease with a
+One-line install from the latest stable release (detects missing system
+libraries, installs them with sudo, verifies the checksum, installs a hidraw
+`udev` rule so the mouse is reachable without root, and registers autostart):
+
+```sh
+curl -fsSL https://openmouse.app/bridge/download/install-linux.sh | bash
+```
+
+Flags: `--tag v1.0.0` (pin a release), `--dir DIR` (install location,
+default `~/.local/share/openmouse-bridge`), `--system` (system-wide install
+to `/opt/openmouse-bridge` with a `/usr/local/bin` symlink), `--no-deps`
+(only report missing packages), `--no-udev` / `--no-autostart` (skip those
+steps), `--start` (launch after installing), `--uninstall` (remove),
+`--yes` (non-interactive package install).
+
+Every successful push to `main` updates the rolling `dev-build` prerelease with a
 Windows x64 zip and checksum. The same files remain available as workflow
 artifacts for individual runs.
 
 Pushing a stable version tag such as `v1.0.0` publishes it as the latest GitHub
-release with generated changelog notes, Windows x64 and universal macOS
-archives, and SHA-256 checksums. Windows signing is automatic when the
+release with generated changelog notes, Windows x64, universal macOS, and Linux
+x64 archives, and SHA-256 checksums. Windows signing is automatic when the
 repository has `WINDOWS_CERTIFICATE_BASE64` and
 `WINDOWS_CERTIFICATE_PASSWORD` secrets; unsigned development builds continue
 to work without those secrets.

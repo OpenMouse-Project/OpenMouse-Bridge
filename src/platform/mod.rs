@@ -8,7 +8,10 @@ mod windows;
 #[cfg(target_os = "macos")]
 mod macos;
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(target_os = "linux")]
+mod linux;
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 mod portable;
 
 #[cfg(target_os = "windows")]
@@ -17,7 +20,10 @@ pub use windows::{autostart_enabled, linux_distribution, platform_name, set_auto
 #[cfg(target_os = "macos")]
 pub use macos::{autostart_enabled, linux_distribution, platform_name, set_autostart};
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(target_os = "linux")]
+pub use linux::{autostart_enabled, linux_distribution, platform_name, set_autostart};
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 pub use portable::{autostart_enabled, linux_distribution, platform_name, set_autostart};
 
 pub fn notify(summary: &str, body: &str) -> Result<()> {

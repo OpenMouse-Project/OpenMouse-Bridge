@@ -368,7 +368,7 @@ impl TrayApp {
         let x = (rect.position.x + f64::from(rect.size.width)) / scale - f64::from(WINDOW_WIDTH);
         #[cfg(target_os = "macos")]
         let y = (rect.position.y + f64::from(rect.size.height)) / scale + 8.0;
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         let y = rect.position.y / scale - f64::from(height) - 8.0;
         context.send_viewport_cmd(ViewportCommand::OuterPosition(Pos2::new(
             x as f32,
@@ -1112,7 +1112,7 @@ fn configure_tray_only_application() {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn configure_tray_only_application() {}
 
 fn notify_natively(notice: &Notice) {
@@ -1181,6 +1181,18 @@ fn open_url(url: &str) -> Result<()> {
         .with_context(|| format!("macOS could not open {url}"))?;
     if !status.success() {
         return Err(anyhow!("macOS could not open {url}"));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn open_url(url: &str) -> Result<()> {
+    let status = std::process::Command::new("xdg-open")
+        .arg(url)
+        .status()
+        .with_context(|| format!("Linux could not open {url}"))?;
+    if !status.success() {
+        return Err(anyhow!("Linux could not open {url}"));
     }
     Ok(())
 }

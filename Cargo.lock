@@ -2857,6 +2857,7 @@ dependencies = [
  "vello_cpu",
  "windows-sys 0.61.2",
  "winresource",
+ "x11rb",
  "zip",
 ]
 

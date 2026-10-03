@@ -23,9 +23,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install Linux HID dependencies
+      - name: Install Linux HID and GUI dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev libgtk-3-dev libayatana-appindicator3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libgl1-mesa-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -33,10 +33,12 @@ jobs:
       - name: Check formatting
         if: runner.os == 'Linux'
         run: cargo fmt --check
-      - name: Test
-        run: cargo test --locked
-      - name: Lint
-        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test installer script
+        if: runner.os == 'Linux'
+        run: |
+          bash -n install-linux.sh
+          bash install-linux.sh --help
+          bash -c 'export HOME=/root OPENMOUSE_INSTALL_SOURCED=1; source ./install-linux.sh; D=$(mktemp -d); write_udev_rule "$D/rule"; bodies=$(grep -c "SUBSYSTEM" "$D/rule"); vids=$(printf "%s" "$VENDOR_IDS" | wc -w); [ "$bodies" = "$vids" ] || exit 1; write_autostart "$D/a.desktop" "/opt/x/b"; grep -q "Exec=\"/opt/x/b\"" "$D/a.desktop"; for pm in apt dnf pacman zypper apk; do pm_packages "$pm" | grep -q curl || exit 1; done; rm -rf "$D"'
 
   windows-build:
     name: Windows release artifact

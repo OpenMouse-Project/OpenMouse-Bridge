@@ -28,7 +28,7 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zip = { version = "4.6", default-features = false, features = ["deflate"] }
 
-[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+[target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
 eframe = { version = "0.36.1", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
 # The profile-switch overlay draws its banner on the CPU with the same font
 # stack egui already builds (skrifa outlines, vello_cpu rasterizer).
@@ -36,6 +36,11 @@ epaint_default_fonts = "0.36.1"
 skrifa = { version = "0.44", default-features = false, features = ["std"] }
 vello_cpu = { version = "0.1", default-features = false, features = ["std", "u8_pipeline"] }
 tray-icon = "0.24.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# X11 overlay banner and foreground-window lookup. Pure Rust; no system
+# libraries beyond what eframe/tray-icon already require.
+x11rb = "0.13"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
@@ -65,8 +70,8 @@ windows-sys = { version = "0.61", features = [
   "Win32_Graphics_Gdi",
   "Win32_Media",
   "Win32_Media_Audio",
-  "Win32_Storage_FileSystem",
   "Win32_System_LibraryLoader",
+  "Win32_Storage_FileSystem",
   "Win32_System_Registry",
   "Win32_System_Threading",
   "Win32_UI_HiDpi",

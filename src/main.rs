@@ -3,9 +3,9 @@
     windows_subsystem = "windows"
 )]
 
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 mod desktop;
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 mod overlay;
 
 use std::fs;
@@ -18,20 +18,20 @@ use tracing_appender::{
 };
 use tracing_subscriber::{EnvFilter, fmt::writer::MakeWriterExt};
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 use anyhow::Result;
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{Arc, atomic::AtomicBool},
 };
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 use openmouse_bridge::{BRIDGE_PORT, api, service::BridgeService};
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 use tokio::net::TcpListener;
 
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 fn main() {
     let _log_guard = init_tracing();
     if let Err(error) = desktop::run() {
@@ -40,7 +40,7 @@ fn main() {
     }
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 #[tokio::main]
 async fn main() {
     let _log_guard = init_tracing();
@@ -50,7 +50,7 @@ async fn main() {
     }
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 async fn run() -> Result<()> {
     let (config, path) = config::load_with_catalog().await?;
     let origins = config.allowed_origins.clone();
@@ -111,7 +111,7 @@ fn init_tracing() -> Option<WorkerGuard> {
     }
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }

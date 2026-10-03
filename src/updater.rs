@@ -1,6 +1,6 @@
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 use std::process::Command;
 use std::{
     env,
@@ -128,8 +128,10 @@ fn platform_archive_name() -> Result<&'static str> {
     return Ok("openmouse-bridge-macos-universal.zip");
     #[cfg(target_os = "windows")]
     return Ok("openmouse-bridge-windows-x64.zip");
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    bail!("automatic Bridge updates are available only on macOS and Windows");
+    #[cfg(target_os = "linux")]
+    return Ok("openmouse-bridge-linux-x64.zip");
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    bail!("automatic Bridge updates are available only on macOS, Windows, and Linux");
 }
 
 fn verify_checksum(archive: &[u8], checksum_file: &[u8]) -> Result<()> {
@@ -315,9 +317,49 @@ Start-Process -FilePath (Join-Path $Destination $Binary) -WorkingDirectory $Dest
     Ok(())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(target_os = "linux")]
+fn spawn_install_helper(staging: &Path, destination: &Path, executable: &Path) -> Result<()> {
+    const SCRIPT: &str = r#"#!/bin/sh
+pid="$1"
+stage="$2"
+destination="$3"
+binary="$4"
+while kill -0 "$pid" 2>/dev/null; do sleep 1; done
+cp -f "$stage/$binary" "$destination/$binary.update" || exit 1
+chmod +x "$destination/$binary.update" || exit 1
+mv -f "$destination/$binary.update" "$destination/$binary" || exit 1
+if [ -d "$stage/native-hid" ]; then
+  rm -rf "$destination/native-hid.update"
+  cp -R "$stage/native-hid" "$destination/native-hid.update" || exit 1
+  rm -rf "$destination/native-hid.old"
+  if [ -d "$destination/native-hid" ]; then mv "$destination/native-hid" "$destination/native-hid.old"; fi
+  mv "$destination/native-hid.update" "$destination/native-hid" || exit 1
+  rm -rf "$destination/native-hid.old"
+fi
+cd "$destination" || exit 1
+nohup "$destination/$binary" >/dev/null 2>&1 &
+rm -rf "$stage"
+"#;
+    let script = staging.join("install-update.sh");
+    fs::write(&script, SCRIPT).context("could not write the update helper")?;
+    Command::new("/bin/sh")
+        .arg(&script)
+        .arg(std::process::id().to_string())
+        .arg(staging)
+        .arg(destination)
+        .arg(
+            executable
+                .file_name()
+                .context("Bridge executable has no file name")?,
+        )
+        .spawn()
+        .context("could not launch the update helper")?;
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 fn spawn_install_helper(_staging: &Path, _destination: &Path, _executable: &Path) -> Result<()> {
-    bail!("automatic Bridge updates are available only on macOS and Windows")
+    bail!("automatic Bridge updates are available only on macOS, Windows, and Linux")
 }
 
 #[cfg(test)]
