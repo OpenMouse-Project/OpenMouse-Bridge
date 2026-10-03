@@ -88,9 +88,18 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if (gh release view dev-build 2>$null) {
-            gh release delete dev-build --cleanup-tag --yes
+          # Deleting the release and pushing the tag race: gh may still see
+          # the old release when create runs (the tag push recreates the
+          # association server-side). Poll until the release is really gone.
+          gh release delete dev-build --cleanup-tag --yes
+          for ($i = 0; $i -lt 30; $i++) {
+            try { gh release view dev-build 2>$null | Out-Null; Start-Sleep -Seconds 10 }
+            catch { break }
           }
           git tag -f dev-build
           git push origin dev-build --force
-          gh release create dev-build --prerelease --title "Development build" --notes "Automatic Windows build from main at $env:GITHUB_SHA." openmouse-bridge-windows-x64.zip openmouse-bridge-windows-x64.zip.sha256
+          for ($i = 0; $i -lt 30; $i++) {
+            try { gh release create dev-build --prerelease --title "Development build" --notes "Automatic Windows build from main at $env:GITHUB_SHA." openmouse-bridge-windows-x64.zip openmouse-bridge-windows-x64.zip.sha256; break }
+            catch { Start-Sleep -Seconds 10 }
+          }
+          gh release view dev-build --json tagName | Out-Null
