@@ -104,14 +104,15 @@ detect_pm() {
 
 # Prints the runtime packages Bridge needs on the given manager. These are
 # the distro names for: libudev (hidapi), GTK3 + AppIndicator (tray icon),
-# XCB/XKB/GL (tray window + overlay banner), unzip, and a TLS downloader.
+# XCB/XKB/GL (tray window + overlay banner), libxdo (tray-icon menu on
+# X11 via muda), unzip, and a TLS downloader.
 pm_packages() {
     case "$1" in
-        apt) echo "libudev1 libgtk-3-0 libayatana-appindicator3-1 libxcb-shape0 libxcb-xfixes0 libxcb-render0 libxkbcommon0 libgl1 unzip curl ca-certificates" ;;
-        dnf) echo "systemd-libs gtk3 libappindicator-gtk3 libxcb libxkbcommon mesa-libGL dbus-libs unzip curl ca-certificates" ;;
-        pacman) echo "systemd-libs gtk3 libappindicator-gtk3 libxcb libxkbcommon mesa dbus unzip curl ca-certificates" ;;
-        zypper) echo "libudev1 gtk3 libappindicator3-1 libxcb1 libxkbcommon0 Mesa-libGL1 dbus-1 unzip curl ca-certificates" ;;
-        apk) echo "eudev-libs gtk+3.0 libxcb libxkbcommon mesa-gl dbus unzip curl ca-certificates" ;;
+        apt) echo "libudev1 libgtk-3-0 libayatana-appindicator3-1 libxcb-shape0 libxcb-xfixes0 libxcb-render0 libxkbcommon0 libgl1 libxdo3 unzip curl ca-certificates" ;;
+        dnf) echo "systemd-libs gtk3 libappindicator-gtk3 libxcb libxkbcommon mesa-libGL dbus-libs libxdo unzip curl ca-certificates" ;;
+        pacman) echo "systemd-libs gtk3 libappindicator-gtk3 libxcb libxkbcommon mesa dbus xdotool unzip curl ca-certificates" ;;
+        zypper) echo "libudev1 gtk3 libappindicator3-1 libxcb1 libxkbcommon0 Mesa-libGL1 dbus-1 libxdo3 unzip curl ca-certificates" ;;
+        apk) echo "eudev-libs gtk+3.0 libxcb libxkbcommon mesa-gl dbus xdotool unzip curl ca-certificates" ;;
         *) return 1 ;;
     esac
 }
