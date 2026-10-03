@@ -11,9 +11,9 @@
 //! Wayland has no X connection, so `Window::new` fails there and notices
 //! fall back to system notifications (see `TrayApp::present`).
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 
-use x11rb::connection::Connection;
+use x11rb::connection::{Connection, RequestConnection as _};
 use x11rb::protocol::shape;
 use x11rb::protocol::xproto::{
     AtomEnum, ClipOrdering, ConfigureWindowAux, ConnectionExt as _, CreateGCAux, CreateWindowAux,
