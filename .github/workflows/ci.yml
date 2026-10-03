@@ -38,7 +38,7 @@ jobs:
         run: |
           bash -n install-linux.sh
           bash install-linux.sh --help
-          bash -c 'export HOME=/root OPENMOUSE_INSTALL_SOURCED=1; source ./install-linux.sh; D=$(mktemp -d); write_udev_rule "$D/rule"; bodies=$(grep -c "SUBSYSTEM" "$D/rule"); vids=$(printf "%s" "$VENDOR_IDS" | wc -w); [ "$bodies" = "$vids" ] || exit 1; write_autostart "$D/a.desktop" "/opt/x/b"; grep -q "Exec=\"/opt/x/b\"" "$D/a.desktop"; for pm in apt dnf pacman zypper apk; do pm_packages "$pm" | grep -q curl || exit 1; done; rm -rf "$D"'
+          bash -c 'export HOME=/root OPENMOUSE_INSTALL_SOURCED=1; source ./install-linux.sh; D=$(mktemp -d); write_udev_rule "$D/rule"; bodies=$(grep -c "SUBSYSTEM" "$D/rule"); vids=$(printf "%s" "$VENDOR_IDS" | wc -w); [ "$bodies" = "$vids" ] || exit 1; write_autostart "$D/a.desktop" "/opt/x/b"; grep -q "Exec=\"/opt/x/b\"" "$D/a.desktop"; write_launcher "$D/l.desktop" "/opt/x/b" "/opt/x/i.png"; grep -q "^Name=OpenMouse Bridge$" "$D/l.desktop"; grep -q "^Terminal=false$" "$D/l.desktop"; for pm in apt dnf pacman zypper apk; do pm_packages "$pm" | grep -q curl || exit 1; done; rm -rf "$D"'
 
   windows-build:
     name: Windows release artifact

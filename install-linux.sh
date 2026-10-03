@@ -19,7 +19,9 @@
 #      (without this Bridge can only open the mouse as root).
 #   4. Registers login autostart via ~/.config/autostart (same entry Bridge
 #      itself writes), unless --no-autostart.
-#
+#   5. Installs a GNOME/KDE launcher entry
+#      (~/.local/share/applications/io.openmouse.bridge.desktop) with the
+#      bundled app icon, unless --no-launcher.
 set -euo pipefail
 
 REPO="OpenMouse-Project/OpenMouse-Bridge"
@@ -32,6 +34,7 @@ SYSTEM=false
 WITH_DEPS=true
 WITH_UDEV=true
 WITH_AUTOSTART=true
+WITH_LAUNCHER=true
 START=false
 UNINSTALL=false
 ASSUME_YES=false
@@ -49,7 +52,6 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 usage() {
     cat <<USAGE
 Usage: install-linux.sh [options]
-
 Options:
   --tag TAG        Install release TAG instead of the latest (e.g. v1.0.0)
   --dir DIR        Install files to DIR (default: ~/.local/share/openmouse-bridge)
@@ -58,8 +60,9 @@ Options:
   --no-deps        Do not install missing system packages, just report them
   --no-udev        Skip the hidraw udev rule (Bridge then needs root to reach mice)
   --no-autostart   Skip login autostart registration
+  --no-launcher    Skip the GNOME/KDE app-launcher entry
   --start          Launch Bridge after installing
-  --uninstall      Remove a previous install (dir, symlink, autostart, udev rule)
+  --uninstall      Remove a previous install (dir, symlink, autostart, launcher, udev rule)
   --yes            Assume yes for package installs
   -h, --help       Show this help
 USAGE
@@ -73,6 +76,7 @@ while [ $# -gt 0 ]; do
         --no-deps) WITH_DEPS=false; shift ;;
         --no-udev) WITH_UDEV=false; shift ;;
         --no-autostart) WITH_AUTOSTART=false; shift ;;
+        --no-launcher) WITH_LAUNCHER=false; shift ;;
         --start) START=true; shift ;;
         --uninstall) UNINSTALL=true; shift ;;
         --yes) ASSUME_YES=true; shift ;;
@@ -211,6 +215,29 @@ NoDisplay=true
 EOF
 }
 
+# Writes the app-launcher entry (visible in GNOME/KDE launchers) next to the
+# installed files. Bridge is a tray app: launching it a second time just
+# opens another copy, so SingleMainWindow keeps the launcher from stacking
+# duplicate icons while it runs.
+write_launcher() {
+    local path="$1" exec="$2" icon="$3"
+    mkdir -p "$(dirname "$path")"
+    cat >"$path" <<EOF
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=OpenMouse Bridge
+Comment=System tray companion for the OpenMouse control panel
+Exec="$exec"
+Icon=$icon
+Terminal=false
+Categories=Settings;HardwareSettings;Utility;
+Keywords=mouse;DPI;polling;gaming;OpenMouse;
+SingleMainWindow=true
+StartupWMClass=openmouse-bridge
+EOF
+}
+
 download() {
     local url="$1" dest="$2"
     if command -v curl >/dev/null 2>&1; then
@@ -230,12 +257,25 @@ release_url() {
     fi
 }
 
+# Refreshes the launcher icon cache when present; harmless when missing
+# (GNOME/KDE pick up the new .desktop file on next login regardless).
+update_desktop_database() {
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "$HOME/.local/share/applications" >/dev/null 2>&1 || true
+    fi
+    if command -v kbuildsycoca6 >/dev/null 2>&1; then
+        kbuildsycoca6 >/dev/null 2>&1 || true
+    elif command -v kbuildsycoca5 >/dev/null 2>&1; then
+        kbuildsycoca5 >/dev/null 2>&1 || true
+    fi
+}
+
 do_uninstall() {
-    local dir="$1" link="$2" desktop="$3" rule="$4" sudo="$5" root="$6"
-    log "Removing ${dir}, ${link}, autostart entry, and udev rule (if present)..."
+    local dir="$1" link="$2" desktop="$3" rule="$4" sudo="$5" root="$6" launcher="$7"
+    log "Removing ${dir}, ${link}, autostart entry, launcher entry, and udev rule (if present)..."
     $root rm -f "$link"
     $root rm -rf "$dir"
-    rm -f "$desktop"
+    rm -f "$desktop" "$launcher"
     if [ -f "$rule" ]; then
         if [ "$sudo" = "none" ]; then
             die "cannot remove $rule without root; delete it manually"
@@ -243,6 +283,7 @@ do_uninstall() {
         $sudo rm -f "$rule"
         $sudo udevadm control --reload-rules 2>/dev/null || true
     fi
+    update_desktop_database
     log "Uninstalled."
 }
 
@@ -261,6 +302,11 @@ main() {
     local binary="$INSTALL_DIR/openmouse-bridge"
     local link="$BIN_LINK_DIR/openmouse-bridge"
     local desktop="$HOME/.config/autostart/io.openmouse.bridge.desktop"
+    # GNOME/KDE launcher: user-local always, so it never needs root and
+    # --uninstall can remove it without sudo. Icon path is absolute because
+    # launchers do not resolve relative to the .desktop location.
+    local launcher="$HOME/.local/share/applications/io.openmouse.bridge.desktop"
+    local icon="$INSTALL_DIR/openmouse-app-icon.png"
     local rule="/etc/udev/rules.d/69-openmouse-bridge.rules"
     local sudo
     sudo="$(sudo_cmd)"
@@ -268,7 +314,7 @@ main() {
     local root=""
     [ -w "$(dirname "$INSTALL_DIR")" ] || root="$sudo"
     if [ "$UNINSTALL" = true ]; then
-        do_uninstall "$INSTALL_DIR" "$link" "$desktop" "$rule" "$sudo" "$root"
+        do_uninstall "$INSTALL_DIR" "$link" "$desktop" "$rule" "$sudo" "$root" "$launcher"
         return 0
     fi
 
@@ -387,6 +433,16 @@ main() {
         log "Login autostart enabled."
     fi
 
+    # 7. App launcher entry + icon refresh. The zip is expected to ship
+    # openmouse-app-icon.png next to the binary (see release.yml Package).
+    if [ "$WITH_LAUNCHER" = true ]; then
+        write_launcher "$launcher" "$binary" "$icon"
+        update_desktop_database
+        log "Launcher entry installed."
+    else
+        log "Skipping launcher entry (--no-launcher)."
+    fi
+
     check_optionals
 
     if [ "$START" = true ]; then
@@ -394,7 +450,6 @@ main() {
         nohup "$binary" >/dev/null 2>&1 &
         disown || true
     fi
-
     log "Done. Open https://control.openmouse.app to connect."
     case ":$PATH:" in
         *":$BIN_LINK_DIR:"*) ;;

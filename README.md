@@ -150,7 +150,8 @@ cargo clippy --all-targets -- -D warnings
 
 One-line install from the latest stable release (detects missing system
 libraries, installs them with sudo, verifies the checksum, installs a hidraw
-`udev` rule so the mouse is reachable without root, and registers autostart):
+`udev` rule so the mouse is reachable without root, registers autostart, and
+adds an OpenMouse Bridge entry to the GNOME/KDE app launcher):
 
 ```sh
 curl -fsSL https://openmouse.app/bridge/download/install-linux.sh | bash
@@ -159,9 +160,9 @@ curl -fsSL https://openmouse.app/bridge/download/install-linux.sh | bash
 Flags: `--tag v1.0.0` (pin a release), `--dir DIR` (install location,
 default `~/.local/share/openmouse-bridge`), `--system` (system-wide install
 to `/opt/openmouse-bridge` with a `/usr/local/bin` symlink), `--no-deps`
-(only report missing packages), `--no-udev` / `--no-autostart` (skip those
-steps), `--start` (launch after installing), `--uninstall` (remove),
-`--yes` (non-interactive package install).
+(only report missing packages), `--no-udev` / `--no-autostart` /
+`--no-launcher` (skip those steps), `--start` (launch after installing),
+`--uninstall` (remove), `--yes` (non-interactive package install).
 
 Every successful push to `main` updates the rolling `dev-build` prerelease with a
 Windows x64 zip and checksum. The same files remain available as workflow

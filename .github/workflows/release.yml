@@ -144,8 +144,9 @@ jobs:
         run: |
           cp target/release/openmouse-bridge ./openmouse-bridge
           chmod +x openmouse-bridge
-          zip -r openmouse-bridge-linux-x64.zip openmouse-bridge README.md native-hid
-          rm openmouse-bridge
+          cp assets/openmouse-app-icon.png ./openmouse-app-icon.png
+          zip -r openmouse-bridge-linux-x64.zip openmouse-bridge openmouse-app-icon.png README.md native-hid
+          rm openmouse-bridge openmouse-app-icon.png
           sha256sum openmouse-bridge-linux-x64.zip > openmouse-bridge-linux-x64.zip.sha256
       - uses: actions/upload-artifact@v4
         with:
