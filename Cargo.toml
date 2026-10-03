@@ -1,6 +1,6 @@
 [package]
 name = "openmouse-bridge"
-version = "1.0.0-beta.12"
+version = "1.0.0-beta.13"
 edition = "2024"
 description = "Local native HID and desktop companion for the OpenMouse control panel"
 license = "MIT"
@@ -29,7 +29,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zip = { version = "4.6", default-features = false, features = ["deflate"] }
 
 [target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
-eframe = { version = "0.36.1", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
+eframe = { version = "0.36.1", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
 # The profile-switch overlay draws its banner on the CPU with the same font
 # stack egui already builds (skrifa outlines, vello_cpu rasterizer).
 epaint_default_fonts = "0.36.1"
