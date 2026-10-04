@@ -108,7 +108,7 @@ export const BRAND_DRIVERS = {
   },
   wooting: {
     vendorIds: [0x31e3],
-    classes: [client("@openmouse/protocol/drivers/wooting/hid", "WootingHidClient")],
+    classes: [client("@openmouse/keyboard-protocol/drivers/wooting/hid", "WootingHidClient")],
   },
   microsoft: {
     vendorIds: [0x045e],

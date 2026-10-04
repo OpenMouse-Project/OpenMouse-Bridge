@@ -131,6 +131,51 @@ async function main() {
     process.exit(EXIT_APPLIED);
   }
 
+  // ── Wooting 60HE+ ───────────────────────────────────────────────────
+  // RAM-only switch needs no confirm; flash saves require confirmed: true
+  // in stdin (headless gate — no modal possible), else exit 1 unsent.
+  if (input.action === "switch-profile") {
+    if (!Number.isInteger(input.slot)) {
+      console.error("[native-hid] switch-profile needs an integer slot.");
+      await client.close().catch(() => undefined);
+      process.exit(EXIT_FAILED);
+    }
+    try {
+      const slot = await withTimeout(client.switchProfile(input.slot), PROBE_TIMEOUT_MS, "switchProfile");
+      process.stdout.write(JSON.stringify({ activeProfile: slot }));
+    } catch (error) {
+      console.error(`[native-hid] could not switch profile: ${error.message}`);
+      await client.close().catch(() => undefined);
+      process.exit(EXIT_FAILED);
+    }
+    await client.close().catch(() => undefined);
+    process.exit(EXIT_APPLIED);
+  }
+
+  if (typeof input.action === "string" && input.action.startsWith("save-")) {
+    if (input.confirmed !== true) {
+      console.error(`[native-hid] ${input.action} overwrites onboard flash: pass confirmed: true.`);
+      await client.close().catch(() => undefined);
+      process.exit(EXIT_FAILED);
+    }
+    const saveCommands = { "save-rgb": 0x08, "save-keyboard": 0x2a, "save-dks": 0x2f, "save-akc": 0x35 };
+    const commandId = saveCommands[input.action];
+    if (commandId === undefined || !Number.isInteger(input.slot)) {
+      console.error(`[native-hid] unknown save action "${input.action}" (want save-rgb/save-keyboard/save-dks/save-akc + integer slot).`);
+      await client.close().catch(() => undefined);
+      process.exit(EXIT_FAILED);
+    }
+    try {
+      await withTimeout(client.saveProfile(commandId, input.slot, true), PROBE_TIMEOUT_MS, "saveProfile");
+    } catch (error) {
+      console.error(`[native-hid] could not save: ${error.message}`);
+      await client.close().catch(() => undefined);
+      process.exit(EXIT_FAILED);
+    }
+    await client.close().catch(() => undefined);
+    process.exit(EXIT_APPLIED);
+  }
+
   try {
     if (Number.isFinite(input.dpi)) {
       await withTimeout(client.setDpi(input.dpi), PROBE_TIMEOUT_MS, "setDpi");

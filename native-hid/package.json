@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@openmouse/protocol": "github:OpenMouse-Project/mouse-protocol#v0.10.0",
+    "@openmouse/keyboard-protocol": "file:../../../keyboard-protocol",
     "node-hid": "^3.1.0"
   },
   "allowScripts": {
