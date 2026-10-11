@@ -58,7 +58,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          npm install --prefix native-hid --omit=dev
+          npm ci --prefix native-hid --omit=dev
           # Trim node-hid's other-platform prebuilt bindings — this archive
           # only ever runs on win32-x64.
           Get-ChildItem native-hid/node_modules/node-hid/prebuilds -Directory |

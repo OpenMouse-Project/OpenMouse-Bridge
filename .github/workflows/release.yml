@@ -42,7 +42,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          npm install --prefix native-hid --omit=dev
+          npm ci --prefix native-hid --omit=dev
           # Trim node-hid's other-platform prebuilt bindings — this archive
           # only ever runs on win32-x64.
           Get-ChildItem native-hid/node_modules/node-hid/prebuilds -Directory |
@@ -84,7 +84,7 @@ jobs:
       - name: Prepare native-hid (deps + bundled Node.js runtime)
         run: |
           set -euo pipefail
-          npm install --prefix native-hid --omit=dev
+          npm ci --prefix native-hid --omit=dev
           # Trim node-hid's non-macOS prebuilt bindings; keep both Apple
           # silicon and Intel since the Bridge binary itself is universal.
           find native-hid/node_modules/node-hid/prebuilds -mindepth 1 -maxdepth 1 -type d \
@@ -131,7 +131,7 @@ jobs:
       - name: Prepare native-hid (deps + bundled Node.js runtime)
         run: |
           set -euo pipefail
-          npm install --prefix native-hid --omit=dev
+          npm ci --prefix native-hid --omit=dev
           # Trim node-hid's non-Linux prebuilt bindings; this archive only
           # ever runs on linux-x64.
           find native-hid/node_modules/node-hid/prebuilds -mindepth 1 -maxdepth 1 -type d \

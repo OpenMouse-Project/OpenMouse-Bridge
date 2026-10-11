@@ -12,10 +12,12 @@
   },
   "dependencies": {
     "@openmouse/protocol": "github:OpenMouse-Project/mouse-protocol#v0.10.0",
-    "@openmouse/keyboard-protocol": "file:../../../keyboard-protocol",
+    "@openmouse/keyboard-protocol": "github:OpenMouse-Project/keyboard-protocol#v1.1.0",
     "node-hid": "^3.1.0"
   },
   "allowScripts": {
+    "github:OpenMouse-Project/keyboard-protocol#v1.1.0": true,
+    "github:OpenMouse-Project/keyboard-protocol#cae3d7a74e8256a9a3cc5c7fe2311db1425bb977": true,
     "github:OpenMouse-Project/mouse-protocol#v0.10.0": true,
     "node-hid@3.4.0": true,
     "github:OpenMouse-Project/mouse-protocol#b69cd44b2498dcaaa65fd6f77ba10bf109e49322": true
