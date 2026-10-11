@@ -693,7 +693,6 @@ impl TrayApp {
         divider(ui);
         match snapshot.map(|snapshot| snapshot.batteries.as_slice()) {
             Some(batteries) if !batteries.is_empty() => {
-                let single = batteries.len() == 1;
                 for battery in batteries.iter().take(MAX_BATTERY_ROWS) {
                     let value = if battery.charging {
                         format!("{}% · Charging", battery.percent)
@@ -707,12 +706,9 @@ impl TrayApp {
                     } else {
                         TEXT
                     };
-                    let label = if single {
-                        "Battery"
-                    } else {
-                        battery.device_name.as_str()
-                    };
-                    value_row(ui, label, &value, color);
+                    // Battery history can belong to a different mouse than
+                    // the active HID device, even when there is only one row.
+                    value_row(ui, &battery.device_name, &value, color);
                     divider(ui);
                 }
             }

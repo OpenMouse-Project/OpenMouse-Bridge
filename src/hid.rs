@@ -59,21 +59,18 @@ fn note_device_opened(session_id: u64, summary: &DeviceSummary) {
     let mut registry = active_device_registry()
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    registry
-        .entry(session_id)
-        .or_default()
-        .insert(
-            summary.key.clone(),
-            ActiveDeviceEntry {
-                info: ActiveDeviceInfo {
-                    key: summary.key.clone(),
-                    name: summary.product_name.clone(),
-                    vendor_id: summary.vendor_id,
-                    product_id: summary.product_id,
-                },
-                seq: ACTIVE_DEVICE_SEQ.fetch_add(1, Ordering::Relaxed),
+    registry.entry(session_id).or_default().insert(
+        summary.key.clone(),
+        ActiveDeviceEntry {
+            info: ActiveDeviceInfo {
+                key: summary.key.clone(),
+                name: summary.product_name.clone(),
+                vendor_id: summary.vendor_id,
+                product_id: summary.product_id,
             },
-        );
+            seq: ACTIVE_DEVICE_SEQ.fetch_add(1, Ordering::Relaxed),
+        },
+    );
 }
 
 fn note_device_closed(session_id: u64, key: &str) {
@@ -107,7 +104,7 @@ pub fn active_devices() -> Vec<ActiveDeviceInfo> {
         .values()
         .flat_map(|devices| devices.values())
         .collect::<Vec<_>>();
-    devices.sort_by(|left, right| right.seq.cmp(&left.seq));
+    devices.sort_by_key(|entry| std::cmp::Reverse(entry.seq));
     devices
         .into_iter()
         .map(|entry| entry.info.clone())
@@ -525,6 +522,11 @@ impl HidSession {
             .refresh_devices()
             .map_err(|error| format!("could not refresh HID devices: {error}"))?;
 
+        // Reconcile against the full inventory, not the requested vendor filter:
+        // a picker scanning one brand must not close another brand's device.
+        let present = self.api.device_list().map(device_group_key).collect();
+        self.reconcile_inventory(&present)?;
+
         let mut by_device = HashMap::<Vec<u8>, Vec<hidapi::DeviceInfo>>::new();
         for info in self.api.device_list() {
             if vendors.contains(&info.vendor_id()) {
@@ -564,6 +566,22 @@ impl HidSession {
         }
         summaries.sort_by(|left, right| left.key.cmp(&right.key));
         Ok(summaries)
+    }
+
+    fn reconcile_inventory(&mut self, present: &HashSet<Vec<u8>>) -> Result<(), String> {
+        let removed = self
+            .device_keys
+            .iter()
+            .filter(|(identity, _)| !present.contains(*identity))
+            .map(|(identity, key)| (identity.clone(), key.clone()))
+            .collect::<Vec<_>>();
+        for (identity, key) in removed {
+            self.close(&key)?;
+            self.listeners.remove(&key);
+            self.candidates.remove(&key);
+            self.device_keys.remove(&identity);
+        }
+        Ok(())
     }
 
     fn open(&mut self, key: &str) -> Result<(), String> {
@@ -1381,9 +1399,7 @@ mod tests {
             .map(|device| device.name.clone())
             .collect::<Vec<_>>();
         let newer = names.iter().position(|name| name == "DeathAdder V3");
-        let older = names
-            .iter()
-            .position(|name| name == "PRO SUPERLIGHT 2C");
+        let older = names.iter().position(|name| name == "PRO SUPERLIGHT 2C");
         assert!(newer.is_some() && older.is_some() && newer < older);
 
         // Closing the current device falls back to the previous one, and a
@@ -1401,6 +1417,75 @@ mod tests {
                 .iter()
                 .all(|device| device.name != "PRO SUPERLIGHT 2C")
         );
+    }
+
+    #[test]
+    fn inventory_removal_cleans_handles_and_preserves_other_sessions() {
+        let session_id = u64::MAX - 41_138;
+        let other_session_id = u64::MAX - 41_139;
+        let (input_tx, _) = mpsc::unbounded_channel();
+        let mut session = HidSession::new(session_id, input_tx).unwrap();
+        for (key, vendor_id, name) in [
+            ("hid-1", RAZER_VENDOR_ID, "unplugged-test-mouse"),
+            ("hid-2", LOGITECH_VENDOR_ID, "remaining-test-mouse"),
+        ] {
+            let summary = DeviceSummary {
+                key: key.into(),
+                vendor_id,
+                product_id: 1,
+                product_name: name.into(),
+                collections: Vec::new(),
+            };
+            session
+                .device_keys
+                .insert(key.as_bytes().to_vec(), key.into());
+            session.candidates.insert(
+                key.into(),
+                Candidate {
+                    paths: Vec::new(),
+                    summary: summary.clone(),
+                },
+            );
+            session.open_devices.insert(
+                key.into(),
+                OpenDevice {
+                    paths: Vec::new(),
+                    vendor_id,
+                    listening: false,
+                    stop: None,
+                    readers: Vec::new(),
+                },
+            );
+            session.listeners.insert(key.into());
+            note_device_opened(session_id, &summary);
+            if key == "hid-1" {
+                note_device_opened(other_session_id, &summary);
+            }
+        }
+
+        session
+            .reconcile_inventory(&HashSet::from([b"hid-2".to_vec()]))
+            .unwrap();
+        assert!(!session.open_devices.contains_key("hid-1"));
+        assert!(!session.candidates.contains_key("hid-1"));
+        assert!(!session.listeners.contains("hid-1"));
+        assert!(!session.device_keys.contains_key(b"hid-1".as_slice()));
+        assert!(session.open("hid-1").is_err());
+        assert!(session.open_devices.contains_key("hid-2"));
+        {
+            let registry = active_device_registry().lock().unwrap();
+            assert!(!registry[&session_id].contains_key("hid-1"));
+            assert!(registry[&session_id].contains_key("hid-2"));
+            assert!(registry[&other_session_id].contains_key("hid-1"));
+        }
+        session.reconcile_inventory(&HashSet::new()).unwrap();
+        assert!(
+            !active_device_registry()
+                .lock()
+                .unwrap()
+                .contains_key(&session_id)
+        );
+        note_session_ended(other_session_id);
     }
 
     #[test]
