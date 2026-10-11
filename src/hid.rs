@@ -515,9 +515,6 @@ impl HidSession {
             return Err("too many HID vendor ids were requested".into());
         }
         let vendors: HashSet<u16> = vendor_ids.into_iter().collect();
-        if vendors.is_empty() {
-            return Ok(Vec::new());
-        }
         self.api
             .refresh_devices()
             .map_err(|error| format!("could not refresh HID devices: {error}"))?;
@@ -526,6 +523,10 @@ impl HidSession {
         // a picker scanning one brand must not close another brand's device.
         let present = self.api.device_list().map(device_group_key).collect();
         self.reconcile_inventory(&present)?;
+
+        if vendors.is_empty() {
+            return Ok(Vec::new());
+        }
 
         let mut by_device = HashMap::<Vec<u8>, Vec<hidapi::DeviceInfo>>::new();
         for info in self.api.device_list() {
@@ -1478,7 +1479,9 @@ mod tests {
             assert!(registry[&session_id].contains_key("hid-2"));
             assert!(registry[&other_session_id].contains_key("hid-1"));
         }
-        session.reconcile_inventory(&HashSet::new()).unwrap();
+        // Even an empty vendor filter must refresh the inventory and retire
+        // the remaining synthetic device, while returning no devices.
+        assert!(session.list(Vec::new()).unwrap().is_empty());
         assert!(
             !active_device_registry()
                 .lock()
