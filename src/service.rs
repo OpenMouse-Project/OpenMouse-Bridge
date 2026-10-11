@@ -280,6 +280,20 @@ pub struct DeviceBattery {
     pub stale: bool,
 }
 
+/// A mouse the control panel currently holds open over native HID, most
+/// recently opened first. Unlike the battery list — which accumulates every
+/// device that ever reported a charge level — this reflects the live HID
+/// session, so the status view can follow device switches (including wired
+/// mice that never report battery).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveDevice {
+    pub key: String,
+    pub name: String,
+    pub vendor_id: u16,
+    pub product_id: u16,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GameActivity {
@@ -308,6 +322,7 @@ pub struct BridgeSnapshot {
     pub visible_application_count: usize,
     pub profile_count: usize,
     pub client_connected: bool,
+    pub active_devices: Vec<ActiveDevice>,
     pub batteries: Vec<DeviceBattery>,
 }
 
@@ -391,6 +406,15 @@ impl BridgeService {
             })
             .collect::<Vec<_>>();
         batteries.sort_by(|a, b| a.device_id.cmp(&b.device_id));
+        let active_devices = crate::hid::active_devices()
+            .into_iter()
+            .map(|device| ActiveDevice {
+                key: device.key,
+                name: device.name,
+                vendor_id: device.vendor_id,
+                product_id: device.product_id,
+            })
+            .collect::<Vec<_>>();
         BridgeSnapshot {
             version: crate::BRIDGE_VERSION,
             platform: platform::platform_name(),
@@ -418,6 +442,7 @@ impl BridgeService {
             visible_application_count: state.applications.len(),
             profile_count: state.config.profiles.len(),
             client_connected,
+            active_devices,
             batteries,
         }
     }

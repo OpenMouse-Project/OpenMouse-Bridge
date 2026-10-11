@@ -655,9 +655,15 @@ impl TrayApp {
         });
         let device_name = snapshot.and_then(|snapshot| {
             snapshot
-                .batteries
+                .active_devices
                 .first()
-                .map(|battery| battery.device_name.clone())
+                .map(|device| device.name.clone())
+                .or_else(|| {
+                    snapshot
+                        .batteries
+                        .first()
+                        .map(|battery| battery.device_name.clone())
+                })
                 .or_else(|| {
                     snapshot
                         .active_profile

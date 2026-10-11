@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::CString,
     sync::{
-        Arc, Mutex, PoisonError,
+        Arc, Mutex, OnceLock, PoisonError,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
@@ -26,6 +26,93 @@ const RAZER_VENDOR_ID: u16 = 0x1532;
 const RAZER_FEATURE_BUFFER_LEN: usize = 91;
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_SESSIONS: AtomicUsize = AtomicUsize::new(0);
+/// Monotonic touch order for open HID devices, so the most recently opened
+/// device sorts first without relying on clock resolution.
+static ACTIVE_DEVICE_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// A HID device the control panel currently holds open, as the status view
+/// sees it. Device keys are allocated per websocket session (`hid-N`), so the
+/// registry is keyed by session: one panel tab re-listing must not clear
+/// another tab's open device.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveDeviceInfo {
+    pub key: String,
+    pub name: String,
+    pub vendor_id: u16,
+    pub product_id: u16,
+}
+
+struct ActiveDeviceEntry {
+    info: ActiveDeviceInfo,
+    seq: u64,
+}
+
+static ACTIVE_DEVICES: OnceLock<Mutex<HashMap<u64, HashMap<String, ActiveDeviceEntry>>>> =
+    OnceLock::new();
+
+fn active_device_registry() -> &'static Mutex<HashMap<u64, HashMap<String, ActiveDeviceEntry>>> {
+    ACTIVE_DEVICES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn note_device_opened(session_id: u64, summary: &DeviceSummary) {
+    let mut registry = active_device_registry()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    registry
+        .entry(session_id)
+        .or_default()
+        .insert(
+            summary.key.clone(),
+            ActiveDeviceEntry {
+                info: ActiveDeviceInfo {
+                    key: summary.key.clone(),
+                    name: summary.product_name.clone(),
+                    vendor_id: summary.vendor_id,
+                    product_id: summary.product_id,
+                },
+                seq: ACTIVE_DEVICE_SEQ.fetch_add(1, Ordering::Relaxed),
+            },
+        );
+}
+
+fn note_device_closed(session_id: u64, key: &str) {
+    let mut registry = active_device_registry()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if let Some(devices) = registry.get_mut(&session_id) {
+        devices.remove(key);
+        if devices.is_empty() {
+            registry.remove(&session_id);
+        }
+    }
+}
+
+fn note_session_ended(session_id: u64) {
+    active_device_registry()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&session_id);
+}
+
+/// The devices the control panel currently holds open over native HID, most
+/// recently opened first. Empty when no HID session has a device open — e.g.
+/// a wired mouse that was never opened still leaves no trace here, which is
+/// why callers fall back to the battery list and the active profile.
+pub fn active_devices() -> Vec<ActiveDeviceInfo> {
+    let registry = active_device_registry()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let mut devices = registry
+        .values()
+        .flat_map(|devices| devices.values())
+        .collect::<Vec<_>>();
+    devices.sort_by(|left, right| right.seq.cmp(&left.seq));
+    devices
+        .into_iter()
+        .map(|entry| entry.info.clone())
+        .collect()
+}
 
 #[derive(Debug, Deserialize)]
 struct ClientMessage {
@@ -481,6 +568,11 @@ impl HidSession {
 
     fn open(&mut self, key: &str) -> Result<(), String> {
         if self.open_devices.contains_key(key) {
+            // Re-selecting an already-open device still makes it the current
+            // one for status purposes.
+            if let Some(candidate) = self.candidates.get(key) {
+                note_device_opened(self.session_id, &candidate.summary);
+            }
             return Ok(());
         }
         let candidate = self
@@ -528,6 +620,9 @@ impl HidSession {
         if self.listeners.contains(key) {
             self.start_reader(key)?;
         }
+        if let Some(candidate) = self.candidates.get(key) {
+            note_device_opened(self.session_id, &candidate.summary);
+        }
         Ok(())
     }
 
@@ -536,6 +631,7 @@ impl HidSession {
             return Ok(());
         };
         open.stop_reader();
+        note_device_closed(self.session_id, key);
         Ok(())
     }
 
@@ -1171,6 +1267,7 @@ pub async fn serve(mut socket: WebSocket) {
     }
 
     drop(session);
+    note_session_ended(session_id);
     tracing::info!(session_id, "HID websocket disconnected");
 }
 
@@ -1263,6 +1360,47 @@ mod tests {
         );
         assert_eq!(report_payload(&[5, 1, 2, 3], 3), vec![1, 2]);
         assert!(report_payload(&full, 0).is_empty());
+    }
+
+    #[test]
+    fn active_devices_prefer_the_most_recently_opened_device() {
+        // A session id no other test uses, so the shared registry is ours.
+        let session = u64::MAX - 41_137;
+        note_session_ended(session);
+        let summary = |key: &str, name: &str| DeviceSummary {
+            key: key.into(),
+            vendor_id: RAZER_VENDOR_ID,
+            product_id: 0x00b0,
+            product_name: name.into(),
+            collections: Vec::new(),
+        };
+        note_device_opened(session, &summary("hid-1", "PRO SUPERLIGHT 2C"));
+        note_device_opened(session, &summary("hid-2", "DeathAdder V3"));
+        let names = active_devices()
+            .iter()
+            .map(|device| device.name.clone())
+            .collect::<Vec<_>>();
+        let newer = names.iter().position(|name| name == "DeathAdder V3");
+        let older = names
+            .iter()
+            .position(|name| name == "PRO SUPERLIGHT 2C");
+        assert!(newer.is_some() && older.is_some() && newer < older);
+
+        // Closing the current device falls back to the previous one, and a
+        // dead session leaves no stale entry behind.
+        note_device_closed(session, "hid-2");
+        let names = active_devices()
+            .iter()
+            .map(|device| device.name.clone())
+            .collect::<Vec<_>>();
+        assert!(!names.iter().any(|name| name == "DeathAdder V3"));
+        assert!(names.iter().any(|name| name == "PRO SUPERLIGHT 2C"));
+        note_session_ended(session);
+        assert!(
+            active_devices()
+                .iter()
+                .all(|device| device.name != "PRO SUPERLIGHT 2C")
+        );
     }
 
     #[test]

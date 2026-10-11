@@ -105,7 +105,9 @@ enumeration details.
 
 ## Loopback API
 
-- `GET /v1/status` reports the Bridge version, platform, active games, battery
+- `GET /v1/status` reports the Bridge version, platform, active games, the
+  devices the control panel currently holds open over native HID
+  (`activeDevices`, most recently opened first), battery levels, battery
   threshold, autostart and automatic-update preferences, and whether an
   OpenMouse client has completed a recent handshake.
 - `PUT /v1/handshake` renews OpenMouse's 20-second connection lease. The client
