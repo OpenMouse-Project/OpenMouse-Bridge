@@ -232,6 +232,7 @@ pub struct BridgeService {
     inner: Arc<RwLock<BridgeState>>,
     config_path: Arc<PathBuf>,
     notice_listener: Arc<std::sync::Mutex<Option<NoticeListener>>>,
+    show_panel: Arc<std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
 }
 
 struct BridgeState {
@@ -345,7 +346,40 @@ impl BridgeService {
             })),
             config_path: Arc::new(config_path),
             notice_listener: Arc::default(),
+            show_panel: Arc::default(),
         }
+    }
+
+    /// Opens the tray panel. A second Bridge launch calls this over localhost
+    /// when it finds the port already taken.
+    pub fn on_show_panel(&self, listener: impl Fn() + Send + Sync + 'static) {
+        *self
+            .show_panel
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(listener));
+    }
+
+    pub fn request_show_panel(&self) {
+        let listener = self
+            .show_panel
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(listener) = listener {
+            listener();
+        }
+    }
+
+    pub async fn acknowledge_tray_hint(&self) -> Result<()> {
+        let config = {
+            let mut state = self.inner.write().await;
+            if state.config.tray_hint_shown {
+                return Ok(());
+            }
+            state.config.tray_hint_shown = true;
+            state.config.clone()
+        };
+        config::save(&self.config_path, &config)
     }
 
     /// Sends profile switches and low-battery alerts to `listener` instead of

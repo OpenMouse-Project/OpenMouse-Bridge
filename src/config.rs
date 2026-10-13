@@ -40,6 +40,10 @@ pub struct BridgeConfig {
     /// user who later turns it off keeps it off.
     #[serde(default)]
     pub autostart_configured: bool,
+    /// Whether the tray panel has been shown once. Bridge stays in the tray
+    /// after that; the first launch opens the panel so a window actually appears.
+    #[serde(default)]
+    pub tray_hint_shown: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -126,6 +130,7 @@ impl Default for BridgeConfig {
             default_profile: None,
             allowed_origins: default_origins(),
             autostart_configured: false,
+            tray_hint_shown: false,
         }
     }
 }
@@ -302,6 +307,7 @@ mod tests {
             default_profile: None,
             allowed_origins: Vec::new(),
             autostart_configured: false,
+            tray_hint_shown: false,
         }
         .normalized();
         assert_eq!(config.battery_threshold_percent, 100);

@@ -230,6 +230,12 @@ enum BridgeCommand {
     SetAutomaticUpdates(bool),
     CheckForUpdates,
     InstallUpdate(UpdateInfo),
+    AcknowledgeTrayHint,
+}
+
+enum Startup {
+    Serving { show_panel: bool },
+    AlreadyRunning,
 }
 
 enum UpdateEvent {
@@ -354,6 +360,7 @@ struct TrayApp {
     // saved value; it is saved once released.
     adjusting_volume: bool,
     tray_rect: Option<TrayRect>,
+    panel_requests: Receiver<()>,
     update_state: UpdateState,
     last_error: Option<String>,
 }
@@ -368,12 +375,17 @@ impl TrayApp {
         commands: tokio_mpsc::UnboundedSender<BridgeCommand>,
         updates: Receiver<UpdateEvent>,
         notices: Receiver<Notice>,
+        panel_requests: Receiver<()>,
         waker: &OnceLock<egui::Context>,
         restart_requested: Arc<AtomicBool>,
         visible: bool,
+        acknowledge_tray_hint: bool,
     ) -> Result<Self> {
         configure_tray_only_application();
         let _ = waker.set(context.clone());
+        if acknowledge_tray_hint {
+            let _ = commands.send(BridgeCommand::AcknowledgeTrayHint);
+        }
         // Without the overlay, notices fall back to system notifications.
         let overlay = Overlay::new()
             .inspect_err(|error| tracing::warn!(%error, "Could not create the overlay"))
@@ -435,6 +447,7 @@ impl TrayApp {
             notification_volume: 60,
             adjusting_volume: false,
             tray_rect: None,
+            panel_requests,
             update_state: UpdateState::Idle,
             last_error: None,
         })
@@ -565,6 +578,10 @@ impl eframe::App for TrayApp {
             if self.visible {
                 context.send_viewport_cmd(ViewportCommand::Focus);
             }
+        }
+        while self.panel_requests.try_recv().is_ok() {
+            tracing::debug!("opening the tray panel for another Bridge launch");
+            self.set_visible(context, true);
         }
         while let Some(action) = self.tray.next_action() {
             match action {
@@ -990,15 +1007,18 @@ type BackgroundRuntime = (
     Receiver<BridgeSnapshot>,
     tokio_mpsc::UnboundedSender<BridgeCommand>,
     Receiver<UpdateEvent>,
+    Receiver<()>,
+    bool,
 );
 
 impl BackgroundServer {
-    fn start(notices: NoticeSink) -> Result<BackgroundRuntime> {
+    fn start(notices: NoticeSink) -> Result<Option<BackgroundRuntime>> {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (snapshot_tx, snapshots) = mpsc::sync_channel(1);
         let (command_tx, command_rx) = tokio_mpsc::unbounded_channel();
         let (update_tx, updates) = mpsc::sync_channel(8);
+        let (panel_tx, panel_requests) = mpsc::channel();
         let thread = thread::Builder::new()
             .name("openmouse-bridge-runtime".into())
             .spawn(move || {
@@ -1009,6 +1029,7 @@ impl BackgroundServer {
                     command_rx,
                     update_tx,
                     notices,
+                    panel_tx,
                 );
                 if let Err(error) = &outcome {
                     let _ = ready_tx.send(Err(format!("{error:#}")));
@@ -1018,7 +1039,12 @@ impl BackgroundServer {
             .context("could not start the Bridge runtime")?;
 
         match ready_rx.recv_timeout(Duration::from_secs(15)) {
-            Ok(Ok(())) => Ok((
+            Ok(Ok(Startup::AlreadyRunning)) => {
+                let _ = shutdown_tx.send(());
+                let _ = thread.join();
+                Ok(None)
+            }
+            Ok(Ok(Startup::Serving { show_panel })) => Ok(Some((
                 Self {
                     shutdown: Some(shutdown_tx),
                     thread: Some(thread),
@@ -1026,7 +1052,9 @@ impl BackgroundServer {
                 snapshots,
                 command_tx,
                 updates,
-            )),
+                panel_requests,
+                show_panel,
+            ))),
             Ok(Err(error)) => {
                 let _ = shutdown_tx.send(());
                 let _ = thread.join();
@@ -1061,8 +1089,11 @@ pub fn run() -> Result<()> {
                 "no display found (set WAYLAND_DISPLAY or DISPLAY for the tray panel); running headless: HTTP API, HID, and game profiles still work"
             );
         }
-        let (server, snapshots, commands, updates) =
-            BackgroundServer::start((notice_tx, Arc::clone(&waker)))?;
+        let Some((server, snapshots, commands, updates, _panel_requests, _show_panel)) =
+            BackgroundServer::start((notice_tx, Arc::clone(&waker)))?
+        else {
+            return Ok(());
+        };
         return run_headless(server, snapshots, commands, updates, notices, waker);
     }
     // The GUI closure below moves the channels in, so a GL failure cannot
@@ -1070,17 +1101,24 @@ pub fn run() -> Result<()> {
     // display is reachable (checked above), and treat a run_native error
     // as fatal here. (A broken-GL fallback would need the channels split
     // before the closure; revisit if Wayland-compositor reports require it.)
-    let (server, snapshots, commands, updates) =
-        BackgroundServer::start((notice_tx, Arc::clone(&waker)))?;
+    let Some((server, snapshots, commands, updates, panel_requests, show_panel)) =
+        BackgroundServer::start((notice_tx, Arc::clone(&waker)))?
+    else {
+        return Ok(());
+    };
     let restart_requested = Arc::new(AtomicBool::new(false));
     let app_restart_requested = Arc::clone(&restart_requested);
-    let visible = env::var_os("OPENMOUSE_BRIDGE_SHOW_WINDOW").is_some();
+    // The panel stays hidden after the first launch. Until then, and whenever
+    // OPENMOUSE_BRIDGE_SHOW_WINDOW is set, open it: a tray-only start looks
+    // like nothing happened, and an elevated process's tray icon does not
+    // show in the normal notification area.
+    let visible = show_panel || env::var_os("OPENMOUSE_BRIDGE_SHOW_WINDOW").is_some();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT])
             .with_decorations(false)
             .with_resizable(false)
-            .with_taskbar(false)
+            .with_taskbar(show_panel)
             .with_always_on_top()
             .with_visible(visible),
         renderer: eframe::Renderer::Glow,
@@ -1096,9 +1134,11 @@ pub fn run() -> Result<()> {
                 commands,
                 updates,
                 notices,
+                panel_requests,
                 &waker,
                 app_restart_requested,
                 visible,
+                show_panel,
             )?))
         }),
     )
@@ -1123,13 +1163,38 @@ fn restart_bridge() -> Result<()> {
     Ok(())
 }
 
+async fn activate_running_bridge() -> bool {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::debug!(%error, "could not ask the running Bridge to open its panel");
+            return false;
+        }
+    };
+    match client
+        .put(format!("http://127.0.0.1:{BRIDGE_PORT}/v1/panel"))
+        .send()
+        .await
+    {
+        Ok(response) => response.status().is_success(),
+        Err(error) => {
+            tracing::debug!(%error, "the running Bridge did not open its panel");
+            false
+        }
+    }
+}
+
 fn run_server(
     shutdown: oneshot::Receiver<()>,
-    ready: SyncSender<Result<(), String>>,
+    ready: SyncSender<Result<Startup, String>>,
     snapshots: SyncSender<BridgeSnapshot>,
     mut commands: tokio_mpsc::UnboundedReceiver<BridgeCommand>,
     update_events: SyncSender<UpdateEvent>,
     (notices, waker): NoticeSink,
+    panel_requests: Sender<()>,
 ) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1137,16 +1202,24 @@ fn run_server(
         .context("could not create the Bridge async runtime")?;
     runtime.block_on(async move {
         let (bridge_config, path) = config::load_with_catalog().await?;
+        let show_panel = !bridge_config.tray_hint_shown;
         let automatic_updates = bridge_config.automatic_updates;
         let origins = bridge_config.allowed_origins.clone();
         let service = BridgeService::new(bridge_config, path.clone());
         let notices = std::sync::Mutex::new(notices);
+        let panel_waker = Arc::clone(&waker);
         service.on_notice(move |notice| {
             let sent = notices
                 .lock()
                 .map(|sender| sender.send(notice).is_ok())
                 .unwrap_or(false);
             if sent && let Some(context) = waker.get() {
+                context.request_repaint();
+            }
+        });
+        service.on_show_panel(move || {
+            let _ = panel_requests.send(());
+            if let Some(context) = panel_waker.get() {
                 context.request_repaint();
             }
         });
@@ -1202,16 +1275,35 @@ fn run_server(
                     BridgeCommand::InstallUpdate(update) => {
                         install_update(update, &update_events).await;
                     }
+                    BridgeCommand::AcknowledgeTrayHint => {
+                        if let Err(error) = command_service.acknowledge_tray_hint().await {
+                            tracing::error!(%error, "could not save Bridge settings");
+                        }
+                    }
                 }
             }
         });
 
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), BRIDGE_PORT);
-        let listener = TcpListener::bind(address).await.with_context(|| {
-            format!("could not bind http://{address}; is Bridge already running?")
-        })?;
+        let listener = match TcpListener::bind(address).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                // The first launch still holds 17846. Ask it to open the panel
+                // instead of exiting with nothing on screen.
+                if activate_running_bridge().await {
+                    tracing::info!(
+                        "OpenMouse Bridge is already running; opening its tray panel"
+                    );
+                    let _ = ready.send(Ok(Startup::AlreadyRunning));
+                    return Ok(());
+                }
+                return Err(error).context(format!(
+                    "could not bind http://{address}; is Bridge already running?"
+                ));
+            }
+        };
         tracing::info!(%address, config = %path.display(), "OpenMouse Bridge is ready");
-        let _ = ready.send(Ok(()));
+        let _ = ready.send(Ok(Startup::Serving { show_panel }));
         let outcome = axum::serve(listener, api::router(service, &origins))
             .with_graceful_shutdown(async {
                 let _ = shutdown.await;

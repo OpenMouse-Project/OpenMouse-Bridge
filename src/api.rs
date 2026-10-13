@@ -68,6 +68,7 @@ pub fn router(service: BridgeService, origins: &[String]) -> Router {
         .route("/v1/native/settings", put(apply_native_settings))
         .route("/v1/battery", put(record_battery))
         .route("/v1/autostart", put(set_autostart))
+        .route("/v1/panel", put(show_panel))
         .merge(hid_route)
         .layer(SetResponseHeaderLayer::if_not_present(
             axum::http::HeaderName::from_static("access-control-allow-private-network"),
@@ -99,6 +100,11 @@ async fn hid_upgrade(
 
 async fn status(State(service): State<BridgeService>) -> Json<crate::service::BridgeSnapshot> {
     Json(service.snapshot().await)
+}
+
+async fn show_panel(State(service): State<BridgeService>) -> Json<ApiResult> {
+    service.request_show_panel();
+    Json(ApiResult { ok: true })
 }
 
 async fn handshake(State(service): State<BridgeService>) -> Json<ApiResult> {

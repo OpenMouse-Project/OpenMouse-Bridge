@@ -33,9 +33,12 @@ use tokio::net::TcpListener;
 
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 fn main() {
-    let _log_guard = init_tracing();
+    let log_guard = init_tracing();
     if let Err(error) = desktop::run() {
         tracing::error!(%error, "OpenMouse Bridge failed");
+        // `process::exit` skips the log guard's flush, which is how a second
+        // launch used to die on the taken port without a line in the log.
+        drop(log_guard);
         std::process::exit(1);
     }
 }
