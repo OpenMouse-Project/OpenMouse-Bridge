@@ -665,11 +665,13 @@ impl BridgeService {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
+                let devices = profile_devices(&service.inner.read().await.config);
+                // Pruning is in-memory only, so it runs even while the
+                // control panel holds a HID session and reads are paused.
+                prune_batteries(&mut service.inner.write().await.battery, &devices);
                 if crate::hid::client_session_active() {
                     continue;
                 }
-                let devices = profile_devices(&service.inner.read().await.config);
-                prune_batteries(&mut service.inner.write().await.battery, &devices);
                 for (device_id, device_name) in devices {
                     let id = device_id.clone();
                     let outcome =
