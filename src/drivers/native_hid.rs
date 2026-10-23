@@ -161,6 +161,25 @@ fn run_helper(request: &impl Serialize) -> Result<Option<Vec<u8>>> {
     }
 }
 
+pub fn spawn_button_listener(brand: &str) -> Result<Child> {
+    let script = locate_apply_script()?.with_file_name("button-listener.mjs");
+    let node = locate_node_binary();
+    let mut command = Command::new(node.as_deref().unwrap_or_else(|| Path::new("node")));
+    command
+        .arg(&script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+    command.spawn().with_context(|| {
+        format!(
+            "could not start {} for the {brand} button listener",
+            script.display()
+        )
+    })
+}
+
 /// Finds `native-hid/src/apply.mjs` next to the running executable — how a
 /// packaged Bridge release is expected to ship it — falling back to the
 /// checkout's own source tree so `cargo run`/`cargo test` work without a

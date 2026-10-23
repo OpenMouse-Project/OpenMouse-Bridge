@@ -1,6 +1,6 @@
 use std::{
-    collections::HashMap,
-    path::PathBuf,
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -132,8 +132,11 @@ fn active_profile_for(
         });
     let running_game = || {
         active_games.iter().find_map(|name| {
-            let game = config.games.iter().find(|game| &game.name == name)?;
-            enabled().find(|profile| profile_matches_game(profile, game))
+            let game = config
+                .tracked_games()
+                .into_iter()
+                .find(|game| &game.name == name)?;
+            enabled().find(|profile| profile_matches_game(profile, &game))
         })
     };
     foreground
@@ -160,6 +163,68 @@ fn profile_key(profile: &ApplicationProfile) -> String {
     } else {
         profile.application.path.to_ascii_lowercase()
     }
+}
+
+const MAX_IMAGE_BYTES: usize = 512 * 1024;
+
+fn image_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return None;
+    }
+    crate::remote_image::image_type(bytes).filter(|kind| *kind != "image/gif")
+}
+
+fn game_image_dir(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("custom-game-images")
+}
+
+fn game_image_file(dir: &Path, name: &str) -> PathBuf {
+    // FNV-1a: stable across runs, unlike the standard hasher.
+    let hash = name
+        .to_ascii_lowercase()
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+    dir.join(format!("{hash:016x}.img"))
+}
+
+fn prune_game_images(dir: &Path, keep: &[&str]) {
+    let wanted: HashSet<PathBuf> = keep.iter().map(|name| game_image_file(dir, name)).collect();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "img") && !wanted.contains(&path) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// The profile `key` names as it is in the config now, and whether it is the
+/// default profile. A profile keeps its key while its settings are edited, so
+/// the copy Bridge applied earlier can be out of date.
+fn current_profile<'a>(
+    config: &'a BridgeConfig,
+    key: &str,
+) -> Option<(&'a ApplicationProfile, bool)> {
+    // Only an enabled profile is ever the active one, so a disabled copy of the same game is not it.
+    config
+        .profiles
+        .iter()
+        .find(|profile| profile.enabled && profile_key(profile) == key)
+        .map(|profile| (profile, false))
+        .or_else(|| {
+            config
+                .default_profile
+                .as_ref()
+                .filter(|profile| profile_key(profile) == key)
+                .map(|profile| (profile, true))
+        })
 }
 
 /// Something worth telling the user about, already worded: a title such as the
@@ -249,6 +314,7 @@ pub struct BridgeService {
     config_path: Arc<PathBuf>,
     notice_listener: Arc<std::sync::Mutex<Option<NoticeListener>>>,
     show_panel: Arc<std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
+    buttons: Arc<crate::buttons::ButtonListener>,
 }
 
 struct BridgeState {
@@ -363,6 +429,7 @@ impl BridgeService {
             config_path: Arc::new(config_path),
             notice_listener: Arc::default(),
             show_panel: Arc::default(),
+            buttons: Arc::default(),
         }
     }
 
@@ -440,6 +507,7 @@ impl BridgeService {
             .iter()
             .find(|application| application.foreground)
             .cloned();
+        let tracked_games = state.config.tracked_games();
         let active_profile =
             active_profile_for(&state.config, &state.applications, &state.active_games);
         let active_profile_is_default =
@@ -472,16 +540,14 @@ impl BridgeService {
             linux_distribution: platform::linux_distribution(),
             uptime_seconds: state.started_at.elapsed().as_secs(),
             active_games: state.active_games.clone(),
-            games: state
-                .config
-                .games
+            games: tracked_games
                 .iter()
                 .map(|game| GameActivity {
                     name: game.name.clone(),
                     active: state.active_games.iter().any(|active| active == &game.name),
                 })
                 .collect(),
-            tracked_game_count: state.config.games.len(),
+            tracked_game_count: tracked_games.len(),
             battery_threshold_percent: state.config.battery_threshold_percent,
             autostart_enabled: platform::autostart_enabled(),
             automatic_updates: state.config.automatic_updates,
@@ -529,7 +595,59 @@ impl BridgeService {
     }
 
     pub async fn games(&self) -> Vec<GameConfig> {
-        self.inner.read().await.config.games.clone()
+        self.inner.read().await.config.tracked_games()
+    }
+
+    pub async fn custom_games(&self) -> Vec<GameConfig> {
+        self.inner.read().await.config.custom_games.clone()
+    }
+
+    pub async fn set_custom_games(&self, games: Vec<GameConfig>) -> Result<Vec<GameConfig>> {
+        let config = {
+            let mut state = self.inner.write().await;
+            state.config.custom_games = games;
+            state.config = state.config.clone().normalized();
+            state.config.clone()
+        };
+        config::save(&self.config_path, &config)?;
+        let names: Vec<&str> = config
+            .custom_games
+            .iter()
+            .map(|game| game.name.as_str())
+            .collect();
+        prune_game_images(&game_image_dir(&self.config_path), &names);
+        Ok(config.custom_games)
+    }
+
+    pub async fn custom_game_image(&self, name: &str) -> Option<(Vec<u8>, &'static str)> {
+        let bytes = tokio::fs::read(game_image_file(&game_image_dir(&self.config_path), name))
+            .await
+            .ok()?;
+        let kind = image_type(&bytes)?;
+        Some((bytes, kind))
+    }
+
+    pub async fn set_custom_game_image(&self, name: &str, image: &[u8]) -> Result<()> {
+        let known = self
+            .inner
+            .read()
+            .await
+            .config
+            .custom_games
+            .iter()
+            .any(|game| game.name.eq_ignore_ascii_case(name));
+        anyhow::ensure!(known, "{name} is not a custom game");
+        anyhow::ensure!(
+            image_type(image).is_some(),
+            "the image must be a PNG, JPEG or WebP of at most {MAX_IMAGE_BYTES} bytes"
+        );
+        let dir = game_image_dir(&self.config_path);
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .context("could not create the image folder")?;
+        tokio::fs::write(game_image_file(&dir, name), image)
+            .await
+            .context("could not save the image")
     }
 
     pub async fn replace_profiles(&self, profiles: Vec<ApplicationProfile>) -> Result<()> {
@@ -540,6 +658,10 @@ impl BridgeService {
             state.config.clone()
         };
         config::save(&self.config_path, &config)
+    }
+
+    pub async fn default_profile(&self) -> Option<ApplicationProfile> {
+        self.inner.read().await.config.default_profile.clone()
     }
 
     pub async fn set_default_profile(&self, profile: ApplicationProfile) -> Result<()> {
@@ -711,7 +833,7 @@ impl BridgeService {
             let mut interval = tokio::time::interval(Duration::from_secs(3));
             loop {
                 interval.tick().await;
-                let games = service.inner.read().await.config.games.clone();
+                let games = service.inner.read().await.config.tracked_games();
                 let active = detector.detect(&games);
                 let running = applications::visible_applications();
                 let applications = registered_applications(&running, &games);
@@ -786,7 +908,20 @@ impl BridgeService {
                     }
                 }
                 let default = state.config.default_profile.clone();
+                // Read from the config each time: editing the active profile's
+                // keys does not change its key, so the applied copy goes stale.
+                let desired_buttons = state
+                    .active_profile_key
+                    .as_deref()
+                    .and_then(|key| current_profile(&state.config, key))
+                    .and_then(|(profile, is_default)| {
+                        crate::buttons::Assignments::from_profile(profile, is_default)
+                    });
                 drop(state);
+                // A control panel holding the mouse is not interrupted by a new helper.
+                service
+                    .buttons
+                    .update(desired_buttons, !crate::hid::client_session_active());
                 if let Some((current, previous, announce)) = switch {
                     let service = service.clone();
                     std::thread::spawn(move || {
@@ -852,6 +987,7 @@ fn apply_natively(profile: &ApplicationProfile) -> ApplyOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote_image::PNG_SIGNATURE;
 
     fn service(config: BridgeConfig) -> BridgeService {
         BridgeService::new(config, PathBuf::from("unused-test-config.json"))
@@ -890,6 +1026,90 @@ mod tests {
             foreground,
             icon_id: String::new(),
         }
+    }
+
+    #[test]
+    fn a_game_image_is_kept_under_a_stable_name_whatever_the_case() {
+        let dir = Path::new("icons");
+        assert_eq!(
+            game_image_file(dir, "My Game"),
+            game_image_file(dir, "my game")
+        );
+        assert_ne!(
+            game_image_file(dir, "My Game"),
+            game_image_file(dir, "Other")
+        );
+        let file = game_image_file(dir, "../../evil\\name");
+        assert_eq!(
+            file.parent(),
+            Some(dir),
+            "a hostile name cannot leave the image folder"
+        );
+    }
+
+    #[test]
+    fn only_a_png_jpeg_or_webp_of_a_sensible_size_is_kept_as_an_image() {
+        let mut png = PNG_SIGNATURE.to_vec();
+        png.extend_from_slice(&[0; 32]);
+        assert_eq!(image_type(&png), Some("image/png"));
+        assert_eq!(
+            image_type(&[0xff, 0xd8, 0xff, 0xe0, 0, 0]),
+            Some("image/jpeg")
+        );
+        let mut webp = b"RIFF\0\0\0\0WEBPVP8 ".to_vec();
+        webp.extend_from_slice(&[0; 8]);
+        assert_eq!(image_type(&webp), Some("image/webp"));
+        assert_eq!(image_type(b"not an image"), None);
+        assert_eq!(image_type(b"GIF89a......"), None, "a GIF is not accepted");
+        png.resize(MAX_IMAGE_BYTES + 1, 0);
+        assert_eq!(image_type(&png), None, "an oversized file is refused");
+    }
+
+    #[test]
+    fn removing_a_game_removes_its_image() {
+        let dir = std::env::temp_dir().join(format!("bridge-icons-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        for name in ["Kept", "Gone"] {
+            std::fs::write(game_image_file(&dir, name), PNG_SIGNATURE).expect("image");
+        }
+        prune_game_images(&dir, &["Kept"]);
+        assert!(game_image_file(&dir, "Kept").exists());
+        assert!(!game_image_file(&dir, "Gone").exists());
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn the_active_profile_is_read_from_the_config_so_edits_are_seen() {
+        let mut config = BridgeConfig {
+            default_profile: Some(test_profile("Default", "", Some(800), None)),
+            profiles: vec![test_profile("Valorant", "/games/valorant", Some(800), None)],
+            ..BridgeConfig::default()
+        };
+
+        let (game, is_default) =
+            current_profile(&config, "/games/valorant").expect("the game profile");
+        assert_eq!(
+            (game.application.name.as_str(), is_default),
+            ("Valorant", false)
+        );
+        let (default, is_default) =
+            current_profile(&config, "default").expect("the default profile");
+        assert_eq!(
+            (default.application.name.as_str(), is_default),
+            ("Default", true)
+        );
+
+        // Editing a profile keeps its key, so the lookup finds the new settings.
+        config.default_profile = Some(test_profile("Default", "", Some(1600), None));
+        let (edited, _) = current_profile(&config, "default").expect("the edited default profile");
+        assert_eq!(edited.settings.dpi, Some(1600));
+        assert!(current_profile(&config, "/games/other").is_none());
+
+        // A disabled profile of the same game is not the one that is applied.
+        let mut disabled = test_profile("Valorant", "/games/valorant", Some(400), None);
+        disabled.enabled = false;
+        config.profiles = vec![disabled];
+        assert!(current_profile(&config, "/games/valorant").is_none());
     }
 
     #[test]

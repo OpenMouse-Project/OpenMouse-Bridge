@@ -21,7 +21,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sysinfo = "0.37"
-tokio = { version = "1.47", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.47", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tower-http = { version = "0.6", features = ["cors", "set-header", "trace"] }
 tracing = "0.1"
 tracing-appender = "0.2"
@@ -48,6 +48,8 @@ gtk = "0.18"
 # X11 overlay banner and foreground-window lookup. Pure Rust; no system
 # libraries beyond what eframe/tray-icon already require.
 x11rb = "0.13"
+# Virtual keyboard and mouse for the button listener (/dev/uinput).
+libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
@@ -70,6 +72,9 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
   "NSWorkspace",
 ] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSData", "NSGeometry", "NSString"] }
+# Posts the key and button events the button listener presses.
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGEvent", "CGEventTypes", "CGRemoteOperation"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = [
@@ -82,6 +87,10 @@ windows-sys = { version = "0.61", features = [
   "Win32_System_Registry",
   "Win32_System_Threading",
   "Win32_UI_HiDpi",
+  "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

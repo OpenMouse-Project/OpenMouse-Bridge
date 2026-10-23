@@ -2,8 +2,8 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
-    body::Body,
-    extract::{Path, State, ws::WebSocketUpgrade},
+    body::{Body, Bytes},
+    extract::{Path, Query, State, ws::WebSocketUpgrade},
     http::{HeaderMap, HeaderValue, Method, Response, StatusCode, header},
     routing::{delete, get, put},
 };
@@ -60,11 +60,23 @@ pub fn router(service: BridgeService, origins: &[String]) -> Router {
         .route("/v1/status", get(status))
         .route("/v1/handshake", put(handshake))
         .route("/v1/games", get(games))
+        .route(
+            "/v1/custom-games",
+            get(custom_games).put(replace_custom_games),
+        )
+        .route(
+            "/v1/custom-games/image",
+            get(custom_game_image).put(set_custom_game_image),
+        )
+        .route("/v1/custom-games/image-from-url", get(image_from_link))
         .route("/v1/applications", get(applications))
         .route("/v1/applications/{icon_id}/icon", get(application_icon))
         .route("/v1/running-applications", get(running_applications))
         .route("/v1/profiles", get(profiles).put(replace_profiles))
-        .route("/v1/default-profile", put(set_default_profile))
+        .route(
+            "/v1/default-profile",
+            get(default_profile).put(set_default_profile),
+        )
         .route("/v1/native/settings", put(apply_native_settings))
         .route("/v1/battery", put(record_battery))
         .route("/v1/battery/{device_id}", delete(forget_battery))
@@ -148,6 +160,74 @@ async fn games(State(service): State<BridgeService>) -> Json<Vec<GameConfig>> {
     Json(service.games().await)
 }
 
+async fn custom_games(State(service): State<BridgeService>) -> Json<Vec<GameConfig>> {
+    Json(service.custom_games().await)
+}
+
+async fn replace_custom_games(
+    State(service): State<BridgeService>,
+    Json(games): Json<Vec<GameConfig>>,
+) -> Result<Json<Vec<GameConfig>>, (StatusCode, String)> {
+    service
+        .set_custom_games(games)
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+#[derive(Debug, Deserialize)]
+struct GameImageQuery {
+    name: String,
+}
+
+async fn custom_game_image(
+    State(service): State<BridgeService>,
+    Query(query): Query<GameImageQuery>,
+) -> Result<Response<Body>, StatusCode> {
+    let (image, kind) = service
+        .custom_game_image(&query.name)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Response::builder()
+        .header(header::CONTENT_TYPE, kind)
+        // Revalidated every time: an image can be replaced under the same name.
+        .header(header::CACHE_CONTROL, "private, no-cache")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .body(Body::from(image))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageLinkQuery {
+    url: String,
+}
+
+async fn image_from_link(
+    Query(query): Query<ImageLinkQuery>,
+) -> Result<Response<Body>, (StatusCode, String)> {
+    let (image, kind) = crate::remote_image::fetch(&query.url)
+        .await
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    Response::builder()
+        .header(header::CONTENT_TYPE, kind)
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .body(Body::from(image))
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+}
+
+async fn set_custom_game_image(
+    State(service): State<BridgeService>,
+    Query(query): Query<GameImageQuery>,
+    body: Bytes,
+) -> Result<Json<ApiResult>, (StatusCode, String)> {
+    service
+        .set_custom_game_image(&query.name, &body)
+        .await
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    Ok(Json(ApiResult { ok: true }))
+}
+
 async fn replace_profiles(
     State(service): State<BridgeService>,
     Json(payload): Json<ProfilesPayload>,
@@ -157,6 +237,10 @@ async fn replace_profiles(
         .await
         .map_err(internal_error)?;
     Ok(Json(ApiResult { ok: true }))
+}
+
+async fn default_profile(State(service): State<BridgeService>) -> Json<Option<ApplicationProfile>> {
+    Json(service.default_profile().await)
 }
 
 async fn set_default_profile(
@@ -230,4 +314,156 @@ async fn apply_native_settings(
 fn internal_error(error: anyhow::Error) -> (StatusCode, String) {
     tracing::error!(%error, "Bridge request failed");
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        body::to_bytes,
+        http::{Method, Request},
+    };
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::{config::BridgeConfig, remote_image::PNG_SIGNATURE};
+
+    fn app() -> (Router, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "bridge-api-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let service = BridgeService::new(BridgeConfig::default(), dir.join("config.json"));
+        (router(service, &[]), dir)
+    }
+
+    async fn call(
+        app: &Router,
+        method: Method,
+        uri: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> (StatusCode, Vec<u8>, Option<String>) {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::from(body))
+            .expect("request");
+        let response = app.clone().oneshot(request).await.expect("response");
+        let status = response.status();
+        let kind = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body")
+            .to_vec();
+        (status, bytes, kind)
+    }
+
+    #[tokio::test]
+    async fn a_custom_game_keeps_the_image_saved_for_it() {
+        let (app, dir) = app();
+        let games = br#"[{"name":"My Game","executables":["MyGame.exe"]}]"#.to_vec();
+        let (status, saved, _) = call(
+            &app,
+            Method::PUT,
+            "/v1/custom-games",
+            "application/json",
+            games,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            String::from_utf8_lossy(&saved).contains("mygame.exe"),
+            "the list comes back normalized"
+        );
+
+        let mut png = PNG_SIGNATURE.to_vec();
+        png.extend_from_slice(&[1, 2, 3]);
+        let (status, ..) = call(
+            &app,
+            Method::PUT,
+            "/v1/custom-games/image?name=My%20Game",
+            "image/png",
+            png.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, bytes, kind) = call(
+            &app,
+            Method::GET,
+            "/v1/custom-games/image?name=my%20game",
+            "",
+            vec![],
+        )
+        .await;
+        assert_eq!(
+            (status, bytes, kind.as_deref()),
+            (StatusCode::OK, png, Some("image/png"))
+        );
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn an_image_is_refused_for_an_unknown_game_or_a_file_that_is_not_an_image() {
+        let (app, dir) = app();
+        let (status, ..) = call(
+            &app,
+            Method::PUT,
+            "/v1/custom-games/image?name=Nope",
+            "image/png",
+            PNG_SIGNATURE.to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "the game must exist");
+        let games = br#"[{"name":"Game","executables":["game.exe"]}]"#.to_vec();
+        call(
+            &app,
+            Method::PUT,
+            "/v1/custom-games",
+            "application/json",
+            games,
+        )
+        .await;
+        let (status, ..) = call(
+            &app,
+            Method::PUT,
+            "/v1/custom-games/image?name=Game",
+            "image/png",
+            b"<html>".to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "only real images are kept");
+        let (status, ..) = call(
+            &app,
+            Method::GET,
+            "/v1/custom-games/image?name=Game",
+            "",
+            vec![],
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn a_link_into_the_local_network_is_refused() {
+        let (app, dir) = app();
+        let (status, message, _) = call(
+            &app,
+            Method::GET,
+            "/v1/custom-games/image-from-url?url=http%3A%2F%2F192.168.1.1%2Flogo.png",
+            "",
+            vec![],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8_lossy(&message).contains("cannot be reached"));
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
 }

@@ -22,7 +22,7 @@ pub mod delux;
 mod native_hid;
 pub mod pulsar;
 
-pub use native_hid::NativeBattery;
+pub use native_hid::{NativeBattery, spawn_button_listener};
 
 /// Serializes Bridge's own device access. A profile switch and a battery read
 /// can start at the same moment (both run at startup), and on macOS the second
@@ -30,7 +30,7 @@ pub use native_hid::NativeBattery;
 /// interleave requests on the same device.
 static DEVICE_ACCESS: Mutex<()> = Mutex::new(());
 
-fn device_access() -> MutexGuard<'static, ()> {
+pub(crate) fn device_access() -> MutexGuard<'static, ()> {
     // The guarded value is (), so a panic while holding it leaves nothing
     // inconsistent behind.
     DEVICE_ACCESS

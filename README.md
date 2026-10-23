@@ -112,7 +112,16 @@ enumeration details.
   OpenMouse client has completed a recent handshake.
 - `PUT /v1/handshake` renews OpenMouse's 20-second connection lease. The client
   sends this heartbeat every five seconds while connected.
-- `GET /v1/games` returns the full executable catalog currently being tracked.
+- `GET /v1/games` returns the full executable catalog currently being tracked,
+  including the user's custom games.
+- `GET /v1/custom-games` returns the games the user added by hand;
+  `PUT /v1/custom-games` replaces them (`[{ name, executables }]`), persists
+  them under `customGames` in `config.json` and answers with the saved list.
+  They live apart from the catalog, which is replaced on every start.
+- `GET /v1/custom-games/image?name=…` returns the image saved for a custom
+  game (404 when it has none); `PUT` with a PNG, JPEG or WebP body (at most
+  512 KB) saves one. Images live in a `custom-game-images` folder beside
+  `config.json` and go away with the game.
 - `GET /v1/applications` lists running games and identifies the foreground
   game. Only applications from the registered catalog are
   returned. Each item includes an `iconId`; requesting

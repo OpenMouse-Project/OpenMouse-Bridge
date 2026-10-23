@@ -197,6 +197,9 @@ write_udev_rule() {
         for vid in $VENDOR_IDS; do
             printf 'SUBSYSTEM=="hidraw", ATTRS{idVendor}=="%s", MODE="0666", TAG+="uaccess"\n' "$vid"
         done
+        echo "# The button listener presses keys and side buttons through a virtual keyboard and mouse."
+        # No SUBSYSTEM match here: the installer test counts those, one per vendor id.
+        echo 'KERNEL=="uinput", MODE="0660", TAG+="uaccess", OPTIONS+="static_node=uinput"'
     } >"$path"
 }
 
@@ -280,7 +283,7 @@ do_uninstall() {
         if [ "$sudo" = "none" ]; then
             die "cannot remove $rule without root; delete it manually"
         fi
-        $sudo rm -f "$rule"
+        $sudo rm -f "$rule" /etc/modules-load.d/openmouse-bridge.conf
         $sudo udevadm control --reload-rules 2>/dev/null || true
     fi
     update_desktop_database
@@ -419,8 +422,12 @@ main() {
             log "Installing hidraw udev rule..."
             write_udev_rule "$tmp/69-openmouse-bridge.rules"
             $sudo cp "$tmp/69-openmouse-bridge.rules" "$rule"
+            # /dev/uinput only exists once the uinput module is loaded.
+            echo uinput | $sudo tee /etc/modules-load.d/openmouse-bridge.conf >/dev/null
+            $sudo modprobe uinput 2>/dev/null || true
             $sudo udevadm control --reload-rules 2>/dev/null || true
             $sudo udevadm trigger --subsystem-match=hidraw --action=change 2>/dev/null || true
+            $sudo udevadm trigger --subsystem-match=misc --sysname-match=uinput --action=change 2>/dev/null || true
             log "Unplug and replug the mouse (or reboot) so the new rule applies."
         fi
     else

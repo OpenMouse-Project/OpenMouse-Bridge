@@ -48,6 +48,16 @@ fall through to the generic `AttackSharkHidClient` path, which drives the 0x04
 six-stage table for model `0x55` (mouse-protocol #174), preserving the stages
 the request does not touch.
 
+## Button listener
+
+`button-listener.mjs` is the one long-running helper. While a game's profile assigns
+the side buttons of a Logitech mouse, Bridge (`src/buttons.rs`) starts it with
+`{"brand": "Logitech"}` on stdin. It puts the mouse on the Host profile if it was
+on an onboard one, turns the mouse's button events on, and prints
+`{"event": "buttons", "mask": 16}` lines; Bridge presses the assigned key. Closing
+stdin stops it: the events go off and the mouse returns to the mode it was in.
+It needs an `@openmouse/protocol` release that has `startButtonListener`.
+
 ## Exit code contract (Bridge depends on this — see `src/drivers/native_hid.rs`)
 
 - `0` — a device was found and the requested settings were applied. In
