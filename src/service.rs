@@ -80,14 +80,20 @@ fn profile_applications(
 
 /// Drops cached icons for applications that are no longer running, so the
 /// cache stays the size of the running list instead of every app ever seen.
+/// Icons of saved local applications stay, since they are served whether or
+/// not the application is running.
 fn prune_application_icons(
     icons: &mut HashMap<String, Option<Vec<u8>>>,
     running: &[ApplicationInfo],
+    local_applications: &[LocalApplication],
 ) {
     icons.retain(|icon_id, _| {
         running
             .iter()
             .any(|application| &application.icon_id == icon_id)
+            || local_applications
+                .iter()
+                .any(|target| &applications::icon_id(&target.path) == icon_id)
     });
 }
 
@@ -882,14 +888,43 @@ impl BridgeService {
         self.inner.read().await.running_applications.clone()
     }
 
+    /// Serves a cached icon, extracting a saved local application's icon from
+    /// its path the first time it is asked for, even when it is not running.
     pub async fn application_icon(&self, icon_id: &str) -> Option<Vec<u8>> {
-        self.inner
-            .read()
+        let path = {
+            let state = self.inner.read().await;
+            if let Some(Some(icon)) = state.application_icons.get(icon_id) {
+                return Some(icon.clone());
+            }
+            state
+                .config
+                .local_applications
+                .iter()
+                .find(|target| applications::icon_id(&target.path) == icon_id)?
+                .path
+                .clone()
+        };
+        let icon = tokio::task::spawn_blocking(move || applications::application_icon(&path))
             .await
-            .application_icons
-            .get(icon_id)
-            .cloned()
-            .flatten()
+            .ok()
+            .flatten();
+        // A failed extraction is not cached, so a path that comes back later gets
+        // its icon. The saved list may have changed while the icon was read, so it
+        // is cached only while a saved application still owns this id.
+        if let Some(icon) = &icon {
+            let mut state = self.inner.write().await;
+            let owned = state
+                .config
+                .local_applications
+                .iter()
+                .any(|target| applications::icon_id(&target.path) == icon_id);
+            if owned {
+                state
+                    .application_icons
+                    .insert(icon_id.to_owned(), Some(icon.clone()));
+            }
+        }
+        icon
     }
 
     pub async fn profiles(&self) -> Vec<ApplicationProfile> {
@@ -1017,6 +1052,14 @@ impl BridgeService {
             Ok(())
         })
         .await?;
+        // A removed application's icon is not served any more.
+        let mut guard = self.inner.write().await;
+        let state = &mut *guard;
+        prune_application_icons(
+            &mut state.application_icons,
+            &state.running_applications,
+            &state.config.local_applications,
+        );
         Ok(canonical)
     }
 
@@ -1336,7 +1379,12 @@ impl BridgeService {
                 state.processes = processes;
                 state.applications = applications;
                 state.application_icons.extend(icons);
-                prune_application_icons(&mut state.application_icons, &running);
+                let inner = &mut *state;
+                prune_application_icons(
+                    &mut inner.application_icons,
+                    &running,
+                    &inner.config.local_applications,
+                );
                 state.running_applications = running;
 
                 // Detect a debounced active-profile switch, push the new
@@ -2562,10 +2610,88 @@ mod tests {
             ("closed".to_string(), None),
         ]);
 
-        prune_application_icons(&mut icons, &running);
+        prune_application_icons(&mut icons, &running, &[]);
 
         assert_eq!(icons.len(), 1);
         assert!(icons.contains_key("running"));
+    }
+
+    #[test]
+    fn a_saved_local_application_keeps_its_icon_while_closed() {
+        let saved: LocalApplication = serde_json::from_value(serde_json::json!({"id":"local:editor","name":"Editor","executable":"Editor.exe","path":"C:\\Apps\\Editor.exe","kind":"app"})).unwrap();
+        let saved_icon = applications::icon_id(&saved.path);
+        let mut icons = HashMap::from([
+            (saved_icon.clone(), Some(vec![1])),
+            ("closed".to_string(), Some(vec![2])),
+        ]);
+
+        prune_application_icons(&mut icons, &[], &[saved]);
+
+        assert_eq!(icons.len(), 1);
+        assert!(icons.contains_key(&saved_icon));
+    }
+
+    fn saved_editor() -> LocalApplication {
+        serde_json::from_value(serde_json::json!({"id":"local:editor","name":"Editor","executable":"Editor.exe","path":"C:\\Missing\\Editor.exe","kind":"app"})).unwrap()
+    }
+
+    #[tokio::test]
+    async fn removing_a_saved_application_drops_its_cached_icon() {
+        let saved = saved_editor();
+        let icon_id = applications::icon_id(&saved.path);
+        let path =
+            std::env::temp_dir().join(format!("openmouse-icon-test-{}.json", std::process::id()));
+        let bridge = BridgeService::new(
+            BridgeConfig {
+                local_applications: vec![saved],
+                ..BridgeConfig::default()
+            },
+            path.clone(),
+        );
+        bridge
+            .inner
+            .write()
+            .await
+            .application_icons
+            .insert(icon_id.clone(), Some(vec![1]));
+        assert_eq!(bridge.application_icon(&icon_id).await, Some(vec![1]));
+
+        bridge.replace_local_applications(Vec::new()).await.unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            !bridge
+                .inner
+                .read()
+                .await
+                .application_icons
+                .contains_key(&icon_id)
+        );
+        assert_eq!(bridge.application_icon(&icon_id).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_icon_extraction_is_not_cached() {
+        let saved = saved_editor();
+        let icon_id = applications::icon_id(&saved.path);
+        let bridge = service(BridgeConfig {
+            local_applications: vec![saved],
+            ..BridgeConfig::default()
+        });
+
+        assert_eq!(
+            bridge.application_icon(&icon_id).await,
+            None,
+            "the path does not exist"
+        );
+        assert!(
+            !bridge
+                .inner
+                .read()
+                .await
+                .application_icons
+                .contains_key(&icon_id)
+        );
     }
 
     #[tokio::test]

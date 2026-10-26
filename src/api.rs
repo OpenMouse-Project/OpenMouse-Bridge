@@ -307,8 +307,32 @@ async fn set_custom_game_image(
     Ok(Json(ApiResult { ok: true }))
 }
 
-async fn local_applications(State(service): State<BridgeService>) -> Json<Vec<LocalApplication>> {
-    Json(service.local_applications().await)
+/// A saved local application as the API serves it, with the id its icon is
+/// served under. The id is never read back from a saved list.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalApplicationEntry {
+    #[serde(flatten)]
+    application: LocalApplication,
+    icon_id: String,
+}
+
+fn local_application_entries(applications: Vec<LocalApplication>) -> Vec<LocalApplicationEntry> {
+    applications
+        .into_iter()
+        .map(|application| LocalApplicationEntry {
+            icon_id: crate::applications::icon_id(&application.path),
+            application,
+        })
+        .collect()
+}
+
+async fn local_applications(
+    State(service): State<BridgeService>,
+) -> Json<Vec<LocalApplicationEntry>> {
+    Json(local_application_entries(
+        service.local_applications().await,
+    ))
 }
 
 async fn replace_local_applications(
@@ -321,7 +345,7 @@ async fn replace_local_applications(
         .await
         .map_err(profile_error)?;
     Ok(Json(
-        serde_json::json!({"ok":true,"applications":applications}),
+        serde_json::json!({"ok":true,"applications":local_application_entries(applications)}),
     ))
 }
 
@@ -508,6 +532,43 @@ mod tests {
             .expect("body")
             .to_vec();
         (status, bytes, kind)
+    }
+
+    #[tokio::test]
+    async fn saved_local_applications_carry_their_icon_id() {
+        let (app, dir) = app();
+        let path = r"C:\Apps\Editor.exe";
+        let icon_id = crate::applications::icon_id(path);
+        let entry = serde_json::json!({"id":"local:editor","name":"Editor","executable":"Editor.exe","path":path,"kind":"app"});
+        let (status, saved, _) = call(
+            &app,
+            Method::PUT,
+            "/v1/local-applications",
+            "application/json",
+            serde_json::to_vec(&serde_json::json!({"applications":[entry]})).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let saved: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(saved["applications"][0]["iconId"], icon_id.as_str());
+
+        let (status, listed, _) =
+            call(&app, Method::GET, "/v1/local-applications", "", vec![]).await;
+        assert_eq!(status, StatusCode::OK);
+        let listed: serde_json::Value = serde_json::from_slice(&listed).unwrap();
+        assert_eq!(listed[0]["iconId"], icon_id.as_str());
+
+        // A client may send back the list it was served, icon ids included.
+        let (status, ..) = call(
+            &app,
+            Method::PUT,
+            "/v1/local-applications",
+            "application/json",
+            serde_json::to_vec(&serde_json::json!({"applications":listed})).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        std::fs::remove_dir_all(dir).expect("cleanup");
     }
 
     #[tokio::test]

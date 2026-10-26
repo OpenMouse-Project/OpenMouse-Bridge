@@ -15,11 +15,7 @@ pub struct ApplicationInfo {
     pub icon_id: String,
 }
 
-#[cfg_attr(
-    not(any(target_os = "windows", target_os = "macos", target_os = "linux")),
-    allow(dead_code)
-)]
-fn icon_id(path: &str) -> String {
+pub fn icon_id(path: &str) -> String {
     let mut hasher = DefaultHasher::new();
     crate::games::path_key(path).hash(&mut hasher);
     format!("{:016x}", hasher.finish())

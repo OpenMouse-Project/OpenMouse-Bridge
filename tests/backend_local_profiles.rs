@@ -55,6 +55,13 @@ async fn server_with_config(storage_failure: bool, config: BridgeConfig) -> Test
     }
 }
 
+/// A saved target as the local-applications endpoints serve it.
+fn served(mut value: serde_json::Value) -> serde_json::Value {
+    let icon_id = openmouse_bridge::applications::icon_id(value["path"].as_str().unwrap());
+    value["iconId"] = icon_id.into();
+    value
+}
+
 fn target() -> serde_json::Value {
     serde_json::json!({"id":"local:editor","name":"Editor","executable":"editor.exe","path":"C:/Tools/editor.exe","kind":"app"})
 }
@@ -74,7 +81,7 @@ async fn activation_metadata_roundtrips_into_canonical_profiles() {
     assert_eq!(response.status(), 200);
     assert_eq!(
         response.json::<serde_json::Value>().await.unwrap(),
-        serde_json::json!({"ok":true,"applications":[value.clone()]})
+        serde_json::json!({"ok":true,"applications":[served(value.clone())]})
     );
     let stored = server.service.local_applications().await;
     assert_eq!(serde_json::to_value(&stored[0]).unwrap(), value);
@@ -163,7 +170,7 @@ async fn saved_missing_canonical_bundle_survives_batch_crud_and_profile_readback
             .unwrap();
         assert_eq!(response.status(), 200);
         let readback: serde_json::Value = response.json().await.unwrap();
-        assert_eq!(readback["applications"][0], bundle);
+        assert_eq!(readback["applications"][0], served(bundle.clone()));
         let profiles = server.service.profiles().await;
         assert_eq!(profiles.len(), 1);
         assert_eq!(
@@ -201,7 +208,7 @@ async fn local_http_roundtrip_reconciles_id_linked_profiles_and_restarts() {
     assert_eq!(response.status(), 200);
     assert_eq!(
         response.json::<serde_json::Value>().await.unwrap(),
-        serde_json::json!({"ok":true,"applications":[target()]})
+        serde_json::json!({"ok":true,"applications":[served(target())]})
     );
     let local = serde_json::json!({"application":{"localId":"local:editor","name":"Wrong","executable":"wrong.exe","path":""},"device":{"id":"d","name":"Mouse"},"settings":{"dpi":1600},"enabled":false});
     let preset = serde_json::json!({"application":{"name":"Editor","executable":"editor.exe","path":""},"device":{"id":"d","name":"Mouse"},"settings":{"dpi":800}});
@@ -303,7 +310,7 @@ async fn local_http_validation_is_400_and_never_changes_state() {
         assert_eq!(std::fs::read(&server.path).unwrap(), original);
         let targets: serde_json::Value =
             client.get(&url).send().await.unwrap().json().await.unwrap();
-        assert_eq!(targets, serde_json::json!([target()]));
+        assert_eq!(targets, serde_json::json!([served(target())]));
     }
     assert_eq!(
         client
