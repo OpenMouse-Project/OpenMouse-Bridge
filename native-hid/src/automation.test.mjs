@@ -209,3 +209,21 @@ test("manual adapter keeps its existing multi-path behavior without a live ident
   await device.close();
   assert.deepEqual(calls, [["open", endpoint.path], ["open", "manual-second"], "close", "close"]);
 });
+
+test("native opens are non-exclusive so macOS does not seize the device and freeze the cursor", async () => {
+  const options = [];
+  class FakeHID {
+    constructor(path, opts) { options.push(opts); }
+    getDeviceInfo() { return { ...endpoint }; }
+    on() {}
+    removeAllListeners() {}
+    close() {}
+  }
+  const manual = new HidDeviceAdapter([endpoint, { ...endpoint, path: "manual-second" }], null, FakeHID);
+  await manual.open();
+  await manual.close();
+  const verified = new HidDeviceAdapter([endpoint], endpoint, FakeHID);
+  await verified.open();
+  await verified.close();
+  assert.deepEqual(options, [{ nonExclusive: true }, { nonExclusive: true }, { nonExclusive: true }]);
+});

@@ -31,7 +31,7 @@ export function buildX11PollingReport(pollingRateHz) {
 
 export function applyX11PollingRate(
   pollingRateHz,
-  { infos = devices(), open = (path) => new HID(path) } = {},
+  { infos = devices(), open = (path) => new HID(path, { nonExclusive: true }) } = {},
 ) {
   const candidates = x11DeviceInfos(infos);
   if (candidates.length === 0) return false;

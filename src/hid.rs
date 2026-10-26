@@ -1545,6 +1545,15 @@ async fn send_json(socket: &mut impl HidSocket, value: &impl Serialize) -> Resul
 
 #[cfg(test)]
 mod tests {
+    /// macOS seizes devices opened in exclusive mode, which stops a mouse's
+    /// pointer collection from moving the cursor while Bridge holds it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_opens_devices_without_seizing_them() {
+        let api = HidApi::new().expect("HID subsystem should initialize");
+        assert!(!api.get_open_exclusive());
+    }
+
     use super::*;
 
     /// Logitech receivers also split their report paths across several HID
