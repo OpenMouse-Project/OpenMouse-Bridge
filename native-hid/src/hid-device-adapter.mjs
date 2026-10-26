@@ -27,6 +27,12 @@ import { HID, devices } from "node-hid";
 
 const REPLAY_ID_MAX = 255;
 
+// macOS seizes a device by default when it is opened, which detaches it from
+// the system: a mouse's own pointer collection stops moving the cursor for as
+// long as Bridge holds it. Shared opens leave the OS driver in place. The flag
+// is ignored on Windows and Linux.
+const OPEN_OPTIONS = { nonExclusive: true };
+
 /**
  * @param {import("node-hid").Device[]} infos - every node-hid entry that
  *   splits off the same underlying USB/BT interface (see module docs above).
@@ -59,7 +65,7 @@ export class HidDeviceAdapter {
       let device;
       try {
         if (this._infos.length !== 1) throw new Error("native live identity requires one endpoint");
-        device = new this._Handle(this._infos[0].path);
+        device = new this._Handle(this._infos[0].path, OPEN_OPTIONS);
         const live = device.getDeviceInfo();
         const fields = ["vendorId", "productId", "path", "serialNumber", "interface"];
         if (!live || fields.some((field) => live[field] === undefined || live[field] !== this._identity[field])) throw new Error("native live handle identity is missing or changed");
@@ -80,7 +86,7 @@ export class HidDeviceAdapter {
     let lastError = null;
     for (const info of this._infos) {
       try {
-        const device = new this._Handle(info.path);
+        const device = new this._Handle(info.path, OPEN_OPTIONS);
         device.on("data", this._onData);
         device.on("error", this._onError);
         openedDevices.push(device);

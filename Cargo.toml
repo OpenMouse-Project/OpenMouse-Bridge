@@ -12,7 +12,9 @@ winresource = "0.1"
 anyhow = "1.0"
 axum = { version = "0.8", features = ["ws"] }
 directories = "6.0"
-hidapi = "2.6.6"
+# macos-shared-device: macOS otherwise seizes every opened device, which freezes
+# the cursor when the opened interface is a mouse's pointer collection.
+hidapi = { version = "2.6.6", features = ["macos-shared-device"] }
 notify-rust = "4.11"
 png = "0.18"
 semver = "1.0"
