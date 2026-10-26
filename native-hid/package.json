@@ -12,17 +12,18 @@
   },
   "dependencies": {
     "@openmouse/keyboard-protocol": "github:OpenMouse-Project/keyboard-protocol#v1.1.0",
-    "@openmouse/protocol": "github:OpenMouse-Project/mouse-protocol#v0.42.2",
+    "@openmouse/protocol": "github:OpenMouse-Project/mouse-protocol#v0.48.0",
     "node-hid": "^3.1.0"
   },
   "allowScripts": {
     "github:OpenMouse-Project/keyboard-protocol#v1.1.0": true,
     "github:OpenMouse-Project/keyboard-protocol#cae3d7a74e8256a9a3cc5c7fe2311db1425bb977": true,
-    "github:OpenMouse-Project/mouse-protocol#v0.42.2": true,
+    "github:OpenMouse-Project/mouse-protocol#v0.48.0": true,
     "node-hid@3.4.0": true,
     "github:OpenMouse-Project/mouse-protocol#b69cd44b2498dcaaa65fd6f77ba10bf109e49322": true,
     "github:OpenMouse-Project/mouse-protocol#de188133bace18b1f75cd7bfd8360f17197222a5": true,
     "github:OpenMouse-Project/mouse-protocol#c3b1bc20866fbef3a27b37ad020887607d6dbbf2": true,
-    "github:OpenMouse-Project/mouse-protocol#e53af6d57197074bb8afd31f0fc1522ece68c890": true
+    "github:OpenMouse-Project/mouse-protocol#e53af6d57197074bb8afd31f0fc1522ece68c890": true,
+    "github:OpenMouse-Project/mouse-protocol#326f292bbe29ea73801cda1b2f0434f4fea62d18": true
   }
 }

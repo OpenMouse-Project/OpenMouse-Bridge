@@ -6,6 +6,8 @@
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 mod desktop;
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+mod native_ui;
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 mod overlay;
 
 use std::fs;
@@ -62,6 +64,7 @@ async fn run() -> Result<()> {
     // application icons over the API, so always keep them extracted.
     service.start_game_monitor(Arc::new(AtomicBool::new(true)));
     service.start_battery_monitor();
+    service.start_mode_monitor();
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), BRIDGE_PORT);
     let listener = TcpListener::bind(address)
         .await

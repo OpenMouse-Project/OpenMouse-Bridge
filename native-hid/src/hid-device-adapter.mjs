@@ -32,7 +32,7 @@ const REPLAY_ID_MAX = 255;
  *   splits off the same underlying USB/BT interface (see module docs above).
  */
 export class HidDeviceAdapter {
-  constructor(infos) {
+  constructor(infos, identity = null, Handle = HID) {
     const [primary] = infos;
     this.vendorId = primary.vendorId;
     this.productId = primary.productId;
@@ -45,6 +45,8 @@ export class HidDeviceAdapter {
     this.opened = false;
 
     this._infos = infos;
+    this._identity = identity;
+    this._Handle = Handle;
     this._devices = [];
     this._listeners = new Set();
     this._onData = this._onData.bind(this);
@@ -53,11 +55,32 @@ export class HidDeviceAdapter {
 
   async open() {
     if (this.opened) return;
+    if (this._identity) {
+      let device;
+      try {
+        if (this._infos.length !== 1) throw new Error("native live identity requires one endpoint");
+        device = new this._Handle(this._infos[0].path);
+        const live = device.getDeviceInfo();
+        const fields = ["vendorId", "productId", "path", "serialNumber", "interface"];
+        if (!live || fields.some((field) => live[field] === undefined || live[field] !== this._identity[field])) throw new Error("native live handle identity is missing or changed");
+        device.on("data", this._onData);
+        device.on("error", this._onError);
+        this._devices = [device];
+        this.opened = true;
+        return;
+      } catch (error) {
+        if (device) {
+          try { device.removeAllListeners(); } catch {}
+          try { device.close(); } catch {}
+        }
+        throw new Error(`native live handle identity verification failed: ${error.message}`);
+      }
+    }
     const openedDevices = [];
     let lastError = null;
     for (const info of this._infos) {
       try {
-        const device = new HID(info.path);
+        const device = new this._Handle(info.path);
         device.on("data", this._onData);
         device.on("error", this._onError);
         openedDevices.push(device);
@@ -244,4 +267,15 @@ export function candidateDevices(vendorId) {
     const unique = infos.filter((info) => (seen.has(info.path) ? false : seen.add(info.path)));
     return new HidDeviceAdapter(unique);
   });
+}
+
+export async function probeVerifiedDevice(info, identity, probe, Handle = HID) {
+  const device = new HidDeviceAdapter([info], identity, Handle);
+  try {
+    await device.open();
+    return await probe(device);
+  } catch (error) {
+    await device.close().catch(() => undefined);
+    throw error;
+  }
 }

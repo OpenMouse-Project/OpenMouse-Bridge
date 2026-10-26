@@ -10,14 +10,13 @@ use skrifa::{
 use vello_cpu::{
     Pixmap, RenderContext, Resources,
     color::{AlphaColor, Srgb},
-    kurbo::{BezPath, Circle, RoundedRect, Shape as _},
+    kurbo::{BezPath, RoundedRect, Shape as _},
 };
 
 const HEIGHT: f64 = 60.0;
 const RADIUS: f64 = 14.0;
 const PADDING: f64 = 18.0;
-const DOT_RADIUS: f64 = 4.0;
-const TEXT_LEFT: f64 = PADDING + DOT_RADIUS * 2.0 + 12.0;
+const TEXT_LEFT: f64 = PADDING;
 const MIN_WIDTH: f64 = 240.0;
 const MAX_WIDTH: f64 = 460.0;
 const TITLE_SIZE: f32 = 15.0;
@@ -25,11 +24,10 @@ const DETAIL_SIZE: f32 = 12.5;
 const TITLE_BASELINE: f64 = 27.0;
 const DETAIL_BASELINE: f64 = 45.0;
 
-const BACKGROUND: AlphaColor<Srgb> = AlphaColor::from_rgba8(16, 17, 19, 245);
+const BACKGROUND: AlphaColor<Srgb> = AlphaColor::from_rgba8(12, 13, 15, 245);
 const BORDER: AlphaColor<Srgb> = AlphaColor::from_rgba8(255, 255, 255, 20);
-const TEXT: AlphaColor<Srgb> = AlphaColor::from_rgba8(236, 238, 240, 255);
-const MUTED: AlphaColor<Srgb> = AlphaColor::from_rgba8(150, 156, 163, 255);
-const ACCENT: AlphaColor<Srgb> = AlphaColor::from_rgba8(93, 222, 137, 255);
+const TEXT: AlphaColor<Srgb> = AlphaColor::from_rgba8(238, 240, 242, 255);
+const MUTED: AlphaColor<Srgb> = AlphaColor::from_rgba8(170, 176, 183, 255);
 
 /// A rendered banner: premultiplied RGBA8 rows, top to bottom.
 pub struct Banner {
@@ -40,8 +38,8 @@ pub struct Banner {
 
 /// Renders `title` over `detail` at `scale` physical pixels per point.
 pub fn banner(title: &str, detail: &str, scale: f64) -> Banner {
-    let font = FontRef::new(epaint_default_fonts::UBUNTU_LIGHT)
-        .expect("the bundled Ubuntu Light font is valid");
+    let font =
+        FontRef::new(crate::native_ui::FONT_BYTES).expect("the bundled DM Sans font is valid");
     let text_room = MAX_WIDTH - TEXT_LEFT - PADDING;
     let title = fit(&font, title, TITLE_SIZE, text_room);
     let detail = fit(&font, detail, DETAIL_SIZE, text_room);
@@ -65,10 +63,6 @@ pub fn banner(title: &str, detail: &str, scale: f64) -> Banner {
     context.fill_path(&scaled(outer.to_path(0.1)));
     context.set_paint(BACKGROUND);
     context.fill_path(&scaled(inner.to_path(0.1)));
-
-    context.set_paint(ACCENT);
-    let dot = Circle::new((PADDING + DOT_RADIUS, HEIGHT / 2.0), DOT_RADIUS);
-    context.fill_path(&scaled(dot.to_path(0.1)));
 
     context.set_paint(TEXT);
     context.fill_path(&text_path(&font, &title, TITLE_SIZE, TITLE_BASELINE, scale));
@@ -192,6 +186,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn banner_uses_openmouse_ground_without_a_decorative_status_dot() {
+        let banner = banner("Game profile", "Saved settings selected", 1.0);
+        let x = PADDING as usize + 4;
+        let y = HEIGHT as usize / 2;
+        let pixel = &banner.pixels[(y * banner.width as usize + x) * 4..][..4];
+        for (actual, expected) in pixel.iter().zip([12_u8, 13, 15, 245]) {
+            assert!(
+                actual.abs_diff(expected) <= 2,
+                "unexpected panel pixel {pixel:?}"
+            );
+        }
+    }
+
+    #[test]
     fn banner_is_opaque_inside_and_transparent_at_the_corners() {
         let banner = banner("Counter-Strike 2", "Profile on · 1600 DPI", 2.0);
         assert_eq!(banner.height, 120);
@@ -203,7 +211,7 @@ mod tests {
 
     #[test]
     fn long_titles_are_shortened_to_fit() {
-        let font = FontRef::new(epaint_default_fonts::UBUNTU_LIGHT).unwrap();
+        let font = FontRef::new(crate::native_ui::FONT_BYTES).unwrap();
         let fitted = fit(&font, &"Very Long Game Name ".repeat(10), TITLE_SIZE, 200.0);
         assert!(fitted.ends_with('…'));
         assert!(line_width(&font, &fitted, TITLE_SIZE) <= 200.0);
