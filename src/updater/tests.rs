@@ -725,7 +725,11 @@ fn checksum_must_match_archive() {
 fn macos_bundle_package_layout_requires_every_bundled_file() {
     let root = fixture();
     let layout = PackageLayout::macos_bundle();
-    let node = layout.native_hid.join("node/bin/node");
+    let node = layout.native_hid.join(if cfg!(windows) {
+        "node/node.exe"
+    } else {
+        "node/bin/node"
+    });
     let mut names = vec![
         layout.binary.clone(),
         layout.native_hid.join("src/apply.mjs"),
