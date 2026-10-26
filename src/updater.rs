@@ -833,7 +833,7 @@ fn spawn_install_helper(staging: &Path, destination: &Path, executable: &Path) -
 
 /// Replaces one directory (a macOS `.app`) as a unit. Same lock, backup and
 /// rollback discipline as `UNIX_TRANSACTION`: status 2 means nothing changed.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 const BUNDLE_TRANSACTION: &str = r#"install_bundle() (
 set -eu
 stage="$1"
@@ -890,7 +890,7 @@ committed=yes
 )
 "#;
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 const BUNDLE_COMPLETION: &str = r#"complete_bundle_update() {
   if install_bundle "$1" "$2" "$3" "$4"; then
     :
