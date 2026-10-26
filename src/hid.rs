@@ -12,9 +12,11 @@ use std::{
 use axum::extract::ws::{Message, WebSocket};
 use hidapi::{HidApi, HidDevice, MAX_REPORT_DESCRIPTOR_SIZE};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 const MAX_REPORT_BYTES: usize = MAX_REPORT_DESCRIPTOR_SIZE;
+const INPUT_QUEUE_CAPACITY: usize = 64;
+const SOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_os = "windows")]
 const READ_TIMEOUT_MS: i32 = 100;
 /// How long a shared-handle reader waits between empty polls. The wait happens
@@ -226,6 +228,35 @@ struct InputReport {
     data: Vec<u8>,
 }
 
+#[derive(Clone)]
+struct InputSender {
+    reports: mpsc::Sender<InputReport>,
+    failed: watch::Sender<bool>,
+}
+
+impl InputSender {
+    fn send(&self, report: InputReport) -> Result<(), ()> {
+        if *self.failed.borrow() {
+            return Err(());
+        }
+        if self.reports.try_send(report).is_err() {
+            self.failed.send_replace(true);
+            return Err(());
+        }
+        Ok(())
+    }
+}
+
+fn input_channel() -> (
+    InputSender,
+    mpsc::Receiver<InputReport>,
+    watch::Receiver<bool>,
+) {
+    let (reports, rx) = mpsc::channel(INPUT_QUEUE_CAPACITY);
+    let (failed, failure_rx) = watch::channel(false);
+    (InputSender { reports, failed }, rx, failure_rx)
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DeviceSummary {
@@ -404,11 +435,11 @@ struct HidSession {
     candidates: HashMap<String, Candidate>,
     open_devices: HashMap<String, OpenDevice>,
     listeners: HashSet<String>,
-    input_tx: mpsc::UnboundedSender<InputReport>,
+    input_tx: InputSender,
 }
 
 impl HidSession {
-    fn new(session_id: u64, input_tx: mpsc::UnboundedSender<InputReport>) -> Result<Self, String> {
+    fn new(session_id: u64, input_tx: InputSender) -> Result<Self, String> {
         Ok(Self {
             session_id,
             api: HidApi::new()
@@ -838,6 +869,7 @@ impl HidSession {
                                     })
                                     .is_err()
                                 {
+                                    thread_stop.store(true, Ordering::Release);
                                     break;
                                 }
                             }
@@ -883,6 +915,11 @@ impl HidSession {
             .open_devices
             .get(key)
             .ok_or_else(|| "the HID interface is not open".to_owned())?;
+        if open.paths.len() != 1 {
+            return Err("HID physical identity is ambiguous; refusing report fan-out".into());
+        }
+        let _access = crate::drivers::manual_report_access(open.vendor_id)
+            .map_err(|error| error.to_string())?;
         let mut frame = Vec::with_capacity(data.len() + 1);
         frame.push(report_id);
         frame.extend_from_slice(&data);
@@ -1048,35 +1085,32 @@ fn report_payload(data: &[u8], size: usize) -> Vec<u8> {
         .to_vec()
 }
 
-fn grouped_device_key(vendor_id: u16, product_id: u16, serial: Option<&str>) -> Vec<u8> {
-    format!(
-        "{vendor_id:04x}:{product_id:04x}:{}",
-        serial.unwrap_or("no-serial")
-    )
-    .into_bytes()
-}
-/// Whether a product's report paths collapse into one connect-page card.
-///
-/// Always true. hidapi's serial — the only true physical identity it exposes
-/// — is used when present, and vendor:product is the most specific no-serial
-/// fallback the platform offers, which is exactly the identity WebHID hands
-/// the app (no serial available there at all). Two identical serial-less
-/// mice of one model merge into a single logical device; that is the same,
-/// unavoidable trade-off the WebHID path makes. This is kept as a named
-/// decision point + the path fallback in `device_group_key` so a future
-/// platform rule (e.g. "never merge two distinct same-model dongles") has a
-/// single, documented place to live.
-fn should_group_interfaces(_vendor_id: u16, _has_serial: bool) -> bool {
-    true
+fn grouped_device_key(
+    vendor_id: u16,
+    product_id: u16,
+    path: &[u8],
+    serial: Option<&str>,
+) -> Vec<u8> {
+    // A serial is a verified physical identity, so every collection of that
+    // device is one candidate. Without one, collections stay apart by path.
+    let serial = serial.filter(|serial| !serial.is_empty());
+    let identity = serial.map_or(path, str::as_bytes);
+    let mut key = Vec::with_capacity(13 + identity.len());
+    key.extend_from_slice(&vendor_id.to_le_bytes());
+    key.extend_from_slice(&product_id.to_le_bytes());
+    key.push(u8::from(serial.is_some()));
+    key.extend_from_slice(&(identity.len() as u64).to_le_bytes());
+    key.extend_from_slice(identity);
+    key
 }
 
 fn device_group_key(info: &hidapi::DeviceInfo) -> Vec<u8> {
-    let serial = info.serial_number().filter(|serial| !serial.is_empty());
-    if should_group_interfaces(info.vendor_id(), serial.is_some()) {
-        grouped_device_key(info.vendor_id(), info.product_id(), serial)
-    } else {
-        info.path().to_bytes().to_vec()
-    }
+    grouped_device_key(
+        info.vendor_id(),
+        info.product_id(),
+        info.path().to_bytes(),
+        info.serial_number(),
+    )
 }
 
 fn inspect_candidate(
@@ -1093,6 +1127,10 @@ fn inspect_candidate(
         if seen_paths.insert(info.path().to_bytes().to_vec()) {
             unique_paths.push(info.path().to_owned());
         }
+    }
+
+    if unique_paths.len() != 1 {
+        return Err("HID physical identity is ambiguous; refusing multi-path access".into());
     }
 
     let inspect_descriptors = primary.vendor_id() != RAZER_VENDOR_ID;
@@ -1362,6 +1400,7 @@ struct ActiveSessionGuard;
 
 impl ActiveSessionGuard {
     fn new() -> Self {
+        let _access = crate::drivers::device_access();
         ACTIVE_SESSIONS.fetch_add(1, Ordering::AcqRel);
         Self
     }
@@ -1375,12 +1414,14 @@ impl Drop for ActiveSessionGuard {
 
 pub async fn serve(mut socket: WebSocket) {
     let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
-    let _active = ActiveSessionGuard::new();
+    let Ok(_active) = tokio::task::spawn_blocking(ActiveSessionGuard::new).await else {
+        return;
+    };
     tracing::info!(session_id, "HID websocket connected");
     start_resume_watch();
     let mut resume_seen = RESUME_GENERATION.load(Ordering::Acquire);
     let mut resume_tick = tokio::time::interval(Duration::from_secs(1));
-    let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+    let (input_tx, mut input_rx, mut failure_rx) = input_channel();
     let session = match HidSession::new(session_id, input_tx) {
         Ok(session) => Arc::new(Mutex::new(session)),
         Err(error) => {
@@ -1392,6 +1433,11 @@ pub async fn serve(mut socket: WebSocket) {
 
     loop {
         tokio::select! {
+            biased;
+            _ = failure_rx.changed() => {
+                tracing::warn!(session_id, "HID input overflow; disconnecting session");
+                break;
+            }
             message = socket.recv() => {
                 let Some(Ok(message)) = message else { break };
                 let Message::Text(text) = message else {
@@ -1452,9 +1498,26 @@ pub async fn serve(mut socket: WebSocket) {
     tracing::info!(session_id, "HID websocket disconnected");
 }
 
-async fn send_json(socket: &mut WebSocket, value: &impl Serialize) -> Result<(), axum::Error> {
-    let json = serde_json::to_string(value).expect("serializing a fixed HID response cannot fail");
-    socket.send(Message::Text(json.into())).await
+trait HidSocket {
+    fn send(
+        &mut self,
+        message: Message,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+}
+
+impl HidSocket for WebSocket {
+    async fn send(&mut self, message: Message) -> Result<(), String> {
+        WebSocket::send(self, message)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+async fn send_json(socket: &mut impl HidSocket, value: &impl Serialize) -> Result<(), String> {
+    let json = serde_json::to_string(value).map_err(|error| error.to_string())?;
+    tokio::time::timeout(SOCKET_SEND_TIMEOUT, socket.send(Message::Text(json.into())))
+        .await
+        .map_err(|_| "HID socket send deadline exceeded; session disconnected".to_owned())?
 }
 
 #[cfg(test)]
@@ -1464,6 +1527,66 @@ mod tests {
     /// Logitech receivers also split their report paths across several HID
     /// entries; used only to pin the grouping rule for them here.
     const LOGITECH_VENDOR_ID: u16 = 0x046D;
+
+    struct FakeSocket {
+        stalled: bool,
+        frames: Vec<Message>,
+    }
+
+    impl HidSocket for FakeSocket {
+        async fn send(&mut self, message: Message) -> Result<(), String> {
+            if self.stalled {
+                std::future::pending::<()>().await;
+            }
+            self.frames.push(message);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn input_overflow_is_terminal_and_never_silently_accepts_reports() {
+        let (tx, rx, failure) = input_channel();
+        let report = || InputReport {
+            kind: "inputreport",
+            device: "fake".into(),
+            report_id: 1,
+            data: vec![7],
+        };
+        for _ in 0..INPUT_QUEUE_CAPACITY {
+            tx.send(report()).unwrap();
+        }
+        assert!(tx.send(report()).is_err());
+        assert!(*failure.borrow());
+        assert_eq!(rx.len(), INPUT_QUEUE_CAPACITY);
+        assert!(tx.send(report()).is_err());
+    }
+
+    #[tokio::test]
+    async fn protocol_replies_are_delivered_or_fail_at_the_send_deadline() {
+        let mut fast = FakeSocket {
+            stalled: false,
+            frames: Vec::new(),
+        };
+        send_json(&mut fast, &Reply::ok(77)).await.unwrap();
+        let Message::Text(frame) = &fast.frames[0] else {
+            panic!("expected text reply");
+        };
+        let reply: serde_json::Value = serde_json::from_str(frame).unwrap();
+        assert_eq!(reply["id"], 77);
+        assert_eq!(reply["ok"], true);
+        let mut slow = FakeSocket {
+            stalled: true,
+            frames: Vec::new(),
+        };
+        let outcome = tokio::time::timeout(
+            SOCKET_SEND_TIMEOUT + Duration::from_secs(1),
+            send_json(&mut slow, &Reply::ok(78)),
+        )
+        .await
+        .expect("send must return its explicit deadline error");
+        assert!(outcome.unwrap_err().contains("deadline"));
+        assert!(slow.frames.is_empty());
+    }
 
     #[test]
     fn descriptor_becomes_webhid_collections_and_report_lengths() {
@@ -1495,39 +1618,40 @@ mod tests {
     }
 
     #[test]
-    fn multi_interface_devices_group_into_one_logical_device_everywhere() {
-        // A physical mouse that reports a serial number is one logical device
-        // everywhere, so its interfaces never become separate connect cards.
-        assert!(should_group_interfaces(0x1234, true));
-        assert!(should_group_interfaces(RAZER_VENDOR_ID, true));
-        assert!(should_group_interfaces(LOGITECH_VENDOR_ID, true));
-        // Without a serial, one logical device per vendor:product on every
-        // platform too — the OS splits report paths into separate enumeration
-        // entries, so grouping them is what keeps a serial-less receiver from
-        // surfacing one card per path. Two identical serial-less mice of the
-        // same model merge; that is the same trade-off the WebHID path makes.
-        assert!(should_group_interfaces(RAZER_VENDOR_ID, false));
-        assert!(should_group_interfaces(LOGITECH_VENDOR_ID, false));
-        assert!(should_group_interfaces(0x1234, false));
-        assert_eq!(
-            grouped_device_key(RAZER_VENDOR_ID, 0x00b0, Some("receiver-123")),
-            grouped_device_key(RAZER_VENDOR_ID, 0x00b0, Some("receiver-123"))
+    fn opaque_interfaces_do_not_merge_without_verified_physical_identity() {
+        assert_ne!(
+            grouped_device_key(0x046d, 0xc54d, b"opaque-A", None),
+            grouped_device_key(0x046d, 0xc54d, b"opaque-B", None)
         );
         assert_eq!(
-            grouped_device_key(LOGITECH_VENDOR_ID, 0xc54d, None),
-            grouped_device_key(LOGITECH_VENDOR_ID, 0xc54d, None)
+            grouped_device_key(0x046d, 0xc54d, b"opaque-A", None),
+            grouped_device_key(0x046d, 0xc54d, b"opaque-A", None)
         );
         assert_ne!(
-            grouped_device_key(RAZER_VENDOR_ID, 0x00b0, Some("receiver-123")),
-            grouped_device_key(RAZER_VENDOR_ID, 0x00b0, Some("receiver-456"))
+            grouped_device_key(0x046d, 0xc54d, b"opaque-A", None),
+            grouped_device_key(0x1532, 0xc54d, b"opaque-A", None)
         );
         assert_ne!(
-            grouped_device_key(RAZER_VENDOR_ID, 0x00b0, None),
-            grouped_device_key(LOGITECH_VENDOR_ID, 0x00b0, None)
+            grouped_device_key(0x046d, 0xc54d, b"opaque-A", Some("")),
+            grouped_device_key(0x046d, 0xc54d, b"opaque-B", Some("")),
+            "an empty serial is no identity"
+        );
+    }
+
+    #[test]
+    fn collections_of_one_serial_bearing_device_group_together() {
+        assert_eq!(
+            grouped_device_key(0x1532, 0x00b0, b"col01", Some("receiver-123")),
+            grouped_device_key(0x1532, 0x00b0, b"col02", Some("receiver-123"))
         );
         assert_ne!(
-            grouped_device_key(LOGITECH_VENDOR_ID, 0xc54d, None),
-            grouped_device_key(LOGITECH_VENDOR_ID, 0xc548, None)
+            grouped_device_key(0x1532, 0x00b0, b"col01", Some("receiver-123")),
+            grouped_device_key(0x1532, 0x00b0, b"col01", Some("receiver-456"))
+        );
+        // A serial that happens to equal another device's path is still a different identity.
+        assert_ne!(
+            grouped_device_key(0x1532, 0x00b0, b"same", Some("same")),
+            grouped_device_key(0x1532, 0x00b0, b"same", None)
         );
     }
 
@@ -1586,7 +1710,7 @@ mod tests {
     fn inventory_removal_cleans_handles_and_preserves_other_sessions() {
         let session_id = u64::MAX - 41_138;
         let other_session_id = u64::MAX - 41_139;
-        let (input_tx, _) = mpsc::unbounded_channel();
+        let (input_tx, _, _) = input_channel();
         let mut session = HidSession::new(session_id, input_tx).unwrap();
         for (key, vendor_id, name) in [
             ("hid-1", RAZER_VENDOR_ID, "unplugged-test-mouse"),

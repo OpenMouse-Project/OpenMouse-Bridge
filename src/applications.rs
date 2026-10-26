@@ -21,7 +21,7 @@ pub struct ApplicationInfo {
 )]
 fn icon_id(path: &str) -> String {
     let mut hasher = DefaultHasher::new();
-    path.to_ascii_lowercase().hash(&mut hasher);
+    crate::games::path_key(path).hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
@@ -273,7 +273,7 @@ mod imp {
             if name.is_empty() || executable.is_empty() {
                 continue;
             }
-            let key = path.to_lowercase();
+            let key = path.clone();
             applications.entry(key).or_insert(ApplicationInfo {
                 name,
                 executable,
@@ -335,7 +335,7 @@ mod imp {
                 continue;
             }
             let foreground = foreground_pid.is_some_and(|pid| Pid::from_u32(pid) == process.pid());
-            let key = path.to_lowercase();
+            let key = path.clone();
             applications
                 .entry(key)
                 .and_modify(|application: &mut ApplicationInfo| {
@@ -427,6 +427,14 @@ pub use imp::{application_icon, visible_applications};
 #[cfg(test)]
 mod tests {
     use super::icon_id;
+
+    #[test]
+    fn posix_path_identity_preserves_case() {
+        assert_ne!(
+            icon_id("/Applications/Editor"),
+            icon_id("/Applications/editor")
+        );
+    }
 
     #[test]
     fn icon_ids_are_case_insensitive_like_application_paths() {

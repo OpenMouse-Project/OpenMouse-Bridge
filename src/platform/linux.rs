@@ -35,10 +35,11 @@ pub fn set_autostart(enabled: bool) -> Result<()> {
         return Ok(());
     }
     let executable = env::current_exe().context("could not locate the Bridge executable")?;
-    let desktop = format!(
-        "[Desktop Entry]\nType=Application\nName=OpenMouse Bridge\nExec=\"{}\"\nHidden=false\nX-GNOME-Autostart-enabled=true\nNoDisplay=true\n",
-        executable.display(),
-    );
+    let desktop = desktop_entry(
+        executable
+            .to_str()
+            .context("Bridge executable path is not Unicode")?,
+    )?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("could not create {}", parent.display()))?;
@@ -48,20 +49,46 @@ pub fn set_autostart(enabled: bool) -> Result<()> {
 
 fn autostart_path() -> Result<PathBuf> {
     let home = BaseDirs::new().context("the operating system did not provide a home directory")?;
-    Ok(home
-        .home_dir()
-        .join(".config/autostart")
-        .join(DESKTOP_FILE_NAME))
+    Ok(home.config_dir().join("autostart").join(DESKTOP_FILE_NAME))
+}
+
+fn desktop_entry(executable: &str) -> Result<String> {
+    anyhow::ensure!(
+        !executable
+            .chars()
+            .any(|character| character.is_control() || character == '='),
+        "Bridge executable path cannot be represented in a desktop entry"
+    );
+    let executable = executable
+        .chars()
+        .fold(String::new(), |mut value, character| {
+            match character {
+                '%' => value.push_str("%%"),
+                '\\' => value.push_str(r"\\\\"),
+                '"' | '$' | '`' => {
+                    value.push_str(r"\\");
+                    value.push(character);
+                }
+                _ => value.push(character),
+            }
+            value
+        });
+    Ok(format!(
+        "[Desktop Entry]\nType=Application\nName=OpenMouse Bridge\nExec=\"{executable}\"\nHidden=false\nX-GNOME-Autostart-enabled=true\nNoDisplay=true\n"
+    ))
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
-    fn desktop_entry_quotes_executable_paths() {
-        let entry = format!(
-            "[Desktop Entry]\nType=Application\nName=OpenMouse Bridge\nExec=\"{}\"\n",
-            "/opt/openmouse/openmouse-bridge"
+    fn desktop_entry_preserves_literal_exec_metacharacters() {
+        let entry = desktop_entry("/opt/50%/A \"$`B\\bridge").unwrap();
+        assert!(
+            entry.contains(r#"Exec="/opt/50%%/A \\"\\$\\`B\\\\bridge""#),
+            "{entry}"
         );
-        assert!(entry.contains("Exec=\"/opt/openmouse/openmouse-bridge\""));
+        assert!(desktop_entry("/opt/bad\nentry").is_err());
     }
 }

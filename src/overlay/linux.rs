@@ -438,12 +438,12 @@ impl Speaker {
             tracing::warn!("No audio player (paplay or aplay) for the notification chime");
             return Ok(());
         };
-        if let Some(mut stdin) = child.stdin.take() {
-            if stdin.write_all(&wav).is_err() {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Ok(());
-            }
+        if let Some(mut stdin) = child.stdin.take()
+            && stdin.write_all(&wav).is_err()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(());
         }
         self.playback = Some(child);
         Ok(())

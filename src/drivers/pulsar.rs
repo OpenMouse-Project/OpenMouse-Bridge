@@ -17,6 +17,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use hidapi::HidApi;
 
+use super::{NativeBattery, NativeStatus};
 use crate::config::ApplicationProfile;
 
 /// This driver's slot in `crate::drivers`' brand registry — matches the
@@ -37,6 +38,43 @@ pub fn apply(profile: &ApplicationProfile) -> Result<()> {
     Ok(())
 }
 
+/// Opens the connected Pulsar mouse and reads its onboard-memory state —
+/// the battery via the same `batteryLevel` query (command `0x04`, percent in
+/// response byte 5, charge flag in byte 6) the WebHID driver's `readStatus`
+/// uses, plus the active DPI stage and polling rate from flash, all inside
+/// one host-control handshake. `Ok(None)` means the mouse answered but
+/// reported no battery (byte 5 above 100).
+pub fn read_status() -> Result<Option<NativeStatus>> {
+    let device = PulsarDevice::open()?;
+    device.with_device_control(|| {
+        // The same flash reads `set_dpi`/`set_polling_rate` confirm their
+        // writes with, so the decode paths are hardware-verified.
+        let polling_rate_hz = decode_polling_rate(device.read_flash(flash::REPORT_RATE, 2)?[0]);
+        let stage = device.read_flash(flash::CURRENT_DPI, 2)?[0].min(7) as u16;
+        let dpi = decode_dpi(&device.read_flash(flash::DPI_VALUES + stage * 4, 4)?);
+        let response = device.query(command::BATTERY_LEVEL, &[])?;
+        assert_accepted(&response, "battery query")?;
+        let percent = response[5];
+        if percent > 100 {
+            return Ok(None);
+        }
+        Ok(Some(NativeStatus {
+            battery: NativeBattery {
+                percent,
+                charging: response[6] == 1,
+                // The report-8 battery query carries no model name; the HID
+                // product string discovery already read is the best
+                // available.
+                reported_name: None,
+            },
+            dpi,
+            polling_rate_hz,
+            // The report-8 protocol has no LightForce equivalent.
+            switch_mode: None,
+        }))
+    })
+}
+
 /// Real Pulsar-branded mice and dongles. The Pulsar 4K Wireless Receiver
 /// shares a report-8 16-byte protocol but enumerates under a different,
 /// shared vendor id (0x3554) that other brands also use — out of scope here.
@@ -49,6 +87,7 @@ const EXCHANGE_TIMEOUT: Duration = Duration::from_millis(1200);
 mod command {
     pub const ENCRYPTION_DATA: u8 = 0x01;
     pub const DEVICE_ONLINE: u8 = 0x03;
+    pub const BATTERY_LEVEL: u8 = 0x04;
     pub const WRITE_FLASH_DATA: u8 = 0x07;
     pub const READ_FLASH_DATA: u8 = 0x08;
 }

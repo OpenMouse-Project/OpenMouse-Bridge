@@ -1,10 +1,13 @@
 pub mod api;
 pub mod applications;
+pub mod buttons;
 pub mod config;
 pub mod drivers;
 pub mod games;
 mod hid;
+pub mod local_targets;
 pub mod platform;
+pub mod remote_image;
 pub mod service;
 pub mod updater;
 
