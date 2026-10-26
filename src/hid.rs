@@ -915,8 +915,11 @@ impl HidSession {
             .open_devices
             .get(key)
             .ok_or_else(|| "the HID interface is not open".to_owned())?;
-        if open.paths.len() != 1 {
-            return Err("HID physical identity is ambiguous; refusing report fan-out".into());
+        // An open device has several paths only when `inspect_candidate` verified
+        // they share one serial; the loop below sends to the path that declares
+        // the report.
+        if open.paths.is_empty() {
+            return Err("the HID interface has no open path".into());
         }
         let _access = crate::drivers::manual_report_access(open.vendor_id)
             .map_err(|error| error.to_string())?;
@@ -1113,6 +1116,14 @@ fn device_group_key(info: &hidapi::DeviceInfo) -> Vec<u8> {
     )
 }
 
+/// True when every interface reports the same non-empty serial.
+fn shares_verified_serial<'a>(mut serials: impl Iterator<Item = Option<&'a str>>) -> bool {
+    match serials.next().flatten().filter(|serial| !serial.is_empty()) {
+        Some(first) => serials.all(|serial| serial == Some(first)),
+        None => false,
+    }
+}
+
 fn inspect_candidate(
     api: &HidApi,
     key: String,
@@ -1129,7 +1140,11 @@ fn inspect_candidate(
         }
     }
 
-    if unique_paths.len() != 1 {
+    // Several paths are the collections of one device only when they share a
+    // verified serial; that is the one case `grouped_device_key` merges them.
+    if unique_paths.len() > 1
+        && !shares_verified_serial(infos.iter().map(hidapi::DeviceInfo::serial_number))
+    {
         return Err("HID physical identity is ambiguous; refusing multi-path access".into());
     }
 
@@ -1653,6 +1668,22 @@ mod tests {
             grouped_device_key(0x1532, 0x00b0, b"same", Some("same")),
             grouped_device_key(0x1532, 0x00b0, b"same", None)
         );
+    }
+
+    #[test]
+    fn several_paths_open_only_under_one_verified_serial() {
+        assert!(shares_verified_serial(
+            [Some("receiver-123"), Some("receiver-123")].into_iter()
+        ));
+        assert!(!shares_verified_serial(
+            [Some("receiver-123"), Some("receiver-456")].into_iter()
+        ));
+        assert!(!shares_verified_serial(
+            [Some("receiver-123"), None].into_iter()
+        ));
+        assert!(!shares_verified_serial([None, None].into_iter()));
+        assert!(!shares_verified_serial([Some(""), Some("")].into_iter()));
+        assert!(!shares_verified_serial(std::iter::empty()));
     }
 
     #[test]
