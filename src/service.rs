@@ -893,8 +893,8 @@ impl BridgeService {
     pub async fn application_icon(&self, icon_id: &str) -> Option<Vec<u8>> {
         let path = {
             let state = self.inner.read().await;
-            if let Some(icon) = state.application_icons.get(icon_id) {
-                return icon.clone();
+            if let Some(Some(icon)) = state.application_icons.get(icon_id) {
+                return Some(icon.clone());
             }
             state
                 .config
@@ -908,11 +908,22 @@ impl BridgeService {
             .await
             .ok()
             .flatten();
-        self.inner
-            .write()
-            .await
-            .application_icons
-            .insert(icon_id.to_owned(), icon.clone());
+        // A failed extraction is not cached, so a path that comes back later gets
+        // its icon. The saved list may have changed while the icon was read, so it
+        // is cached only while a saved application still owns this id.
+        if let Some(icon) = &icon {
+            let mut state = self.inner.write().await;
+            let owned = state
+                .config
+                .local_applications
+                .iter()
+                .any(|target| applications::icon_id(&target.path) == icon_id);
+            if owned {
+                state
+                    .application_icons
+                    .insert(icon_id.to_owned(), Some(icon.clone()));
+            }
+        }
         icon
     }
 
@@ -1041,6 +1052,14 @@ impl BridgeService {
             Ok(())
         })
         .await?;
+        // A removed application's icon is not served any more.
+        let mut guard = self.inner.write().await;
+        let state = &mut *guard;
+        prune_application_icons(
+            &mut state.application_icons,
+            &state.running_applications,
+            &state.config.local_applications,
+        );
         Ok(canonical)
     }
 
@@ -2610,6 +2629,69 @@ mod tests {
 
         assert_eq!(icons.len(), 1);
         assert!(icons.contains_key(&saved_icon));
+    }
+
+    fn saved_editor() -> LocalApplication {
+        serde_json::from_value(serde_json::json!({"id":"local:editor","name":"Editor","executable":"Editor.exe","path":"C:\\Missing\\Editor.exe","kind":"app"})).unwrap()
+    }
+
+    #[tokio::test]
+    async fn removing_a_saved_application_drops_its_cached_icon() {
+        let saved = saved_editor();
+        let icon_id = applications::icon_id(&saved.path);
+        let path =
+            std::env::temp_dir().join(format!("openmouse-icon-test-{}.json", std::process::id()));
+        let bridge = BridgeService::new(
+            BridgeConfig {
+                local_applications: vec![saved],
+                ..BridgeConfig::default()
+            },
+            path.clone(),
+        );
+        bridge
+            .inner
+            .write()
+            .await
+            .application_icons
+            .insert(icon_id.clone(), Some(vec![1]));
+        assert_eq!(bridge.application_icon(&icon_id).await, Some(vec![1]));
+
+        bridge.replace_local_applications(Vec::new()).await.unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            !bridge
+                .inner
+                .read()
+                .await
+                .application_icons
+                .contains_key(&icon_id)
+        );
+        assert_eq!(bridge.application_icon(&icon_id).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_icon_extraction_is_not_cached() {
+        let saved = saved_editor();
+        let icon_id = applications::icon_id(&saved.path);
+        let bridge = service(BridgeConfig {
+            local_applications: vec![saved],
+            ..BridgeConfig::default()
+        });
+
+        assert_eq!(
+            bridge.application_icon(&icon_id).await,
+            None,
+            "the path does not exist"
+        );
+        assert!(
+            !bridge
+                .inner
+                .read()
+                .await
+                .application_icons
+                .contains_key(&icon_id)
+        );
     }
 
     #[tokio::test]
