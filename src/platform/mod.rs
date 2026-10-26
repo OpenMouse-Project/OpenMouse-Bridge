@@ -21,7 +21,7 @@ pub use windows::{
 };
 
 #[cfg(target_os = "macos")]
-pub use macos::{autostart_enabled, linux_distribution, platform_name, set_autostart};
+pub use macos::{autostart_enabled, bundle_root, linux_distribution, platform_name, set_autostart};
 
 #[cfg(target_os = "linux")]
 pub use linux::{autostart_enabled, linux_distribution, platform_name, set_autostart};
@@ -158,9 +158,7 @@ pub fn notify(summary: &str, body: &str) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn macos_is_bundled() -> bool {
-    std::env::current_exe()
-        .map(|path| path.to_string_lossy().contains(".app/Contents/MacOS/"))
-        .unwrap_or(false)
+    bundle_root().is_some()
 }
 
 #[cfg(target_os = "macos")]
