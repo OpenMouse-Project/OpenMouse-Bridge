@@ -843,6 +843,9 @@ impl HidSession {
             .get_mut(key)
             .ok_or_else(|| "the HID interface must be open before listening".to_owned())?;
         let stop = Arc::new(AtomicBool::new(false));
+        // Stored before any reader starts, so a later spawn failure can stop and
+        // join the readers already running instead of leaving them to block cleanup.
+        open.stop = Some(Arc::clone(&stop));
         for (index, (device, buffer_len, uses_report_ids)) in reader_specs.into_iter().enumerate() {
             let thread_stop = Arc::clone(&stop);
             let tx = self.input_tx.clone();
@@ -884,12 +887,16 @@ impl HidSession {
                             }
                         }
                     }
-                })
-                .map_err(|error| format!("could not start the HID input reader: {error}"))?;
-            open.readers.push(reader);
+                });
+            match reader {
+                Ok(reader) => open.readers.push(reader),
+                Err(error) => {
+                    open.stop_reader();
+                    return Err(format!("could not start the HID input reader: {error}"));
+                }
+            }
         }
         open.listening = true;
-        open.stop = Some(stop);
         Ok(())
     }
 
@@ -916,8 +923,7 @@ impl HidSession {
             .get(key)
             .ok_or_else(|| "the HID interface is not open".to_owned())?;
         // An open device has several paths only when `inspect_candidate` verified
-        // they share one serial; the loop below sends to the path that declares
-        // the report.
+        // they share one serial. A report still goes to exactly one of them.
         if open.paths.is_empty() {
             return Err("the HID interface has no open path".into());
         }
@@ -926,27 +932,10 @@ impl HidSession {
         let mut frame = Vec::with_capacity(data.len() + 1);
         frame.push(report_id);
         frame.extend_from_slice(&data);
-        let mut sent = false;
         let mut last_error = None;
-        let declared_path_exists = open.paths.iter().any(|path| {
-            let reports = if feature {
-                &path.layout.feature_bits
-            } else {
-                &path.layout.output_bits
-            };
-            reports.contains_key(&report_id)
-        });
-        for path in &open.paths {
-            if declared_path_exists {
-                let reports = if feature {
-                    &path.layout.feature_bits
-                } else {
-                    &path.layout.output_bits
-                };
-                if !reports.contains_key(&report_id) {
-                    continue;
-                }
-            }
+        let layouts: Vec<&ReportLayout> = open.paths.iter().map(|path| &path.layout).collect();
+        for index in report_paths(&layouts, report_id, feature) {
+            let path = &open.paths[index];
             let result = path
                 .device
                 .lock()
@@ -959,20 +948,18 @@ impl HidSession {
                     }
                     .map_err(|error| error.to_string())
                 });
+            // The first path that takes the report is the only one written, so a
+            // command never reaches the device twice.
             match result {
-                Ok(()) => sent = true,
+                Ok(()) => return Ok(()),
                 Err(error) => last_error = Some(error),
             }
         }
-        if sent {
-            Ok(())
-        } else {
-            let operation = if feature { "feature" } else { "output" };
-            Err(format!(
-                "could not send {operation} report {report_id}: {}",
-                last_error.unwrap_or_else(|| "no HID path was open".to_owned())
-            ))
-        }
+        let operation = if feature { "feature" } else { "output" };
+        Err(format!(
+            "could not send {operation} report {report_id}: {}",
+            last_error.unwrap_or_else(|| "no HID path was open".to_owned())
+        ))
     }
 
     fn receive_input_report(&self, key: &str, report_id: u8) -> Result<Vec<u8>, String> {
@@ -1114,6 +1101,27 @@ fn device_group_key(info: &hidapi::DeviceInfo) -> Vec<u8> {
         info.path().to_bytes(),
         info.serial_number(),
     )
+}
+
+/// The paths to try for a report, in order: those whose descriptor declares it,
+/// or every path when none does (Razer descriptors are not parsed). The sender
+/// stops at the first path that takes the report.
+fn report_paths(layouts: &[&ReportLayout], report_id: u8, feature: bool) -> Vec<usize> {
+    let declares = |layout: &ReportLayout| {
+        if feature {
+            layout.feature_bits.contains_key(&report_id)
+        } else {
+            layout.output_bits.contains_key(&report_id)
+        }
+    };
+    let declared: Vec<usize> = (0..layouts.len())
+        .filter(|&index| declares(layouts[index]))
+        .collect();
+    if declared.is_empty() {
+        (0..layouts.len()).collect()
+    } else {
+        declared
+    }
 }
 
 /// True when every interface reports the same non-empty serial.
@@ -1684,6 +1692,22 @@ mod tests {
         assert!(!shares_verified_serial([None, None].into_iter()));
         assert!(!shares_verified_serial([Some(""), Some("")].into_iter()));
         assert!(!shares_verified_serial(std::iter::empty()));
+    }
+
+    #[test]
+    fn a_report_goes_to_the_paths_that_declare_it_first() {
+        let mut vendor = ReportLayout::default();
+        vendor.feature_bits.insert(0x11, 160);
+        vendor.output_bits.insert(0x10, 48);
+        let mouse = ReportLayout::default();
+        let mut second = ReportLayout::default();
+        second.feature_bits.insert(0x11, 160);
+        let layouts = [&mouse, &vendor, &second];
+        assert_eq!(report_paths(&layouts, 0x11, true), vec![1, 2]);
+        assert_eq!(report_paths(&layouts, 0x10, false), vec![1]);
+        // Undeclared (a Razer path without parsed descriptors): every path is a candidate, tried in order.
+        assert_eq!(report_paths(&layouts, 0x00, true), vec![0, 1, 2]);
+        assert!(report_paths(&[], 0x11, true).is_empty());
     }
 
     #[test]
