@@ -312,10 +312,15 @@ fn locate_node_binary() -> Option<PathBuf> {
 }
 
 /// The `native-hid/` directory a packaged Bridge release ships next to its
-/// executable, if the executable's location can be determined at all (it's
-/// an `Option` rather than a hard error because the fallback paths this
-/// module's callers use don't need it to succeed).
+/// executable (or, in a macOS `.app`, under `Contents/Resources/`), if the
+/// executable's location can be determined at all (it's an `Option` rather
+/// than a hard error because the fallback paths this module's callers use
+/// don't need it to succeed).
 fn installed_native_hid_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    if let Some(bundle) = crate::platform::bundle_root() {
+        return Some(bundle.join("Contents/Resources/native-hid"));
+    }
     Some(std::env::current_exe().ok()?.parent()?.join("native-hid"))
 }
 

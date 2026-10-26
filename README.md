@@ -247,6 +247,15 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
+## Install on macOS
+
+Download `OpenMouse-Bridge-macos-universal.dmg` from the latest release, open
+it, and drag OpenMouse Bridge to Applications. It runs as a menu bar app with
+no Terminal window. `packaging/macos/` holds the scripts that build the app
+bundle and DMG; the release workflow signs and notarizes them when the
+`MACOS_CERTIFICATE_BASE64`, `MACOS_CERTIFICATE_PASSWORD`, `MACOS_SIGN_IDENTITY`,
+`APPLE_ID`, `APPLE_TEAM_ID` and `APPLE_APP_PASSWORD` secrets are set.
+
 ## Install on Linux
 
 One-line install from the latest stable release (detects missing system
