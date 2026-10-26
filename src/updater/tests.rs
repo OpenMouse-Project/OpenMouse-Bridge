@@ -720,3 +720,202 @@ fn checksum_must_match_archive() {
         .is_err()
     );
 }
+
+#[test]
+fn macos_bundle_package_layout_requires_every_bundled_file() {
+    let root = fixture();
+    let layout = PackageLayout::macos_bundle();
+    let node = layout.native_hid.join("node/bin/node");
+    let mut names = vec![
+        layout.binary.clone(),
+        layout.native_hid.join("src/apply.mjs"),
+        layout.native_hid.join("src/brands.mjs"),
+        layout.native_hid.join("src/hid-device-adapter.mjs"),
+        layout.native_hid.join("src/attack-shark-x11.mjs"),
+        layout.native_hid.join("package.json"),
+        node,
+        layout.native_hid.join("node_modules/node-hid/package.json"),
+        layout
+            .native_hid
+            .join("node_modules/@openmouse/protocol/package.json"),
+        layout
+            .native_hid
+            .join("node_modules/@openmouse/keyboard-protocol/package.json"),
+    ];
+    names.extend(layout.extra.iter().cloned());
+    for name in &names {
+        let path = root.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"inert-fixture").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+    assert!(
+        verify_package_with(&root, &layout).is_err(),
+        "font license is mandatory inside the bundle"
+    );
+    fs::write(
+        root.join(&layout.license),
+        include_bytes!("../../assets/fonts/DM-Sans-OFL.txt"),
+    )
+    .unwrap();
+    verify_package_with(&root, &layout).unwrap();
+    assert!(
+        verify_package_with(&root, &PackageLayout::flat()).is_err(),
+        "a bundle is not a flat package"
+    );
+    for name in &names {
+        let path = root.join(name);
+        fs::remove_file(&path).unwrap();
+        assert!(
+            verify_package_with(&root, &layout).is_err(),
+            "accepted a bundle missing {}",
+            name.display()
+        );
+        fs::write(&path, b"inert-fixture").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn bundle_archive_paths_are_accepted_by_the_extractor() {
+    let bytes = archive(&[
+        // The extractor's executable check follows the running install's
+        // layout, which is flat under test.
+        (platform_binary_name(), b"flat"),
+        ("OpenMouse Bridge.app/Contents/Info.plist", b"plist"),
+        (
+            "OpenMouse Bridge.app/Contents/MacOS/openmouse-bridge",
+            b"bin",
+        ),
+    ]);
+    let root = fixture();
+    extract_archive(&bytes, &root).unwrap();
+    assert!(
+        root.join("OpenMouse Bridge.app/Contents/MacOS/openmouse-bridge")
+            .is_file()
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn generated_bundle_transaction_replaces_or_restores_the_app() {
+    for case in [
+        "success",
+        "existing-lock",
+        "copy-failure",
+        "commit-failure",
+        "rollback-failure",
+    ] {
+        let root = fixture();
+        let stage = root.join("stage");
+        let destination = root.join("install");
+        let staged_exe = stage.join("OpenMouse Bridge.app/Contents/MacOS");
+        let installed_exe = destination.join("Renamed Bridge.app/Contents/MacOS");
+        for directory in [&staged_exe, &installed_exe] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        fs::write(root.join("sandbox-marker"), b"bridge-update-fixture-only").unwrap();
+        fs::write(staged_exe.join("openmouse-bridge"), b"new-binary").unwrap();
+        fs::write(installed_exe.join("openmouse-bridge"), b"old-binary").unwrap();
+        fs::write(destination.join("sentinel"), b"untouched").unwrap();
+        if case == "existing-lock" {
+            fs::create_dir(destination.join(".openmouse-update.lock")).unwrap();
+        }
+        let script = root.join("sandbox.sh");
+        let contents = format!(
+            "{BUNDLE_TRANSACTION}\n{BUNDLE_COMPLETION}\n{}",
+            r#"
+root="$1"
+fixture_case="$2"
+[ "$(cat "$root/sandbox-marker")" = bridge-update-fixture-only ] || exit 90
+cp() {
+  if [ "$fixture_case" = copy-failure ]; then return 1; fi
+  command cp "$@"
+}
+mv() {
+  case "$1" in */new/*) if [ "$fixture_case" = commit-failure ] || [ "$fixture_case" = rollback-failure ]; then return 1; fi ;; esac
+  case "$1" in */old/*) if [ "$fixture_case" = rollback-failure ]; then return 1; fi ;; esac
+  command mv "$@"
+}
+record_launch() { cat "$1/$2/Contents/MacOS/openmouse-bridge" > "$root/launch-record"; }
+complete_bundle_update "$root/stage" "$root/install" "OpenMouse Bridge.app" "Renamed Bridge.app" record_launch
+"#
+        );
+        write_helper(&script, &contents).unwrap();
+        let output = Command::new("/bin/sh")
+            .arg(&script)
+            .arg(root.to_string_lossy().as_ref())
+            .arg(case)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            case != "rollback-failure",
+            "{case}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            root.join("launch-record").exists(),
+            case != "rollback-failure",
+            "{case}: relaunch eligibility"
+        );
+        if case == "rollback-failure" {
+            assert!(destination.join(".openmouse-update.lock").exists());
+            fs::remove_dir_all(root).unwrap();
+            continue;
+        }
+        let expected: &[u8] = if case == "success" {
+            b"new-binary"
+        } else {
+            b"old-binary"
+        };
+        assert_eq!(fs::read(root.join("launch-record")).unwrap(), expected);
+        assert_eq!(
+            fs::read(installed_exe.join("openmouse-bridge")).unwrap(),
+            expected,
+            "{case}: installed app"
+        );
+        assert_eq!(
+            fs::read(destination.join("sentinel")).unwrap(),
+            b"untouched"
+        );
+        assert!(!destination.join("OpenMouse Bridge.app").exists());
+        assert_eq!(
+            fs::read_dir(&destination).unwrap().count(),
+            if case == "existing-lock" { 3 } else { 2 },
+            "{case}: no transaction leftovers"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn archives_larger_than_the_metadata_budget_still_open() {
+    use std::io::Write;
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let stored =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    writer.start_file(platform_binary_name(), stored).unwrap();
+    // Real release archives are tens of megabytes; opening one must not read
+    // the whole file as "metadata".
+    let block = vec![0x5a; 1024 * 1024];
+    for _ in 0..(MAX_ZIP_METADATA_READ_BYTES / block.len() + 4) {
+        writer.write_all(&block).unwrap();
+    }
+    let bytes = writer.finish().unwrap().into_inner();
+    assert!(bytes.len() > MAX_ZIP_METADATA_READ_BYTES);
+    let root = fixture();
+    extract_archive(&bytes, &root).unwrap();
+    assert!(root.join(platform_binary_name()).is_file());
+    fs::remove_dir_all(root).unwrap();
+}

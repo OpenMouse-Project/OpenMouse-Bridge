@@ -22,6 +22,9 @@ const UPDATE_URL_ENV: &str = "OPENMOUSE_BRIDGE_UPDATE_API_URL";
 const USER_AGENT: &str = "OpenMouse-Bridge-Updater";
 const CHECK_TIMEOUT: Duration = Duration::from_secs(8);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// The bundle a macOS app-update archive carries at its root.
+#[cfg(any(target_os = "macos", test))]
+const MACOS_APP_NAME: &str = "OpenMouse Bridge.app";
 
 #[derive(Clone, Debug)]
 pub struct UpdateInfo {
@@ -153,8 +156,14 @@ fn asset_url(assets: &[ReleaseAsset], name: &str) -> Result<String> {
 }
 
 fn platform_archive_name() -> Result<&'static str> {
+    // Installs from the DMG run as a signed .app and are replaced as a whole
+    // bundle; bare-binary installs keep following the original zip.
     #[cfg(target_os = "macos")]
-    return Ok("openmouse-bridge-macos-universal.zip");
+    return Ok(if crate::platform::bundle_root().is_some() {
+        "openmouse-bridge-macos-app.zip"
+    } else {
+        "openmouse-bridge-macos-universal.zip"
+    });
     #[cfg(target_os = "windows")]
     return Ok("openmouse-bridge-windows-x64.zip");
     #[cfg(target_os = "linux")]
@@ -232,22 +241,80 @@ fn stage_archive(archive: &[u8], version: &str) -> Result<()> {
     verify_package(&staging.path)?;
     let current_executable =
         env::current_exe().context("could not locate the Bridge executable")?;
-    let install_directory = current_executable
-        .parent()
-        .context("Bridge executable has no parent directory")?;
     ensure!(
         current_executable.file_name() == Some(std::ffi::OsStr::new(platform_binary_name())),
         "Bridge executable has an unexpected name"
     );
+    // A bundled install replaces the whole .app so its code signature stays
+    // intact; the directory that must be writable is the one holding it.
+    #[cfg(target_os = "macos")]
+    if let Some(bundle) = crate::platform::bundle_root() {
+        let install_directory = bundle
+            .parent()
+            .context("Bridge bundle has no parent directory")?;
+        let bundle_name = bundle
+            .file_name()
+            .context("Bridge bundle has no file name")?;
+        verify_install_targets(install_directory, &[bundle_name])?;
+        spawn_bundle_install_helper(&staging.path, install_directory, bundle_name)?;
+        staging.handed_off = true;
+        return Ok(());
+    }
+    let install_directory = current_executable
+        .parent()
+        .context("Bridge executable has no parent directory")?;
     verify_install_directory(install_directory)?;
     spawn_install_helper(&staging.path, install_directory, &current_executable)?;
     staging.handed_off = true;
     Ok(())
 }
 
+/// Where an update package keeps the files Bridge needs, relative to the
+/// extracted archive: flat next to the executable, or inside a macOS bundle.
+struct PackageLayout {
+    binary: std::path::PathBuf,
+    license: std::path::PathBuf,
+    native_hid: std::path::PathBuf,
+    extra: Vec<std::path::PathBuf>,
+}
+
+impl PackageLayout {
+    fn flat() -> Self {
+        Self {
+            binary: platform_binary_name().into(),
+            license: "DM-Sans-OFL.txt".into(),
+            native_hid: "native-hid".into(),
+            extra: Vec::new(),
+        }
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    fn macos_bundle() -> Self {
+        let app = Path::new(MACOS_APP_NAME);
+        Self {
+            binary: app.join("Contents/MacOS/openmouse-bridge"),
+            license: app.join("Contents/Resources/DM-Sans-OFL.txt"),
+            native_hid: app.join("Contents/Resources/native-hid"),
+            extra: vec![app.join("Contents/Info.plist")],
+        }
+    }
+
+    fn current() -> Self {
+        #[cfg(target_os = "macos")]
+        if crate::platform::bundle_root().is_some() {
+            return Self::macos_bundle();
+        }
+        Self::flat()
+    }
+}
+
 fn verify_package(staging: &Path) -> Result<()> {
+    verify_package_with(staging, &PackageLayout::current())
+}
+
+fn verify_package_with(staging: &Path, layout: &PackageLayout) -> Result<()> {
     verify_tree(staging)?;
-    let license = staging.join("DM-Sans-OFL.txt");
+    let license = staging.join(&layout.license);
     let expected = include_bytes!("../assets/fonts/DM-Sans-OFL.txt");
     ensure!(
         reject_link(&license)?.is_file() && fs::metadata(&license)?.len() == expected.len() as u64,
@@ -258,36 +325,41 @@ fn verify_package(staging: &Path) -> Result<()> {
         "update package contains an incomplete DM Sans license"
     );
     let node = if cfg!(windows) {
-        "native-hid/node/node.exe"
+        layout.native_hid.join("node/node.exe")
     } else {
-        "native-hid/node/bin/node"
+        layout.native_hid.join("node/bin/node")
     };
-    for name in [
-        platform_binary_name(),
-        "native-hid/src/apply.mjs",
-        "native-hid/src/brands.mjs",
-        "native-hid/src/hid-device-adapter.mjs",
-        "native-hid/src/attack-shark-x11.mjs",
-        "native-hid/package.json",
-        node,
-        "native-hid/node_modules/node-hid/package.json",
-        "native-hid/node_modules/@openmouse/protocol/package.json",
-        "native-hid/node_modules/@openmouse/keyboard-protocol/package.json",
-    ] {
+    let hid = &layout.native_hid;
+    let mut required = vec![
+        layout.binary.clone(),
+        hid.join("src/apply.mjs"),
+        hid.join("src/brands.mjs"),
+        hid.join("src/hid-device-adapter.mjs"),
+        hid.join("src/attack-shark-x11.mjs"),
+        hid.join("package.json"),
+        node.clone(),
+        hid.join("node_modules/node-hid/package.json"),
+        hid.join("node_modules/@openmouse/protocol/package.json"),
+        hid.join("node_modules/@openmouse/keyboard-protocol/package.json"),
+    ];
+    required.extend(layout.extra.iter().cloned());
+    for name in &required {
         let path = staging.join(name);
         verify_directory_chain(path.parent().context("missing package parent")?)?;
-        let metadata =
-            reject_link(&path).with_context(|| format!("update package is missing {name}"))?;
+        let metadata = reject_link(&path)
+            .with_context(|| format!("update package is missing {}", name.display()))?;
         ensure!(
             metadata.is_file() && metadata.len() > 0,
-            "update package file is empty or invalid: {name}"
+            "update package file is empty or invalid: {}",
+            name.display()
         );
         #[cfg(unix)]
-        if name == platform_binary_name() || name == node {
+        if *name == layout.binary || *name == node {
             use std::os::unix::fs::PermissionsExt;
             ensure!(
                 metadata.permissions().mode() & 0o500 == 0o500,
-                "update executable requires owner read and execute access: {name}"
+                "update executable requires owner read and execute access: {}",
+                name.display()
             );
         }
     }
@@ -458,8 +530,17 @@ fn extract_archive_with_limits(
         inner: Cursor::new(archive),
         metadata_budget: &metadata_budget,
     };
-    let mut zip = zip::ZipArchive::new(reader)
-        .context("update archive is invalid or exceeds metadata budget")?;
+    // Update archives never carry prepended data. Without a known offset the
+    // zip crate scans the whole file forward looking for the central
+    // directory, which spends the entire metadata budget on any archive
+    // larger than it - that is, every real release.
+    let mut zip = zip::ZipArchive::with_config(
+        zip::read::Config {
+            archive_offset: zip::read::ArchiveOffset::Known(0),
+        },
+        reader,
+    )
+    .context("update archive is invalid or exceeds metadata budget")?;
     metadata_budget.set(None);
     ensure!(zip.len() <= entries, "update archive has too many entries");
     let mut declared_total = 0u64;
@@ -566,25 +647,34 @@ fn extract_archive_with_limits(
         }
     }
     ensure!(
-        reject_link(&staging.join(platform_binary_name()))?.is_file(),
+        reject_link(&staging.join(&PackageLayout::current().binary))?.is_file(),
         "update archive does not contain the Bridge executable"
     );
     Ok(())
 }
 
 fn verify_install_directory(directory: &Path) -> Result<()> {
+    verify_install_targets(
+        directory,
+        &[
+            std::ffi::OsStr::new(platform_binary_name()),
+            std::ffi::OsStr::new("native-hid"),
+            std::ffi::OsStr::new("openmouse-app-icon.png"),
+            std::ffi::OsStr::new("DM-Sans-OFL.txt"),
+        ],
+    )
+}
+
+/// Checks that `directory` is a plain, unlocked, writable directory and that
+/// every existing entry named in `names` is a link-free tree.
+fn verify_install_targets(directory: &Path, names: &[&std::ffi::OsStr]) -> Result<()> {
     verify_directory_chain(directory)?;
     match fs::symlink_metadata(directory.join(".openmouse-update.lock")) {
         Ok(_) => anyhow::bail!("Bridge update lock already exists"),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("could not inspect Bridge update lock"),
     }
-    for name in [
-        platform_binary_name(),
-        "native-hid",
-        "openmouse-app-icon.png",
-        "DM-Sans-OFL.txt",
-    ] {
+    for name in names {
         let path = directory.join(name);
         match fs::symlink_metadata(&path) {
             Ok(_) => verify_tree(&path)?,
@@ -736,6 +826,100 @@ fn spawn_install_helper(staging: &Path, destination: &Path, executable: &Path) -
                 .file_name()
                 .context("Bridge executable has no file name")?,
         )
+        .spawn()
+        .context("could not launch the update helper")?;
+    Ok(())
+}
+
+/// Replaces one directory (a macOS `.app`) as a unit. Same lock, backup and
+/// rollback discipline as `UNIX_TRANSACTION`: status 2 means nothing changed.
+#[cfg(any(target_os = "macos", test))]
+const BUNDLE_TRANSACTION: &str = r#"install_bundle() (
+set -eu
+stage="$1"
+destination="$2"
+staged="$3"
+installed="$4"
+[ -d "$stage/$staged/Contents/MacOS" ] || exit 1
+for tree_root in "$stage" "$destination"; do
+  parent="$tree_root"
+  while [ "$parent" != / ]; do
+    [ -d "$parent" ] && [ ! -L "$parent" ] || exit 1
+    parent=$(dirname "$parent") || exit 1
+  done
+done
+special=$(find "$stage" ! -type f ! -type d -print) || exit 1
+[ -z "$special" ] || exit 1
+lock="$destination/.openmouse-update.lock"
+(umask 077; mkdir "$lock") || exit 2
+transaction=$(umask 077; mktemp -d "$destination/.openmouse-update.XXXXXXXX") || { rmdir "$lock" || :; exit 2; }
+committed=no
+rollback() {
+  status=$?
+  trap - 0 1 2 15
+  failed=no
+  if [ "$committed" != yes ]; then
+    if [ -e "$transaction/old/$installed" ]; then
+      rm -rf "$destination/$installed" && mv "$transaction/old/$installed" "$destination/$installed" || failed=yes
+    elif [ -f "$transaction/installed/marker" ]; then
+      rm -rf "$destination/$installed" || failed=yes
+    fi
+  fi
+  if [ "$failed" = yes ]; then
+    printf '%s\n' "Update rollback failed; backups retained at $transaction" >&2
+    exit 1
+  fi
+  rm -rf "$transaction"
+  rmdir "$lock"
+  if [ "$committed" != yes ]; then exit 2; fi
+  exit "$status"
+}
+trap rollback 0
+trap 'exit 1' 1 2 15
+mkdir "$transaction/new" "$transaction/old" "$transaction/installed" || exit 1
+if [ -e "$destination/$installed" ] || [ -L "$destination/$installed" ]; then
+  special=$(find "$destination/$installed" ! -type f ! -type d -print) || exit 1
+  [ -z "$special" ] || exit 1
+fi
+cp -R "$stage/$staged" "$transaction/new/$installed" || exit 1
+chmod u+x "$transaction/new/$installed/Contents/MacOS/openmouse-bridge" || exit 1
+if [ -e "$destination/$installed" ]; then mv "$destination/$installed" "$transaction/old/$installed" || exit 1; fi
+: > "$transaction/installed/marker" || exit 1
+mv "$transaction/new/$installed" "$destination/$installed" || exit 1
+committed=yes
+)
+"#;
+
+#[cfg(any(target_os = "macos", test))]
+const BUNDLE_COMPLETION: &str = r#"complete_bundle_update() {
+  if install_bundle "$1" "$2" "$3" "$4"; then
+    :
+  else
+    status=$?
+    [ "$status" -eq 2 ] || return 1
+  fi
+  "$5" "$2" "$4"
+}
+"#;
+
+#[cfg(target_os = "macos")]
+fn spawn_bundle_install_helper(
+    staging: &Path,
+    destination: &Path,
+    installed: &std::ffi::OsStr,
+) -> Result<()> {
+    let script = staging.join("install-update.sh");
+    let contents = format!(
+        "#!/bin/sh\n{BUNDLE_TRANSACTION}\n{BUNDLE_COMPLETION}\npid=\"$1\"\nstage=\"$2\"\ndestination=\"$3\"\nstaged=\"$4\"\ninstalled=\"$5\"\ntrap 'rm -rf \"$stage\"' 0\nwhile kill -0 \"$pid\" 2>/dev/null; do sleep 1; done\nlaunch_bundle() {{ open \"$1/$2\"; }}\ncomplete_bundle_update \"$stage\" \"$destination\" \"$staged\" \"$installed\" launch_bundle\n"
+    );
+    write_helper(&script, &contents)?;
+    Command::new("/bin/sh")
+        .arg(&script)
+        .arg(std::process::id().to_string())
+        .arg(staging)
+        .arg(destination)
+        .arg(MACOS_APP_NAME)
+        .arg(installed)
         .spawn()
         .context("could not launch the update helper")?;
     Ok(())
