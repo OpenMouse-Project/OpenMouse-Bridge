@@ -611,8 +611,8 @@ impl HidSession {
                 if !self.open_devices.contains_key(&key) {
                     let candidate = inspect_candidate(&self.api, key.clone(), &infos)?;
                     self.candidates.insert(key.clone(), candidate);
-                } else if let Err(error) = self.recover(&key) {
-                    tracing::warn!(session_id = self.session_id, device_key = %key, %error, "HID reopen after path change failed");
+                } else {
+                    self.recover(&key)?;
                 }
             }
             if let Some(candidate) = self.candidates.get(&key) {
