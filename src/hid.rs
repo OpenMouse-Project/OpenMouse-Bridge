@@ -600,9 +600,20 @@ impl HidSession {
                 self.device_keys.insert(device_id, key.clone());
                 key
             };
-            if !self.candidates.contains_key(&key) {
-                let candidate = inspect_candidate(&self.api, key.clone(), &infos)?;
-                self.candidates.insert(key.clone(), candidate);
+            let paths = infos.iter().map(|info| info.path()).collect::<HashSet<_>>();
+            if self.candidates.get(&key).is_none_or(|candidate| {
+                candidate.paths.len() != paths.len()
+                    || candidate
+                        .paths
+                        .iter()
+                        .any(|path| !paths.contains(path.path.as_c_str()))
+            }) {
+                if !self.open_devices.contains_key(&key) {
+                    let candidate = inspect_candidate(&self.api, key.clone(), &infos)?;
+                    self.candidates.insert(key.clone(), candidate);
+                } else {
+                    self.recover(&key)?;
+                }
             }
             if let Some(candidate) = self.candidates.get(&key) {
                 summaries.push(candidate.summary.clone());
@@ -922,8 +933,8 @@ impl HidSession {
             .open_devices
             .get(key)
             .ok_or_else(|| "the HID interface is not open".to_owned())?;
-        // An open device has several paths only when `inspect_candidate` verified
-        // they share one serial. A report still goes to exactly one of them.
+        // An open device has several paths only when `grouped_device_key` matched
+        // them by serial or Windows HID interface. A report still goes to exactly one.
         if open.paths.is_empty() {
             return Err("the HID interface has no open path".into());
         }
@@ -1082,13 +1093,19 @@ fn grouped_device_key(
     serial: Option<&str>,
 ) -> Vec<u8> {
     // A serial is a verified physical identity, so every collection of that
-    // device is one candidate. Without one, collections stay apart by path.
+    // device is one candidate. Without one, Windows collections group by their
+    // interface's OS-assigned parent instance; anything else stays apart by path.
     let serial = serial.filter(|serial| !serial.is_empty());
-    let identity = serial.map_or(path, str::as_bytes);
+    let interface = collection_interface(path);
+    let (kind, identity) = match (serial, &interface) {
+        (Some(serial), _) => (1, serial.as_bytes()),
+        (None, Some(interface)) => (2, interface.as_bytes()),
+        (None, None) => (0, path),
+    };
     let mut key = Vec::with_capacity(13 + identity.len());
     key.extend_from_slice(&vendor_id.to_le_bytes());
     key.extend_from_slice(&product_id.to_le_bytes());
-    key.push(u8::from(serial.is_some()));
+    key.push(kind);
     key.extend_from_slice(&(identity.len() as u64).to_le_bytes());
     key.extend_from_slice(identity);
     key
@@ -1124,12 +1141,13 @@ fn report_paths(layouts: &[&ReportLayout], report_id: u8, feature: bool) -> Vec<
     }
 }
 
-/// True when every interface reports the same non-empty serial.
-fn shares_verified_serial<'a>(mut serials: impl Iterator<Item = Option<&'a str>>) -> bool {
-    match serials.next().flatten().filter(|serial| !serial.is_empty()) {
-        Some(first) => serials.all(|serial| serial == Some(first)),
-        None => false,
-    }
+fn collection_interface(path: &[u8]) -> Option<String> {
+    let path = std::str::from_utf8(path).ok()?.to_ascii_lowercase();
+    let (hardware, rest) = path.strip_prefix(r"\\?\hid#")?.split_once('#')?;
+    let (instance, _) = rest.split_once('#')?;
+    let (hardware, _) = hardware.rsplit_once("&col")?;
+    let (parent, _) = instance.rsplit_once('&')?;
+    Some(format!("{hardware}#{parent}"))
 }
 
 fn inspect_candidate(
@@ -1146,14 +1164,6 @@ fn inspect_candidate(
         if seen_paths.insert(info.path().to_bytes().to_vec()) {
             unique_paths.push(info.path().to_owned());
         }
-    }
-
-    // Several paths are the collections of one device only when they share a
-    // verified serial; that is the one case `grouped_device_key` merges them.
-    if unique_paths.len() > 1
-        && !shares_verified_serial(infos.iter().map(hidapi::DeviceInfo::serial_number))
-    {
-        return Err("HID physical identity is ambiguous; refusing multi-path access".into());
     }
 
     let inspect_descriptors = primary.vendor_id() != RAZER_VENDOR_ID;
@@ -1173,19 +1183,19 @@ fn inspect_candidate(
             collections.append(&mut path_collections);
             path_layout
         } else {
+            collections.extend(
+                infos
+                    .iter()
+                    .filter(|info| info.path() == path.as_c_str())
+                    .map(|info| CollectionInfo {
+                        usage_page: info.usage_page(),
+                        usage: info.usage(),
+                        ..CollectionInfo::default()
+                    }),
+            );
             ReportLayout::default()
         };
         paths.push(CandidatePath { path, layout });
-    }
-    if collections.is_empty() {
-        collections = infos
-            .iter()
-            .map(|info| CollectionInfo {
-                usage_page: info.usage_page(),
-                usage: info.usage(),
-                ..CollectionInfo::default()
-            })
-            .collect();
     }
 
     Ok(Candidate {
@@ -1685,22 +1695,6 @@ mod tests {
             grouped_device_key(0x1532, 0x00b0, b"same", Some("same")),
             grouped_device_key(0x1532, 0x00b0, b"same", None)
         );
-    }
-
-    #[test]
-    fn several_paths_open_only_under_one_verified_serial() {
-        assert!(shares_verified_serial(
-            [Some("receiver-123"), Some("receiver-123")].into_iter()
-        ));
-        assert!(!shares_verified_serial(
-            [Some("receiver-123"), Some("receiver-456")].into_iter()
-        ));
-        assert!(!shares_verified_serial(
-            [Some("receiver-123"), None].into_iter()
-        ));
-        assert!(!shares_verified_serial([None, None].into_iter()));
-        assert!(!shares_verified_serial([Some(""), Some("")].into_iter()));
-        assert!(!shares_verified_serial(std::iter::empty()));
     }
 
     #[test]
