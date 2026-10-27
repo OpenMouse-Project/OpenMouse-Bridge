@@ -601,14 +601,19 @@ impl HidSession {
                 key
             };
             let paths = infos.iter().map(|info| info.path()).collect::<HashSet<_>>();
-            let open = self.open_devices.contains_key(&key);
-            if self
-                .candidates
-                .get(&key)
-                .is_none_or(|candidate| !open && candidate.paths.len() != paths.len())
-            {
-                let candidate = inspect_candidate(&self.api, key.clone(), &infos)?;
-                self.candidates.insert(key.clone(), candidate);
+            if self.candidates.get(&key).is_none_or(|candidate| {
+                candidate.paths.len() != paths.len()
+                    || candidate
+                        .paths
+                        .iter()
+                        .any(|path| !paths.contains(path.path.as_c_str()))
+            }) {
+                if !self.open_devices.contains_key(&key) {
+                    let candidate = inspect_candidate(&self.api, key.clone(), &infos)?;
+                    self.candidates.insert(key.clone(), candidate);
+                } else if let Err(error) = self.recover(&key) {
+                    tracing::warn!(session_id = self.session_id, device_key = %key, %error, "HID reopen after path change failed");
+                }
             }
             if let Some(candidate) = self.candidates.get(&key) {
                 summaries.push(candidate.summary.clone());
@@ -1178,19 +1183,19 @@ fn inspect_candidate(
             collections.append(&mut path_collections);
             path_layout
         } else {
+            collections.extend(
+                infos
+                    .iter()
+                    .filter(|info| info.path() == path.as_c_str())
+                    .map(|info| CollectionInfo {
+                        usage_page: info.usage_page(),
+                        usage: info.usage(),
+                        ..CollectionInfo::default()
+                    }),
+            );
             ReportLayout::default()
         };
         paths.push(CandidatePath { path, layout });
-    }
-    if collections.is_empty() {
-        collections = infos
-            .iter()
-            .map(|info| CollectionInfo {
-                usage_page: info.usage_page(),
-                usage: info.usage(),
-                ..CollectionInfo::default()
-            })
-            .collect();
     }
 
     Ok(Candidate {
