@@ -1560,6 +1560,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_opens_devices_without_seizing_them() {
+        // Initialising IOHID traps on the headless macos-14 release runner;
+        // Bridge CI still covers this on macOS 26.
+        if std::env::var_os("OPENMOUSE_SKIP_IOHID_TEST").is_some() {
+            return;
+        }
         let api = HidApi::new().expect("HID subsystem should initialize");
         assert!(!api.get_open_exclusive());
     }

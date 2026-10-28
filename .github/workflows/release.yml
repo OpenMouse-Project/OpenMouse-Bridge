@@ -95,6 +95,8 @@ jobs:
           cache-dependency-path: native-hid/package-lock.json
       - run: cargo fmt --check
       - run: cargo test --locked
+        env:
+          OPENMOUSE_SKIP_IOHID_TEST: "1"
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo build --release --locked --target aarch64-apple-darwin
       - run: cargo build --release --locked --target x86_64-apple-darwin
