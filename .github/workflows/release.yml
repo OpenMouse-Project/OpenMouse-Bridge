@@ -155,7 +155,10 @@ jobs:
       - name: Package DMG and app update archive
         run: |
           set -euo pipefail
-          python3 -m pip install --quiet dmgbuild
+          # Homebrew Python is externally managed (PEP 668), so use a venv.
+          python3 -m venv "$RUNNER_TEMP/dmgbuild-venv"
+          "$RUNNER_TEMP/dmgbuild-venv/bin/python" -m pip install --quiet dmgbuild
+          export PATH="$RUNNER_TEMP/dmgbuild-venv/bin:$PATH"
           packaging/macos/build-dmg.sh "dist/OpenMouse Bridge.app" OpenMouse-Bridge-macos-universal.dmg
           # Plain Info-ZIP (not ditto): the updater's strict extractor expects ordinary zip entries.
           (cd dist && zip -r -X -q "../openmouse-bridge-macos-app.zip" "OpenMouse Bridge.app")
