@@ -25,7 +25,10 @@
 set -euo pipefail
 
 REPO="OpenMouse-Project/OpenMouse-Bridge"
-ASSET="openmouse-bridge-linux-x64.zip"
+ASSET="openmouse-bridge-linux-x64-full.zip"
+# Releases before 1.0.0-beta.22 published the full package under this name;
+# since then it is a small archive for older updaters, not a usable install.
+LEGACY_ASSET="openmouse-bridge-linux-x64.zip"
 RAW_BASE="https://raw.githubusercontent.com/${REPO}/main"
 TAG="latest"
 INSTALL_DIR=""
@@ -377,7 +380,10 @@ main() {
     # hit "tmp: unbound variable" under `set -u` when it fires on EXIT.
     trap "rm -rf \"$tmp\"" EXIT
     log "Downloading OpenMouse Bridge ($TAG)..."
-    download "$(release_url)" "$tmp/$ASSET"
+    if ! download "$(release_url)" "$tmp/$ASSET"; then
+        ASSET="$LEGACY_ASSET"
+        download "$(release_url)" "$tmp/$ASSET"
+    fi
     download "$(release_url).sha256" "$tmp/$ASSET.sha256"
     (
         cd "$tmp"

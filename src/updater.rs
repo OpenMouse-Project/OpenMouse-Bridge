@@ -46,6 +46,18 @@ struct ReleaseAsset {
 }
 
 pub async fn check_for_update() -> Result<Option<UpdateInfo>> {
+    let release = fetch_latest_release().await?;
+    select_update(release, crate::BRIDGE_VERSION)
+}
+
+/// The release to finish a stub install with: the latest one, even when it is
+/// the version already running, because the install only lacks its payload.
+pub async fn check_for_stub_completion() -> Result<UpdateInfo> {
+    let release = fetch_latest_release().await?;
+    select_completion(release, crate::BRIDGE_VERSION)
+}
+
+async fn fetch_latest_release() -> Result<Release> {
     let url = env::var(UPDATE_URL_ENV).unwrap_or_else(|_| LATEST_RELEASE_URL.to_owned());
     let client = reqwest::Client::builder()
         .timeout(CHECK_TIMEOUT)
@@ -60,9 +72,7 @@ pub async fn check_for_update() -> Result<Option<UpdateInfo>> {
         .error_for_status()
         .with_context(|| format!("update check failed for {url}"))?;
     let bytes = read_bounded_response(response, MAX_RELEASE_BYTES).await?;
-    let release = serde_json::from_slice::<Release>(&bytes)
-        .context("could not parse the latest Bridge release")?;
-    select_update(release, crate::BRIDGE_VERSION)
+    serde_json::from_slice::<Release>(&bytes).context("could not parse the latest Bridge release")
 }
 
 pub async fn download_and_stage(update: &UpdateInfo) -> Result<()> {
@@ -127,24 +137,41 @@ pub(crate) async fn read_bounded_response(
     Ok(bytes)
 }
 
+fn release_version(release: &Release) -> Result<Version> {
+    let version_text = release.tag_name.trim_start_matches('v');
+    Version::parse(version_text)
+        .with_context(|| format!("release {} has an invalid version", release.tag_name))
+}
+
 fn select_update(release: Release, current: &str) -> Result<Option<UpdateInfo>> {
     let current = Version::parse(current).context("Bridge has an invalid current version")?;
-    let version_text = release.tag_name.trim_start_matches('v');
-    let available = Version::parse(version_text)
-        .with_context(|| format!("release {} has an invalid version", release.tag_name))?;
+    let available = release_version(&release)?;
     if available <= current {
         return Ok(None);
     }
+    package_update(&release, available).map(Some)
+}
 
+fn select_completion(release: Release, current: &str) -> Result<UpdateInfo> {
+    let current = Version::parse(current).context("Bridge has an invalid current version")?;
+    let available = release_version(&release)?;
+    ensure!(
+        available >= current,
+        "the latest release {available} is older than this Bridge"
+    );
+    package_update(&release, available)
+}
+
+fn package_update(release: &Release, available: Version) -> Result<UpdateInfo> {
     let archive_name = platform_archive_name()?;
     let checksum_name = format!("{archive_name}.sha256");
     let archive_url = asset_url(&release.assets, archive_name)?;
     let checksum_url = asset_url(&release.assets, &checksum_name)?;
-    Ok(Some(UpdateInfo {
+    Ok(UpdateInfo {
         version: available.to_string(),
         archive_url,
         checksum_url,
-    }))
+    })
 }
 
 fn asset_url(assets: &[ReleaseAsset], name: &str) -> Result<String> {
@@ -157,19 +184,51 @@ fn asset_url(assets: &[ReleaseAsset], name: &str) -> Result<String> {
 
 fn platform_archive_name() -> Result<&'static str> {
     // Installs from the DMG run as a signed .app and are replaced as a whole
-    // bundle; bare-binary installs keep following the original zip.
+    // bundle. Everything else follows the `-full` zips: the unsuffixed zips of
+    // the same platforms are small bridge packages (see `is_stub_install`) for
+    // the older updaters, which cannot open an archive over their 16 MiB
+    // metadata budget.
     #[cfg(target_os = "macos")]
     return Ok(if crate::platform::bundle_root().is_some() {
         "openmouse-bridge-macos-app.zip"
     } else {
-        "openmouse-bridge-macos-universal.zip"
+        "openmouse-bridge-macos-universal-full.zip"
     });
     #[cfg(target_os = "windows")]
-    return Ok("openmouse-bridge-windows-x64.zip");
+    return Ok("openmouse-bridge-windows-x64-full.zip");
     #[cfg(target_os = "linux")]
-    return Ok("openmouse-bridge-linux-x64.zip");
+    return Ok("openmouse-bridge-linux-x64-full.zip");
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     anyhow::bail!("automatic Bridge updates are available only on macOS, Windows, and Linux");
+}
+
+/// A bridge package keeps the Node.js runtime as a placeholder this small; the
+/// real one is tens of megabytes.
+const PLACEHOLDER_RUNTIME_MAX_BYTES: u64 = 4096;
+
+/// Whether this install came from a bridge package: the small archive that
+/// older updaters can open, which carries this binary but only a placeholder
+/// for the bundled Node.js runtime. It has to fetch the full package before
+/// the native HID helper can run. Bundled macOS installs are always complete.
+pub fn is_stub_install() -> bool {
+    #[cfg(target_os = "macos")]
+    if crate::platform::bundle_root().is_some() {
+        return false;
+    }
+    env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent().map(|parent| parent.join("native-hid")))
+        .is_some_and(|native_hid| runtime_is_placeholder(&native_hid))
+}
+
+fn runtime_is_placeholder(native_hid: &Path) -> bool {
+    let runtime = if cfg!(windows) {
+        native_hid.join("node/node.exe")
+    } else {
+        native_hid.join("node/bin/node")
+    };
+    fs::metadata(runtime)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() < PLACEHOLDER_RUNTIME_MAX_BYTES)
 }
 
 fn verify_checksum(archive: &[u8], checksum_file: &[u8]) -> Result<()> {

@@ -60,7 +60,24 @@ jobs:
         shell: pwsh
         run: |
           Copy-Item assets/fonts/DM-Sans-OFL.txt DM-Sans-OFL.txt
-          Compress-Archive -Path target/release/openmouse-bridge.exe,README.md,DM-Sans-OFL.txt,native-hid -DestinationPath openmouse-bridge-windows-x64.zip
+          Compress-Archive -Path target/release/openmouse-bridge.exe,README.md,DM-Sans-OFL.txt,native-hid -DestinationPath openmouse-bridge-windows-x64-full.zip
+          (Get-FileHash openmouse-bridge-windows-x64-full.zip -Algorithm SHA256).Hash.ToLower() + "  openmouse-bridge-windows-x64-full.zip" | Set-Content openmouse-bridge-windows-x64-full.zip.sha256
+          # Small bridge archive under the original name for the older updaters
+          # (they cannot open archives over 16 MiB); see
+          # packaging/bridge/build-bridge-package.sh.
+          $stage = Join-Path $env:RUNNER_TEMP "bridge-package"
+          New-Item -ItemType Directory -Force -Path "$stage/native-hid/node", "$stage/native-hid/node_modules/node-hid", "$stage/native-hid/node_modules/@openmouse/protocol", "$stage/native-hid/node_modules/@openmouse/keyboard-protocol" | Out-Null
+          Copy-Item target/release/openmouse-bridge.exe, README.md, DM-Sans-OFL.txt $stage
+          Copy-Item native-hid/package.json "$stage/native-hid/"
+          Copy-Item native-hid/src "$stage/native-hid/src" -Recurse
+          Copy-Item native-hid/node_modules/node-hid/package.json "$stage/native-hid/node_modules/node-hid/"
+          Copy-Item native-hid/node_modules/@openmouse/protocol/package.json "$stage/native-hid/node_modules/@openmouse/protocol/"
+          Copy-Item native-hid/node_modules/@openmouse/keyboard-protocol/package.json "$stage/native-hid/node_modules/@openmouse/keyboard-protocol/"
+          Set-Content "$stage/native-hid/node/node.exe" "Placeholder: Bridge replaces this with the real Node.js runtime on first launch."
+          Compress-Archive -Path "$stage/*" -DestinationPath openmouse-bridge-windows-x64.zip -CompressionLevel Optimal
+          $size = (Get-Item openmouse-bridge-windows-x64.zip).Length
+          Write-Host "openmouse-bridge-windows-x64.zip: $size bytes (limit 16252928)"
+          if ($size -gt 16252928) { throw "bridge archive is over the older updaters' 16 MiB read budget" }
           (Get-FileHash openmouse-bridge-windows-x64.zip -Algorithm SHA256).Hash.ToLower() + "  openmouse-bridge-windows-x64.zip" | Set-Content openmouse-bridge-windows-x64.zip.sha256
       - uses: actions/upload-artifact@v4
         with:
@@ -68,6 +85,8 @@ jobs:
           path: |
             openmouse-bridge-windows-x64.zip
             openmouse-bridge-windows-x64.zip.sha256
+            openmouse-bridge-windows-x64-full.zip
+            openmouse-bridge-windows-x64-full.zip.sha256
 
   macos:
     name: macOS universal
@@ -124,7 +143,10 @@ jobs:
             -output openmouse-bridge
           chmod +x openmouse-bridge
           cp assets/fonts/DM-Sans-OFL.txt ./DM-Sans-OFL.txt
-          zip -r openmouse-bridge-macos-universal.zip openmouse-bridge README.md DM-Sans-OFL.txt native-hid
+          zip -r openmouse-bridge-macos-universal-full.zip openmouse-bridge README.md DM-Sans-OFL.txt native-hid
+          shasum -a 256 openmouse-bridge-macos-universal-full.zip > openmouse-bridge-macos-universal-full.zip.sha256
+          # Small bridge archive under the original name for the older updaters.
+          packaging/bridge/build-bridge-package.sh openmouse-bridge openmouse-bridge-macos-universal.zip
           shasum -a 256 openmouse-bridge-macos-universal.zip > openmouse-bridge-macos-universal.zip.sha256
       - name: Import signing certificate
         if: env.MACOS_CERTIFICATE_BASE64 != ''
@@ -182,6 +204,8 @@ jobs:
           path: |
             openmouse-bridge-macos-universal.zip
             openmouse-bridge-macos-universal.zip.sha256
+            openmouse-bridge-macos-universal-full.zip
+            openmouse-bridge-macos-universal-full.zip.sha256
             openmouse-bridge-macos-app.zip
             openmouse-bridge-macos-app.zip.sha256
             OpenMouse-Bridge-macos-universal.dmg
@@ -223,7 +247,10 @@ jobs:
           chmod +x openmouse-bridge
           cp assets/openmouse-app-icon.png ./openmouse-app-icon.png
           cp assets/fonts/DM-Sans-OFL.txt ./DM-Sans-OFL.txt
-          zip -r openmouse-bridge-linux-x64.zip openmouse-bridge openmouse-app-icon.png README.md DM-Sans-OFL.txt native-hid
+          zip -r openmouse-bridge-linux-x64-full.zip openmouse-bridge openmouse-app-icon.png README.md DM-Sans-OFL.txt native-hid
+          sha256sum openmouse-bridge-linux-x64-full.zip > openmouse-bridge-linux-x64-full.zip.sha256
+          # Small bridge archive under the original name for the older updaters.
+          packaging/bridge/build-bridge-package.sh openmouse-bridge openmouse-bridge-linux-x64.zip openmouse-app-icon.png
           rm openmouse-bridge openmouse-app-icon.png
           sha256sum openmouse-bridge-linux-x64.zip > openmouse-bridge-linux-x64.zip.sha256
       - uses: actions/upload-artifact@v4
@@ -232,6 +259,8 @@ jobs:
           path: |
             openmouse-bridge-linux-x64.zip
             openmouse-bridge-linux-x64.zip.sha256
+            openmouse-bridge-linux-x64-full.zip
+            openmouse-bridge-linux-x64-full.zip.sha256
   release:
     name: Publish stable release
     needs: [windows, macos, linux]

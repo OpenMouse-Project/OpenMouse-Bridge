@@ -708,6 +708,71 @@ fn current_or_older_release_is_ignored() {
 }
 
 #[test]
+fn stub_completion_accepts_the_running_version_but_not_an_older_release() {
+    if platform_archive_name().is_err() {
+        return;
+    }
+    let same = select_completion(release("1.3.2"), "1.3.2").expect("same version completes");
+    assert_eq!(same.version, "1.3.2");
+    let newer = select_completion(release("1.4.0"), "1.3.2").expect("newer release completes");
+    assert_eq!(newer.version, "1.4.0");
+    assert!(select_completion(release("1.2.9"), "1.3.2").is_err());
+}
+
+#[test]
+fn updates_use_the_full_package_not_the_legacy_bridge_archive() {
+    let Ok(name) = platform_archive_name() else {
+        return;
+    };
+    #[cfg(not(target_os = "macos"))]
+    assert!(name.ends_with("-full.zip"), "{name}");
+    #[cfg(target_os = "macos")]
+    assert!(
+        name.ends_with("-full.zip") || name == "openmouse-bridge-macos-app.zip",
+        "{name}"
+    );
+    // A release that only has the legacy-named bridge archives is not an update.
+    let legacy = name.replace("-full", "");
+    let release = Release {
+        tag_name: "v2.0.0".into(),
+        assets: vec![
+            ReleaseAsset {
+                name: legacy.clone(),
+                browser_download_url: "https://example.test/stub.zip".into(),
+            },
+            ReleaseAsset {
+                name: format!("{legacy}.sha256"),
+                browser_download_url: "https://example.test/stub.zip.sha256".into(),
+            },
+        ],
+    };
+    if name != legacy {
+        assert!(select_update(release, "1.9.0").is_err());
+    }
+}
+
+#[test]
+fn only_a_tiny_node_runtime_marks_an_install_as_a_stub() {
+    let root = fixture();
+    let native_hid = root.join("native-hid");
+    let runtime = if cfg!(windows) {
+        native_hid.join("node/node.exe")
+    } else {
+        native_hid.join("node/bin/node")
+    };
+    assert!(!runtime_is_placeholder(&native_hid), "no runtime at all");
+    fs::create_dir_all(runtime.parent().unwrap()).unwrap();
+    fs::write(&runtime, b"#!/bin/sh\nexit 1\n").unwrap();
+    assert!(runtime_is_placeholder(&native_hid));
+    fs::write(&runtime, vec![0u8; PLACEHOLDER_RUNTIME_MAX_BYTES as usize]).unwrap();
+    assert!(
+        !runtime_is_placeholder(&native_hid),
+        "a real runtime is large"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn checksum_must_match_archive() {
     let archive = b"bridge";
     let checksum = format!("{:x}  bridge.zip\n", Sha256::digest(archive));

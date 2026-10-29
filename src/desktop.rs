@@ -1909,7 +1909,11 @@ fn run_server(
 
         let command_service = service.clone();
         let command_handler = tokio::spawn(async move {
-            if automatic_updates {
+            // A stub install can't run its HID helper yet; finishing it comes
+            // before any ordinary update check.
+            if updater::is_stub_install() {
+                tokio::spawn(finish_stub_install(update_events.clone()));
+            } else if automatic_updates {
                 check_for_updates(true, &update_events).await;
             }
             while let Some(command) = commands.recv().await {
@@ -2013,6 +2017,35 @@ async fn check_for_updates(install_automatically: bool, events: &SyncSender<Upda
             tracing::warn!(%error, "Bridge update check failed");
             let _ = events.try_send(UpdateEvent::Failed(format!("{error:#}")));
         }
+    }
+}
+
+/// Fetches the full package a bridge install is missing, retrying with a
+/// growing delay until it is staged; the update helper then restarts Bridge.
+async fn finish_stub_install(events: SyncSender<UpdateEvent>) {
+    let mut delay = Duration::from_secs(15);
+    loop {
+        let _ = events.try_send(UpdateEvent::Checking);
+        let outcome = match updater::check_for_stub_completion().await {
+            Ok(update) => {
+                let version = update.version.clone();
+                let _ = events.try_send(UpdateEvent::Downloading(version.clone()));
+                updater::download_and_stage(&update).await.map(|()| version)
+            }
+            Err(error) => Err(error),
+        };
+        match outcome {
+            Ok(version) => {
+                let _ = events.try_send(UpdateEvent::Restarting(version));
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not finish installing Bridge; will retry");
+                let _ = events.try_send(UpdateEvent::Failed(format!("{error:#}")));
+            }
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(15 * 60));
     }
 }
 
