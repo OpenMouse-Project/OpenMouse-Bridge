@@ -96,3 +96,8 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+# Keeps the binary small: the bridge package the older updaters download has to
+# compress under their 16 MiB archive-metadata budget.
+strip = true
