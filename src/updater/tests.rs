@@ -997,3 +997,29 @@ fn archives_larger_than_the_metadata_budget_still_open() {
     assert!(root.join(platform_binary_name()).is_file());
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn staging_parent_drops_only_the_verbatim_drive_prefix() {
+    assert_eq!(
+        without_verbatim_prefix(r"\\?\C:\Users\me\AppData\Local".into()),
+        Path::new(r"C:\Users\me\AppData\Local")
+    );
+    assert_eq!(
+        without_verbatim_prefix(r"\\?\UNC\server\share".into()),
+        Path::new(r"\\?\UNC\server\share")
+    );
+    assert_eq!(
+        without_verbatim_prefix(r"C:\plain".into()),
+        Path::new(r"C:\plain")
+    );
+    assert_eq!(without_verbatim_prefix("/tmp".into()), Path::new("/tmp"));
+}
+
+#[cfg(windows)]
+#[test]
+fn canonical_staging_parent_is_a_plain_drive_path() {
+    let parent = without_verbatim_prefix(fs::canonicalize(env::temp_dir()).unwrap());
+    let text = parent.to_str().unwrap();
+    assert!(!text.starts_with(r"\\?\"), "{text}");
+    assert!(parent.is_dir());
+}
