@@ -32,6 +32,8 @@ zip = { version = "9.0", default-features = false, features = ["deflate"] }
 # The GPUI shell (src/gpui_shell) is built only with `--features gpui` until it
 # reaches parity with the egui tray panel; see docs/gpui-migration.md.
 gpui-kit = { version = "0.7", optional = true }
+# The native window behind a GPUI window, to hide just the panel to the tray.
+raw-window-handle = { version = "0.6", optional = true }
 
 [features]
 gpui = ["dep:gpui-kit", "dep:raw-window-handle"]
@@ -85,8 +87,6 @@ objc2-core-foundation = { version = "0.3.2", default-features = false, features 
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGEvent", "CGEventTypes", "CGRemoteOperation"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-# Window handle for hiding the GPUI panel to the tray (feature `gpui`).
-raw-window-handle = { version = "0.6", optional = true }
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",

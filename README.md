@@ -29,8 +29,12 @@ What is on this branch so far:
       yet, and Linux has no tray)
 - [x] Remembered mice: `devices.json` keeps every mouse Bridge has seen, and the
       HID bus is scanned every 5 seconds for what is plugged in
-- [ ] Home parity with the egui panel (battery details, remove-stale control),
-      overlay and notifications
+- [x] Low-battery and game-profile alerts show on the on-screen overlay (the
+      existing Bridge overlay and chime), with a Test notification button in
+      Settings
+- [x] The Attack Shark R5 Ultra's battery is read natively (the Node helper
+      cannot read it)
+- [ ] Home parity with the egui panel (battery details, remove-stale control)
 - [ ] In-app updater and `latest.json`
 - [ ] Windows installer, macOS update path, Linux AppImage
 

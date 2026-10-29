@@ -1,9 +1,12 @@
 //! The tray panel's views: Home, Settings and the Bridge info page.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-    mpsc,
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    time::Duration,
 };
 
 use gpui_kit::assets::IconName;
@@ -25,6 +28,7 @@ use crate::desktop::{
     BridgeCommand, UpdateEvent, WINDOW_HEIGHT, WINDOW_WIDTH, notify_natively, open_logs,
     open_openmouse, profile_label, service_label,
 };
+use crate::overlay::Overlay;
 
 /// How many remembered mice Home lists before summarising the rest.
 const HOME_DEVICE_ROWS: usize = 3;
@@ -41,7 +45,7 @@ impl View {
     fn base_height(self) -> f32 {
         match self {
             View::Home => WINDOW_HEIGHT,
-            View::Settings => 400.0,
+            View::Settings => 436.0,
             View::Info => 380.0,
         }
     }
@@ -68,11 +72,17 @@ pub struct PanelView {
     error: Option<String>,
     field: ascii::Field,
     was_visible: bool,
+    /// The on-screen banner for low-battery and game-profile notices. Without
+    /// it (no display for the native window), notices fall back to system
+    /// notifications.
+    overlay: Option<Overlay>,
 }
 
 pub struct Drained {
     pub changed: bool,
     pub panel_requested: bool,
+    /// How soon the overlay needs the next tick while a banner is fading.
+    pub overlay_delay: Option<Duration>,
 }
 
 impl PanelView {
@@ -101,6 +111,9 @@ impl PanelView {
             error: None,
             field: ascii::Field::default(),
             was_visible: true,
+            overlay: Overlay::new()
+                .inspect_err(|error| tracing::warn!(%error, "Could not create the overlay"))
+                .ok(),
         }
     }
 
@@ -144,7 +157,7 @@ impl PanelView {
             changed = true;
         }
         while let Ok(notice) = self.notices.try_recv() {
-            notify_natively(&notice);
+            self.present(&notice);
         }
         let mut panel_requested = false;
         while self.panel_requests.try_recv().is_ok() {
@@ -158,6 +171,29 @@ impl PanelView {
         Drained {
             changed: (changed && visible) || became_visible,
             panel_requested,
+            overlay_delay: self.overlay.as_mut().and_then(Overlay::tick),
+        }
+    }
+
+    /// Shows `notice` on the overlay with its chime, or as a system
+    /// notification when there is no overlay. Low-battery alerts and the
+    /// profile switch for a detected game both arrive here.
+    fn present(&mut self, notice: &Notice) {
+        let (sound, volume) = self.snapshot.as_ref().map_or((true, 60), |snapshot| {
+            (snapshot.notification_sound, snapshot.notification_volume)
+        });
+        let Some(overlay) = self.overlay.as_mut() else {
+            notify_natively(notice);
+            return;
+        };
+        if let Err(error) = overlay.show(&notice.title, &notice.detail) {
+            tracing::warn!(%error, "Could not show the overlay");
+            notify_natively(notice);
+            return;
+        }
+        tracing::info!(title = %notice.title, sound, volume, "Showed a notice on the overlay");
+        if sound && let Err(error) = overlay.chime(volume) {
+            tracing::warn!(%error, "Could not play the notification sound");
         }
     }
 
@@ -221,6 +257,16 @@ impl PanelView {
         self.update_busy = true;
         self.update_text = Some("Checking for updates…".into());
         let _ = self.commands.send(BridgeCommand::CheckForUpdates);
+        cx.notify();
+    }
+
+    /// Sends a notice down the same path a low-battery alert or a detected
+    /// game's profile switch takes, so it shows the overlay and plays the chime.
+    fn test_notification(&mut self, cx: &mut Context<Self>) {
+        self.present(&Notice {
+            title: "Test notification".into(),
+            detail: "This is how OpenMouse Bridge alerts look.".into(),
+        });
         cx.notify();
     }
 
@@ -554,6 +600,14 @@ impl PanelView {
         }
         content = content.child(updates).child(
             card(line, fill)
+                .child(
+                    Button::new("test-notification")
+                        .ghost()
+                        .compact()
+                        .icon(IconName::Bell)
+                        .label("Test notification")
+                        .on_click(cx.listener(|this, _, _, cx| this.test_notification(cx))),
+                )
                 .child(
                     Button::new("open-logs")
                         .ghost()

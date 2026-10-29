@@ -22,19 +22,31 @@ pub enum Command {
 #[cfg(target_os = "macos")]
 mod platform {
     use gpui_kit::Window;
-    use objc2::MainThreadMarker;
-    use objc2_app_kit::NSApplication;
+    use objc2::rc::Retained;
+    use objc2_app_kit::{NSView, NSWindow};
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-    /// Hides the whole app, like Cmd+H; the menu bar icon stays.
-    pub fn hide_window(_window: &Window) {
-        if let Some(marker) = MainThreadMarker::new() {
-            NSApplication::sharedApplication(marker).hide(None);
+    /// The panel's own `NSWindow`. Hiding only this window, not the whole app,
+    /// keeps the overlay's window from un-hiding the panel when it appears.
+    fn ns_window(window: &Window) -> Option<Retained<NSWindow>> {
+        let RawWindowHandle::AppKit(handle) = HasWindowHandle::window_handle(window).ok()?.as_raw()
+        else {
+            return None;
+        };
+        // SAFETY: the view belongs to the live window this handle came from.
+        let view = unsafe { Retained::retain(handle.ns_view.as_ptr().cast::<NSView>()) }?;
+        view.window()
+    }
+
+    pub fn hide_window(window: &Window) {
+        if let Some(window) = ns_window(window) {
+            window.orderOut(None);
         }
     }
 
-    pub fn show_window(_window: &mut Window) {
-        if let Some(marker) = MainThreadMarker::new() {
-            NSApplication::sharedApplication(marker).unhide(None);
+    pub fn show_window(window: &mut Window) {
+        if let Some(window) = ns_window(window) {
+            window.makeKeyAndOrderFront(None);
         }
     }
 }

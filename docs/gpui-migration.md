@@ -128,7 +128,13 @@ Phase 1 is under way.
     install button when one is found), open logs, and a link to the info page.
   - Info: version, platform, address, uptime, control-panel connection, device
     mode, profile and remembered-mouse counts, config and log paths.
-  - System notifications stand in for the overlay.
+  - Notices (low battery, and the profile switch for a detected game) are shown
+    on Bridge's existing on-screen overlay and chime, which draws its own
+    non-activating window and does not depend on egui. Settings has a Test
+    notification button that sends one down the same path. A system
+    notification is the fallback when the overlay cannot be created.
+  - On macOS only the panel's own window is hidden to the tray, not the whole
+    app, so an overlay appearing never brings the panel back.
 - Core: `devices.json` (beside `config.json`) remembers every mouse seen: name,
   last battery reading, DPI, polling rate and when it was last seen. It is
   reported as `knownDevices` in `/v1/status`. The HID bus is listed every 5
@@ -146,5 +152,5 @@ buttons, anything on Windows (the tray code has never been compiled there), and
 Linux (no tray yet).
 
 Next: panel placement at the tray icon and hide-on-escape, Home parity with the
-egui panel (battery details, remove-stale control), then the GPUI overlay and
-notifications.
+egui panel (battery details, remove-stale control), and a GPUI-styled overlay if
+the current one should match Desktop's look.

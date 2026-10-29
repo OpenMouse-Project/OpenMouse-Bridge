@@ -84,21 +84,26 @@ pub fn run() -> Result<()> {
 
         let view = view.downgrade();
         cx.spawn(async move |cx| {
+            let mut wait = POLL;
             loop {
-                cx.background_executor().timer(POLL).await;
+                cx.background_executor().timer(wait).await;
                 let tray_requests: Vec<tray::Command> = tray_commands
                     .as_ref()
                     .map(|commands| commands.try_iter().collect())
                     .unwrap_or_default();
-                let Ok(panel_wanted) = view.update(cx, |view: &mut PanelView, cx| {
-                    let drained = view.drain();
-                    if drained.changed {
-                        cx.notify();
-                    }
-                    drained.panel_requested
-                }) else {
+                let Ok((panel_wanted, overlay_delay)) =
+                    view.update(cx, |view: &mut PanelView, cx| {
+                        let drained = view.drain();
+                        if drained.changed {
+                            cx.notify();
+                        }
+                        (drained.panel_requested, drained.overlay_delay)
+                    })
+                else {
                     break;
                 };
+                // A fading banner needs a frame every ~16 ms; otherwise idle.
+                wait = overlay_delay.map_or(POLL, |delay| delay.min(POLL));
                 let show = panel_wanted
                     || tray_requests
                         .iter()
