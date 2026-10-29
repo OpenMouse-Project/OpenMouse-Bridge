@@ -847,10 +847,9 @@ impl BridgeService {
                     connected: match &state.detected {
                         // The latest scan decides; a brand match covers the id
                         // the control panel uses for a scan-shaped one.
-                        Some(detected) => detected.iter().any(|mouse| {
-                            mouse.device_id == device.id
-                                || brand_of(&mouse.device_id) == brand_of(&device.id)
-                        }),
+                        Some(detected) => detected
+                            .iter()
+                            .any(|mouse| is_same_mouse(&device.id, &device.name, mouse)),
                         // No scan yet (just started): fall back to how recent
                         // the last sighting is.
                         None => age < BATTERY_STALE_AFTER.as_secs(),
@@ -1287,6 +1286,17 @@ impl BridgeService {
                 polling_rate_hz: entry.polling_rate_hz,
                 switch_mode: entry.switch_mode.clone(),
             };
+            // A reading names the mouse: drop a scan-shaped entry for it.
+            let duplicates: Vec<String> = state
+                .known
+                .devices()
+                .iter()
+                .filter(|device| device.id != update.id && names_match(&device.name, &update.name))
+                .map(|device| device.id.clone())
+                .collect();
+            for id in duplicates {
+                state.known.forget(&id);
+            }
             remember_known(&mut state.known, update);
             should_alert
         };
@@ -1615,6 +1625,52 @@ fn brand_of(id: &str) -> &str {
     id.split(':').next().unwrap_or_default()
 }
 
+/// Words that say nothing about which mouse it is.
+const NAME_NOISE: &[&str] = &[
+    "mouse",
+    "wireless",
+    "wired",
+    "gaming",
+    "usb",
+    "receiver",
+    "dongle",
+    "ghz",
+    "bluetooth",
+    "hid",
+    "device",
+    "2",
+    "4g",
+    "24g",
+];
+
+fn name_words(name: &str) -> Vec<String> {
+    name.split(|character: char| !character.is_ascii_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .filter(|word| !word.is_empty() && !NAME_NOISE.contains(&word.as_str()))
+        .collect()
+}
+
+/// Whether two display names are the same mouse: the shorter one's meaningful
+/// words, at least two of them, all appear in the longer. The bus scan reports
+/// "R5 Ultra Mouse 2.4G" where the control panel says "Attack Shark R5 Ultra".
+fn names_match(a: &str, b: &str) -> bool {
+    let (a, b) = (name_words(a), name_words(b));
+    let (short, long) = if a.len() <= b.len() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
+    short.len() >= 2 && short.iter().all(|word| long.contains(word))
+}
+
+/// Whether a mouse found on the bus is the remembered `device`: the same id,
+/// the same brand, or the same model name.
+fn is_same_mouse(device_id: &str, device_name: &str, mouse: &drivers::DetectedMouse) -> bool {
+    mouse.device_id == device_id
+        || brand_of(&mouse.device_id) == brand_of(device_id)
+        || names_match(device_name, &mouse.name)
+}
+
 /// Records the mice found on the HID bus, so one with no battery reader is
 /// still listed. A brand that already has a remembered entry is that same mouse
 /// under the id the control panel uses, so the sighting refreshes that entry
@@ -1625,7 +1681,7 @@ fn remember_detected(known: &mut DeviceStore, discovered: &[drivers::DetectedMou
             .devices()
             .iter()
             .find(|device| {
-                device.id != mouse.device_id && brand_of(&device.id) == brand_of(&mouse.device_id)
+                device.id != mouse.device_id && is_same_mouse(&device.id, &device.name, mouse)
             })
             .map(|device| (device.id.clone(), device.name.clone()))
             .unwrap_or_else(|| (mouse.device_id.clone(), mouse.name.clone()));
@@ -2799,6 +2855,59 @@ mod tests {
         assert_eq!(device.name, "G Pro");
         assert!(device.last_seen > old, "touched by the sighting");
         assert_eq!(device.percent, Some(60), "its reading is kept");
+    }
+
+    #[test]
+    fn names_match_by_their_meaningful_words() {
+        // The bus scan and the control panel name the same mouse differently.
+        assert!(names_match("R5 Ultra Mouse 2.4G", "Attack Shark R5 Ultra"));
+        assert!(names_match(
+            "Attack Shark R5 Ultra",
+            "Attack Shark R5 Ultra Mouse 2.4G"
+        ));
+        // Generic receiver names carry no model, so they never match by name.
+        assert!(!names_match("USB Receiver", "PRO X SUPERLIGHT 2c"));
+        // One shared word is not enough.
+        assert!(!names_match("Pulsar X2", "Razer Viper X"));
+        assert!(!names_match("Wooting 60HE+", "R5 Ultra Mouse 2.4G"));
+    }
+
+    #[tokio::test]
+    async fn one_mouse_seen_under_two_brands_is_one_connected_entry() {
+        let bridge = BridgeService::new(BridgeConfig::default(), temp_config_path());
+        let scan = drivers::DetectedMouse {
+            device_id: "Delux:3719C0531974".into(),
+            name: "R5 Ultra Mouse 2.4G".into(),
+        };
+        // The bus scan finds it first, as "Delux".
+        {
+            let mut state = bridge.inner.write().await;
+            remember_detected(&mut state.known, std::slice::from_ref(&scan));
+            state.detected = Some(vec![scan.clone()]);
+        }
+        assert_eq!(bridge.snapshot().await.known_devices.len(), 1);
+
+        // Then the control panel reports it as "Attack Shark".
+        bridge
+            .record_battery(reading(
+                "Attack Shark:Attack Shark R5 Ultra",
+                "Attack Shark R5 Ultra",
+                66,
+            ))
+            .await
+            .unwrap();
+        let known = bridge.snapshot().await.known_devices;
+        assert_eq!(known.len(), 1, "the scan-shaped entry is absorbed");
+        assert_eq!(known[0].id, "Attack Shark:Attack Shark R5 Ultra");
+        assert_eq!(known[0].percent, Some(66));
+        assert!(known[0].connected, "the scan still sees it");
+
+        // Later scans refresh that entry instead of adding the scan id back.
+        {
+            let mut state = bridge.inner.write().await;
+            remember_detected(&mut state.known, std::slice::from_ref(&scan));
+        }
+        assert_eq!(bridge.snapshot().await.known_devices.len(), 1);
     }
 
     fn battery_entry(age: Duration) -> BatteryState {
