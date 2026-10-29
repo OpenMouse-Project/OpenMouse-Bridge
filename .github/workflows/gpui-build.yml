@@ -1,0 +1,252 @@
+name: GPUI build
+
+# Builds the GPUI Bridge as a macOS DMG and a Linux AppImage and uploads them as
+# workflow artifacts, so any push can be downloaded and tried. Windows is added
+# from the Windows machine (see the marked section at the bottom). Publishing a
+# release from these artifacts is a later step; nothing here publishes.
+on:
+  workflow_dispatch:
+  push:
+    branches: [GPUI, main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpui-build-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/GPUI' }}
+
+env:
+  # Keep in sync with ci.yml and release.yml.
+  NATIVE_HID_NODE_VERSION: v24.18.1
+
+jobs:
+  macos-dmg:
+    name: macOS DMG
+    runs-on: macos-14
+    timeout-minutes: 60
+    # Signing and notarization are automatic when these secrets exist; without
+    # them the app is ad-hoc signed.
+    env:
+      MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gpui-macos
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: native-hid/package-lock.json
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --release --locked --target aarch64-apple-darwin
+      - run: cargo build --release --locked --target x86_64-apple-darwin
+      - name: Prepare native-hid (deps + bundled Node.js runtime)
+        run: |
+          set -euo pipefail
+          npm ci --prefix native-hid --omit=dev
+          # Trim node-hid's non-macOS prebuilt bindings; keep both Apple
+          # silicon and Intel since the Bridge binary itself is universal.
+          find native-hid/node_modules/node-hid/prebuilds -mindepth 1 -maxdepth 1 -type d \
+            ! -name HID-darwin-arm64 ! -name HID-darwin-x64 -exec rm -rf {} +
+          curl -fsSL "https://nodejs.org/dist/$NATIVE_HID_NODE_VERSION/node-$NATIVE_HID_NODE_VERSION-darwin-arm64.tar.gz" | tar -xz
+          curl -fsSL "https://nodejs.org/dist/$NATIVE_HID_NODE_VERSION/node-$NATIVE_HID_NODE_VERSION-darwin-x64.tar.gz" | tar -xz
+          mkdir -p native-hid/node/bin
+          lipo -create \
+            "node-$NATIVE_HID_NODE_VERSION-darwin-arm64/bin/node" \
+            "node-$NATIVE_HID_NODE_VERSION-darwin-x64/bin/node" \
+            -output native-hid/node/bin/node
+          chmod +x native-hid/node/bin/node
+      - name: Universal binary
+        run: |
+          lipo -create \
+            target/aarch64-apple-darwin/release/openmouse-bridge \
+            target/x86_64-apple-darwin/release/openmouse-bridge \
+            -output openmouse-bridge
+          chmod +x openmouse-bridge
+      - name: Import signing certificate
+        if: env.MACOS_CERTIFICATE_BASE64 != ''
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/openmouse-signing.keychain-db"
+          keychain_password="$(uuidgen)"
+          echo "$MACOS_CERTIFICATE_BASE64" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/certificate.p12" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          echo "MACOS_SIGN_IDENTITY=$MACOS_SIGN_IDENTITY" >> "$GITHUB_ENV"
+      - name: Build OpenMouse Bridge.app
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          mkdir -p dist
+          packaging/macos/build-app.sh openmouse-bridge native-hid "$version" dist
+      - name: Notarize app
+        if: env.MACOS_CERTIFICATE_BASE64 != '' && env.APPLE_ID != ''
+        run: |
+          set -euo pipefail
+          ditto -c -k --keepParent "dist/OpenMouse Bridge.app" notarize-app.zip
+          xcrun notarytool submit notarize-app.zip --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple "dist/OpenMouse Bridge.app"
+      - name: Package DMG and app update archive
+        run: |
+          set -euo pipefail
+          # Homebrew Python is externally managed (PEP 668), so use a venv.
+          python3 -m venv "$RUNNER_TEMP/dmgbuild-venv"
+          "$RUNNER_TEMP/dmgbuild-venv/bin/python" -m pip install --quiet dmgbuild
+          export PATH="$RUNNER_TEMP/dmgbuild-venv/bin:$PATH"
+          packaging/macos/build-dmg.sh "dist/OpenMouse Bridge.app" OpenMouse-Bridge-macos-universal.dmg
+          # Plain Info-ZIP (not ditto): the updater's strict extractor expects ordinary zip entries.
+          (cd dist && zip -r -X -q "../openmouse-bridge-macos-app.zip" "OpenMouse Bridge.app")
+          shasum -a 256 openmouse-bridge-macos-app.zip > openmouse-bridge-macos-app.zip.sha256
+      - name: Notarize DMG
+        if: env.MACOS_CERTIFICATE_BASE64 != '' && env.APPLE_ID != ''
+        run: |
+          set -euo pipefail
+          xcrun notarytool submit OpenMouse-Bridge-macos-universal.dmg --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple OpenMouse-Bridge-macos-universal.dmg
+      - name: Verify DMG
+        run: |
+          set -euo pipefail
+          hdiutil attach OpenMouse-Bridge-macos-universal.dmg -nobrowse -readonly -mountpoint "$RUNNER_TEMP/dmg"
+          test -d "$RUNNER_TEMP/dmg/OpenMouse Bridge.app"
+          codesign --verify --deep --strict "$RUNNER_TEMP/dmg/OpenMouse Bridge.app"
+          hdiutil detach "$RUNNER_TEMP/dmg"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bridge-macos-dmg
+          path: |
+            OpenMouse-Bridge-macos-universal.dmg
+            openmouse-bridge-macos-app.zip
+            openmouse-bridge-macos-app.zip.sha256
+          if-no-files-found: error
+
+  linux-appimage:
+    name: Linux AppImage
+    # The oldest runner image on offer, so the AppImage runs on any distro
+    # whose glibc is at least that old.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        # HID (udev), TLS, and what GPUI draws and takes input through
+        # (Wayland, X11/XCB, xkbcommon, Vulkan, fontconfig). No GTK: Linux has
+        # no tray icon yet.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang cmake pkg-config \
+            libudev-dev libssl-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libvulkan-dev libgl1-mesa-dev libfontconfig-dev libfreetype-dev \
+            libasound2-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gpui-linux
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: native-hid/package-lock.json
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: Prepare native-hid (deps + bundled Node.js runtime)
+        run: |
+          set -euo pipefail
+          npm ci --prefix native-hid --omit=dev
+          # Trim node-hid's non-Linux prebuilt bindings.
+          find native-hid/node_modules/node-hid/prebuilds -mindepth 1 -maxdepth 1 -type d \
+            ! -name HID-linux-x64 -exec rm -rf {} +
+          curl -fsSL "https://nodejs.org/dist/$NATIVE_HID_NODE_VERSION/node-$NATIVE_HID_NODE_VERSION-linux-x64.tar.xz" | tar -xJ
+          mkdir -p native-hid/node/bin
+          cp "node-$NATIVE_HID_NODE_VERSION-linux-x64/bin/node" native-hid/node/bin/node
+          chmod +x native-hid/node/bin/node
+      - name: Assemble the AppDir
+        run: |
+          set -euo pipefail
+          appdir=AppDir
+          # Bridge finds native-hid next to its executable, so they sit together.
+          install -Dm755 target/release/openmouse-bridge "$appdir/usr/bin/openmouse-bridge"
+          cp -R native-hid "$appdir/usr/bin/native-hid"
+          cp assets/fonts/DM-Sans-OFL.txt README.md "$appdir/usr/bin/"
+          cp assets/openmouse-app-icon.png "$appdir/io.openmouse.bridge.png"
+          cp assets/openmouse-app-icon.png "$appdir/.DirIcon"
+          cat > "$appdir/io.openmouse.bridge.desktop" <<'DESKTOP'
+          [Desktop Entry]
+          Type=Application
+          Name=OpenMouse Bridge
+          Comment=Local companion for the OpenMouse control panel
+          Exec=openmouse-bridge
+          Icon=io.openmouse.bridge
+          Categories=Utility;
+          Terminal=false
+          DESKTOP
+          cat > "$appdir/AppRun" <<'APPRUN'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/openmouse-bridge" "$@"
+          APPRUN
+          chmod +x "$appdir/AppRun"
+      - name: Build the AppImage
+        run: |
+          set -euo pipefail
+          curl -fsSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          # Runners have no FUSE, so the tool unpacks itself and runs from there.
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run AppDir OpenMouse-Bridge-linux-x86_64.AppImage
+          sha256sum OpenMouse-Bridge-linux-x86_64.AppImage > OpenMouse-Bridge-linux-x86_64.AppImage.sha256
+      - name: Check the AppImage contents
+        run: |
+          set -euo pipefail
+          chmod +x OpenMouse-Bridge-linux-x86_64.AppImage
+          ./OpenMouse-Bridge-linux-x86_64.AppImage --appimage-extract > /dev/null
+          test -x squashfs-root/usr/bin/openmouse-bridge
+          test -x squashfs-root/usr/bin/native-hid/node/bin/node
+          test -f squashfs-root/usr/bin/native-hid/src/apply.mjs
+          test -f squashfs-root/usr/bin/DM-Sans-OFL.txt
+          # Every shared library the binary needs must resolve on this machine.
+          ! ldd squashfs-root/usr/bin/openmouse-bridge | grep 'not found'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bridge-linux-appimage
+          path: |
+            OpenMouse-Bridge-linux-x86_64.AppImage
+            OpenMouse-Bridge-linux-x86_64.AppImage.sha256
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Windows: to be added from the Windows machine.
+  #
+  # Left out on purpose: the Windows side of the GPUI shell (tray icon, panel
+  # placement, hide-to-tray) is written but has never been built or run, so the
+  # job should be added together with what that turns up. It needs to:
+  #   - build on windows-latest;
+  #   - prepare native-hid with the win-x64 Node.js runtime, as ci.yml does;
+  #   - produce the installer (a per-user, no-admin installer is the plan; see
+  #     docs/gpui-migration.md and Desktop's gpui/installer for the approach);
+  #   - sign it when WINDOWS_CERTIFICATE_BASE64 and WINDOWS_CERTIFICATE_PASSWORD
+  #     exist, as release.yml does for the exe;
+  #   - upload it as the `bridge-windows` artifact.
+  # ---------------------------------------------------------------------------
