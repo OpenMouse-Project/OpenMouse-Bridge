@@ -29,34 +29,26 @@ tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zip = { version = "9.0", default-features = false, features = ["deflate"] }
-# The GPUI shell (src/gpui_shell) is built only with `--features gpui` until it
-# reaches parity with the egui tray panel; see docs/gpui-migration.md.
-gpui-kit = { version = "0.7", optional = true }
-# The native window behind a GPUI window, to hide just the panel to the tray.
-raw-window-handle = { version = "0.6", optional = true }
-
-[features]
-gpui = ["dep:gpui-kit", "dep:raw-window-handle"]
 
 [target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
-eframe = { version = "0.36.1", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
-# The profile-switch overlay draws its banner on the CPU with the same font
-# stack egui already builds (skrifa outlines, vello_cpu rasterizer).
+# The window is GPUI; see docs/gpui-migration.md.
+gpui-kit = "0.7"
+# The profile-switch overlay draws its banner on the CPU: skrifa outlines, the
+# vello_cpu rasterizer, and epaint_default_fonts for fallback glyphs.
 epaint_default_fonts = "0.36.1"
 skrifa = { version = "0.44", default-features = false, features = ["std"] }
 vello_cpu = { version = "0.1", default-features = false, features = ["std", "u8_pipeline"] }
-# No libxdo: tray-icon's default features link libxdo (via muda) for the
-# predefined Copy/Cut/Paste/SelectAll menu items, which Bridge never uses
-# (desktop.rs only builds plain MenuItems). The gtk feature alone keeps the
-# AppIndicator menu working and removes the libxdo.so.3 runtime requirement,
-# which Arch/CachyOS cannot satisfy (their xdotool ships libxdo.so.4).
-tray-icon = { version = "0.24.2", default-features = false, features = ["gtk"] }
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+# No default features: they link libxdo (via muda) for menu items Bridge never
+# uses. Linux has no tray yet, so this is not built there.
+tray-icon = { version = "0.24.2", default-features = false }
+# The native window behind a GPUI window, to hide just the panel to the tray.
+raw-window-handle = "0.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# tray-icon's GTK menu needs gtk::init() on the main thread before it is built.
-gtk = "0.18"
-# X11 overlay banner and foreground-window lookup. Pure Rust; no system
-# libraries beyond what eframe/tray-icon already require.
+# X11 overlay banner and foreground-window lookup. Pure Rust, no system
+# libraries.
 x11rb = "0.13"
 # Virtual keyboard and mouse for the button listener (/dev/uinput).
 libc = "0.2"

@@ -29,12 +29,12 @@ Stays (UI-independent core): `service`, `api`, `hid`, `drivers`, `buttons`,
 
 Replaced:
 
-| Today | Becomes |
+| Was | Is |
 | --- | --- |
-| `src/desktop.rs` (egui/eframe panel, `tray-icon`, about 2.6k lines) | GPUI tray and panel |
-| `src/native_ui.rs`, `src/overlay/*` | GPUI overlay and notifications |
-| `src/updater.rs` zip download and per-OS swap scripts | in-app updater below |
-| zip packages and `install-linux.sh` | installers below |
+| `src/desktop.rs` (egui/eframe panel, `tray-icon`, about 2.6k lines) | **Done.** `src/gpui_shell/` (the window) and `src/runtime.rs` (the background server, commands, update events and relaunch logic the window sits on); the egui code, `native_ui.rs` and the `eframe` and `gtk` dependencies are gone |
+| `src/overlay/*` (its own native window, drawn on the CPU) | Kept, and driven by the GPUI shell. Restyling it to match Desktop is optional |
+| `src/updater.rs` zip download and per-OS swap scripts | In-app updater below (not started) |
+| zip packages and `install-linux.sh` | Installers below (not started) |
 
 Reference in `../Desktop/gpui`: `tray.rs`, `autostart.rs`, `overlay.rs`,
 `update_check.rs`, `installer/` (a Rust exe that embeds the app as its payload),
@@ -109,67 +109,66 @@ their own install helper fails before it swaps anything.
 
 ## Progress
 
-Phase 1 is under way.
+This branch is the new Bridge, version 1.0.0, and is meant to replace `main`.
+GPUI is the only window: the egui panel, `native_ui.rs`, `eframe`, `gtk` and the
+`gpui` cargo feature are all gone, so a plain `cargo run` starts it.
 
-- `Cargo.toml` has an optional `gpui` feature (`gpui-kit` 0.7) and the
-  `gpui-pre-apple` patch, vendored from Desktop into `vendor/gpui-pre-apple`.
-  Default builds do not use either.
-- `src/desktop.rs` exposes what a second shell needs (`BackgroundServer`,
-  `BridgeCommand`, `UpdateEvent`, the label helpers, `tray_icon`,
-  `restart_bridge`, window size constants). Behaviour is unchanged.
-- `src/gpui_shell/` (feature `gpui`, selected with
-  `OPENMOUSE_BRIDGE_SHELL=egui` picks the old shell instead) starts the same `BackgroundServer` and polls its
-  channels every 200 ms. The palette and the ASCII field are ported from
-  Desktop (dark only). The panel resizes to its content and does not repaint
-  while hidden in the tray.
-  - Home: service, profile and remembered mice, with Open OpenMouse / Restart /
-    Quit.
-  - Settings: run on start, update automatically, check for updates (with an
-    install button when one is found), open logs, and a link to the info page.
-  - Info: version, platform, address, uptime, control-panel connection, device
-    mode, profile and remembered-mouse counts, config and log paths.
-  - Notices (low battery, and the profile switch for a detected game) are shown
-    on Bridge's existing on-screen overlay and chime, which draws its own
-    non-activating window and does not depend on egui. Settings has a Test
-    notification button that sends one down the same path. A system
-    notification is the fallback when the overlay cannot be created.
-  - On macOS only the panel's own window is hidden to the tray, not the whole
-    app, so an overlay appearing never brings the panel back.
-  - The panel opens beside the tray icon: centred under it, just below the menu
-    bar, on macOS; with its right edge on the icon's, above a bottom taskbar, on
-    Windows. Launched visible with no click to go by, it opens in the tray's
-    corner of the main screen. A height change keeps its top edge fixed.
-  - macOS has no tray menu: an NSStatusItem with a menu attached opens it on any
-    click and the click handler never runs, so a click or double-click could not
-    show the panel. Left or right click shows the panel, which has Restart and
-    Quit buttons of its own. Windows keeps a tray menu.
-- Core: `devices.json` (beside `config.json`) remembers every mouse seen: name,
-  last battery reading, DPI, polling rate and when it was last seen. It is
-  reported as `knownDevices` in `/v1/status`. The HID bus is listed every 5
+- **The window** (`src/gpui_shell/`): Desktop's dark palette and ASCII
+  background, a title bar (the title drags the window; settings and close
+  buttons), and three views. Home shows the service, the profile ("Default"
+  unless a game's profile is active), the remembered mice with their battery,
+  DPI and last-seen time, a forget button for ones that are unplugged, an update
+  card, and a first-run note. Settings has run on start, hybrid mode, the tray
+  icon style, the alert level, sound and volume, updates, a test notification,
+  open logs, and a link to the info page. Info shows version, platform, address,
+  uptime, connection state and paths. The panel resizes to its content and does
+  not repaint while hidden.
+- **The tray:** the connected mouse's battery on the icon (glyph or number, the
+  colour following charge state, a tooltip with the time left). The panel opens
+  beside the icon: centred under it below the macOS menu bar, above a bottom
+  Windows taskbar. macOS has no tray menu, because an attached menu swallows
+  every click; a left or right click shows the panel, and Windows keeps a menu.
+  Closing or Escape hides the panel. The icon is rebuilt after the PC sleeps.
+  Linux has no tray yet, so its window is an ordinary one and closing it quits.
+- **Alerts:** low-battery and game-profile notices show on Bridge's overlay and
+  chime.
+- **Remembered mice:** `devices.json` beside `config.json` keeps every mouse
+  seen, reported as `knownDevices` in `/v1/status`. The HID bus is listed every 5
   seconds (about 5 ms, no device opened); "connected" follows the latest scan,
-  matched by brand because the control panel names a mouse differently from the
-  bus. A mouse that appears gets a battery read right away. Known limitation:
-  two mice of one brand cannot be told apart for the connected state. Discovery
-  is by driver brand, so a keyboard from such a brand (a Wooting) is listed too.
+  matched by brand and then by model name, because the control panel names a
+  mouse differently from the bus. Known limitation: two mice of one brand cannot
+  be told apart for the connected state, and a keyboard from a brand with a
+  driver (a Wooting) is listed too.
+- **Batteries:** the Attack Shark R5 Ultra's is read natively; the Node helper
+  cannot read it. HID enumeration runs behind one lock and hidapi is
+  initialised on a thread that never exits, which fixed an intermittent
+  SIGTRAP on macOS.
+- **Updates:** wired to the existing updater until the in-app one replaces it.
+  The updater reports how far the download has got; the panel draws a progress
+  bar and percentage (a sweeping bar while the download is checked and
+  unpacked), and the app exits when the updater says it is restarting, since the
+  helper waits for the process to end before it installs and relaunches.
+- **Relaunch:** if the window ends for any reason other than quit, restart or an
+  update, Bridge starts again, with the same crash-loop limits as before.
 
-Updates are wired to the existing updater (the zip-swap one, until the in-app
-updater below replaces it). The updater now exposes how far the archive download
-has got; the panel draws a bar with a percentage, a sweeping bar while the
-download is being checked and unpacked, and exits when the updater reports it is
-restarting, since the helper waits for the process to end before it installs.
-Checked end to end on macOS against a local fake release: the whole archive
+Checked on macOS: it builds and runs with no flags; the tray reads and follows
+the battery; the panel lands beside the icon and keeps its top edge when it
+grows; the overlay appears and fades; headless mode serves the API with no
+window; an end-to-end update against a local fake release (the archive
 downloaded, the app exited by itself, the helper installed the new version and
-relaunched it, and no lock or temporary folders were left behind. This build is
-version 1.0.0; semver ranks it above every 1.0.0-beta build, so beta installs see
-it as an update.
+relaunched it, no lock or temporary folders left); first launch opens the panel
+once and later launches start hidden; the full test suite passes repeatedly.
 
-Checked on macOS: it builds, starts, serves the API, remembers mice across
-restarts (unit tests), and refreshes "last seen" every scan against real
-hardware. Idle CPU on a debug build was about 1.7% of a core with the panel
-hidden and 7% visible. Not checked: clicks on the tray icon, the switches and
-buttons, anything on Windows (the tray code has never been compiled there), and
-Linux (no tray yet).
+Not checked: how the panel, the progress bar and the tray icon look (no
+screenshots from the test environment); clicks on the panel's buttons and
+switches, and Escape; anything on Windows (the tray, placement and hide code is
+written and type-checks against the Windows bindings, but it has never been
+built or run there); anything on Linux; and the GitHub workflows, which have
+not run yet.
 
-Next: panel placement at the tray icon and hide-on-escape, Home parity with the
-egui panel (battery details, remove-stale control), and a GPUI-styled overlay if
-the current one should match Desktop's look.
+Next: Windows (build and run it, then the installer); the Linux tray and
+AppImage, including relaunching `$APPIMAGE` rather than the mounted binary for
+restart, update and login startup; the in-app updater with `latest.json`;
+moving installs of earlier versions across; `install-linux.sh`, whose package
+lists still name the GTK libraries; and replacing `release.yml`, which still
+builds the older zip packages.

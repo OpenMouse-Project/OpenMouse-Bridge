@@ -1,12 +1,12 @@
 //! What the tray icon shows for the connected mouse's battery: which battery,
-//! the colour it is drawn in, the tooltip and the icon. Used by the GPUI shell;
-//! the egui shell keeps its own copy of this until it is removed.
+//! the colour it is drawn in, the tooltip and the icon.
 
 use anyhow::{Context, Result};
 use openmouse_bridge::{
     platform::{self, TrayBatteryStyle},
     service::{BridgeSnapshot, DeviceBattery},
 };
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use tray_icon::Icon;
 
 const ACCENT: (u8, u8, u8) = (93, 222, 137);
@@ -130,6 +130,7 @@ pub fn tooltip(battery: &TrayBattery) -> String {
     text.chars().take(TOOLTIP_CHARS).collect()
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub fn icon(battery: &TrayBattery) -> Result<Icon> {
     let (rgba, width, height) = platform::battery_icon_rgba(
         battery.percent,

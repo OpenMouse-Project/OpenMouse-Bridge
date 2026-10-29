@@ -1,13 +1,6 @@
 //! The tray panel's views: Home, Settings and the Bridge info page.
 
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
-    time::Duration,
-};
+use std::{sync::mpsc, time::Duration};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -24,14 +17,14 @@ use openmouse_bridge::{
 };
 use tokio::sync::mpsc as tokio_mpsc;
 
-use super::ascii;
-use crate::desktop::{
+use super::{ExitFlags, ascii};
+use crate::overlay::Overlay;
+use crate::runtime::{
     BridgeCommand, UpdateEvent, WINDOW_HEIGHT, WINDOW_WIDTH, notify_natively, open_logs,
     open_openmouse, service_label,
 };
-use crate::overlay::Overlay;
 
-/// The low-battery alert levels the egui panel offers.
+/// The low-battery alert levels on offer.
 const BATTERY_THRESHOLDS: [u8; 7] = [10, 15, 20, 25, 30, 40, 50];
 const VOLUME_STEP: u8 = 10;
 
@@ -68,7 +61,7 @@ enum View {
 }
 
 impl View {
-    /// The panel's base height in logical points; Home matches the egui panel.
+    /// The panel's base height in logical points.
     fn base_height(self) -> f32 {
         match self {
             View::Home => WINDOW_HEIGHT,
@@ -92,7 +85,7 @@ pub struct PanelView {
     updates: mpsc::Receiver<UpdateEvent>,
     notices: mpsc::Receiver<Notice>,
     panel_requests: mpsc::Receiver<()>,
-    restart: Arc<AtomicBool>,
+    exit: ExitFlags,
     snapshot: Option<BridgeSnapshot>,
     view: View,
     autostart: bool,
@@ -132,7 +125,7 @@ pub struct Drained {
     pub overlay_delay: Option<Duration>,
 }
 
-/// Where the update flow stands, in the same states as the egui panel.
+/// Where the update flow stands.
 #[derive(Clone)]
 enum UpdateState {
     Idle,
@@ -266,12 +259,7 @@ pub struct CoreLinks {
 }
 
 impl PanelView {
-    pub fn new(
-        links: CoreLinks,
-        restart: Arc<AtomicBool>,
-        first_run: bool,
-        focus: FocusHandle,
-    ) -> Self {
+    pub fn new(links: CoreLinks, exit: ExitFlags, first_run: bool, focus: FocusHandle) -> Self {
         let CoreLinks {
             snapshots,
             commands,
@@ -290,7 +278,7 @@ impl PanelView {
             updates,
             notices,
             panel_requests,
-            restart,
+            exit,
             snapshot: None,
             // A development aid: OPENMOUSE_BRIDGE_START_VIEW=settings|info opens
             // straight onto that view.
@@ -761,7 +749,7 @@ impl PanelView {
                     if super::tray::can_hide() {
                         super::tray::hide(window);
                     } else {
-                        cx.quit();
+                        this.exit.quit(cx);
                     }
                 })),
         )
@@ -828,7 +816,7 @@ impl PanelView {
             )));
         }
 
-        let restart = Arc::clone(&self.restart);
+        let exit = self.exit.clone();
         let mut content = div()
             .flex()
             .flex_col()
@@ -928,17 +916,14 @@ impl PanelView {
                     Button::new("restart")
                         .compact()
                         .label("Restart")
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            restart.store(true, Ordering::Relaxed);
-                            cx.quit();
-                        })),
+                        .on_click(cx.listener(move |_, _, _, cx| exit.restart(cx))),
                 )
                 .child(
                     Button::new("quit")
                         .ghost()
                         .compact()
                         .label("Quit")
-                        .on_click(cx.listener(|_, _, _, cx| cx.quit())),
+                        .on_click(cx.listener(|this, _, _, cx| this.exit.quit(cx))),
                 ),
         )
     }
@@ -1258,7 +1243,7 @@ mod tests {
     // Not `use super::*`: that pulls in GPUI's own `test` macro, which shadows
     // `#[test]`.
     use super::{UpdateState, step_threshold, step_volume};
-    use crate::desktop::UpdateEvent;
+    use crate::runtime::UpdateEvent;
 
     #[test]
     fn the_alert_level_steps_along_the_offered_list() {

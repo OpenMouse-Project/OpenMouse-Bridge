@@ -4,20 +4,12 @@
 )]
 
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
-mod desktop;
-#[cfg(all(
-    feature = "gpui",
-    any(target_os = "windows", target_os = "macos", target_os = "linux")
-))]
 mod gpui_shell;
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
-mod native_ui;
-#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 mod overlay;
-#[cfg(all(
-    feature = "gpui",
-    any(target_os = "windows", target_os = "macos", target_os = "linux")
-))]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+mod runtime;
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 mod tray_battery;
 
 use std::fs;
@@ -46,7 +38,7 @@ use tokio::net::TcpListener;
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 fn main() {
     let log_guard = init_tracing();
-    if let Err(error) = run_shell() {
+    if let Err(error) = runtime::run() {
         tracing::error!(%error, "OpenMouse Bridge failed");
         // `process::exit` skips the log guard's flush, which is how a second
         // launch used to die on the taken port without a line in the log.
@@ -84,18 +76,6 @@ async fn run() -> Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
-}
-
-/// The egui shell, except in a build with `--features gpui` (work in
-/// progress), which runs the GPUI shell instead. `OPENMOUSE_BRIDGE_SHELL=egui`
-/// brings the egui shell back in such a build.
-#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
-fn run_shell() -> anyhow::Result<()> {
-    #[cfg(feature = "gpui")]
-    if std::env::var("OPENMOUSE_BRIDGE_SHELL").as_deref() != Ok("egui") {
-        return gpui_shell::run();
-    }
-    desktop::run()
 }
 
 fn init_tracing() -> Option<WorkerGuard> {

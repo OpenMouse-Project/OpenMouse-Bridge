@@ -1,60 +1,38 @@
 # OpenMouse Bridge
 
 > [!WARNING]
-> **Work in progress: the `GPUI` branch.** Bridge is being rebuilt on
-> [GPUI](https://www.gpui.rs/) with real installers and in-app updates. Nothing
-> on this branch is released, and the new shell does not exist yet. The rest of
-> this README documents Bridge as it works today. See
-> [docs/gpui-migration.md](docs/gpui-migration.md) for the full plan.
+> **Work in progress: the `GPUI` branch.** This is the new OpenMouse Bridge,
+> rebuilt on [GPUI](https://www.gpui.rs/), and it will replace `main`. It is
+> version 1.0.0 and not released yet. See
+> [docs/gpui-migration.md](docs/gpui-migration.md) for the plan and what has and
+> has not been checked.
 
-## GPUI migration (WIP)
+## Where it stands
 
-| Area | Plan | Status |
-| --- | --- | --- |
-| Shell | Replace the egui tray panel, overlay and notifications with GPUI | Runs on macOS: Home, Settings and Info |
-| Windows | Custom per-user installer, no admin prompt | Not started |
-| macOS | Keep the signed `.app` and DMG | Exists today |
-| Linux | AppImage, with a one-time udev permission step | Not started |
-| Updates | In-app download, verify, then "Restart to update" | Not started |
+GPUI is the only window: there is no other shell. It runs on macOS today; the
+Windows side is written but has never been built or run, and Linux has no tray
+icon yet.
 
-What is on this branch so far:
-
-- [x] Migration plan in [`docs/gpui-migration.md`](docs/gpui-migration.md)
-- [x] Optional `gpui` cargo feature and the vendored `gpui-pre-apple` patch
-- [x] The seams a second shell needs, exposed from `src/desktop.rs`
-- [x] `src/gpui_shell/`: panel window and tray icon (Open / Restart / Quit) in
-      Desktop's dark look with the ASCII field, a Home view, a Settings view (run
-      on start, update automatically, check for updates, open logs) and a Bridge
-      info page (macOS; the Windows tray code is written but not built or run
-      yet, and Linux has no tray)
-- [x] Remembered mice: `devices.json` keeps every mouse Bridge has seen, and the
-      HID bus is scanned every 5 seconds for what is plugged in
-- [x] Low-battery and game-profile alerts show on the on-screen overlay (the
-      existing Bridge overlay and chime), with a Test notification button in
-      Settings
-- [x] The Attack Shark R5 Ultra's battery is read natively (the Node helper
-      cannot read it)
-- [x] Updates in the GPUI shell: an update card on Home with Install and Retry,
-      a progress bar and percentage while it downloads, and the app exits when
-      the update is staged so the installer helper can swap it in and relaunch
-- [x] Settings: hybrid mode, tray icon style, alert level, sound and volume
-- [x] First-run behaviour, forgetting a stale mouse, Escape hides the panel
-- [ ] Still to port from the egui panel: the tray icon after sleep or hibernate,
-      relaunch after a crash, and the extended battery details
-- [ ] In-app updater and `latest.json`
-- [ ] Windows installer, macOS update path, Linux AppImage
-
-Try the GPUI shell (macOS, unreleased, expect rough edges):
+- [x] A panel in Desktop's dark look with its ASCII background: Home, Settings
+      and a Bridge info page, opening beside the tray icon
+- [x] The tray icon shows the connected mouse's battery
+- [x] Remembered mice (`devices.json`), found by scanning the HID bus every 5
+      seconds
+- [x] Low-battery and game-profile alerts on the on-screen overlay and chime
+- [x] The Attack Shark R5 Ultra's battery, read natively
+- [x] Updates with an update card and a progress bar
+- [x] First-run behaviour, Escape and the close button hide the panel, the tray
+      icon is recreated after sleep, and Bridge relaunches after a crash
+- [ ] Windows: build and run it, then an installer
+- [ ] Linux: a tray icon, and the AppImage
+- [ ] The in-app updater with `latest.json`, replacing the zip-swap one
+- [ ] Moving installs of earlier versions across
 
 ```sh
-cargo run --features gpui
+cargo run
 ```
 
-A build with the `gpui` feature runs the GPUI shell. Set
-`OPENMOUSE_BRIDGE_SHELL=egui` to run the egui panel from the same build; a build
-without the feature always runs the egui panel.
-
-Bridge stays a separate app from OpenMouse Desktop; Desktop is only a reference
+Bridge is a separate app from OpenMouse Desktop; Desktop is only a reference
 for patterns.
 
 ---
@@ -116,22 +94,21 @@ Install stable Rust, then run:
 cargo run
 ```
 
-On Linux, install the system libraries for the tray icon and window first
-(Ubuntu 24.04):
+On Linux, install the system libraries for the window first (Ubuntu 22.04 or
+24.04):
 
 ```sh
-sudo apt-get update && sudo apt-get install -y libudev-dev libgtk-3-dev libayatana-appindicator3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libgl1-mesa-dev pkg-config
+sudo apt-get update && sudo apt-get install -y build-essential clang cmake pkg-config libudev-dev libssl-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libvulkan-dev libgl1-mesa-dev libfontconfig-dev libfreetype-dev libasound2-dev
 ```
 
-Linux notes: the tray icon needs a StatusNotifier/AppIndicator host (stock
-GNOME shows nothing without an AppIndicator extension; the panel still opens
-with `OPENMOUSE_BRIDGE_SHOW_WINDOW=1`), the overlay banner and foreground
-detection need X11 (on Wayland the banner falls back to a system notification
-and `foreground` is always false), and the chime needs `paplay` or `aplay`.
-With no `WAYLAND_DISPLAY` or `DISPLAY` (servers, SSH sessions), or with
-`OPENMOUSE_BRIDGE_HEADLESS=1` / `--headless`, Bridge skips the tray panel
-and serves its HTTP API, HID, and game profiles headless (Ctrl-C stops it).
-Startup at login writes `~/.config/autostart/io.openmouse.bridge.desktop`.
+Linux notes: there is no tray icon yet, so the panel is an ordinary window and
+its close button quits; the overlay banner and foreground detection need X11
+(on Wayland the banner falls back to a system notification and `foreground` is
+always false), and the chime needs `paplay` or `aplay`. With no
+`WAYLAND_DISPLAY` or `DISPLAY` (servers, SSH sessions), or with
+`OPENMOUSE_BRIDGE_HEADLESS=1` / `--headless`, Bridge skips the window and serves
+its HTTP API, HID, and game profiles headless (Ctrl-C stops it). Startup at
+login writes `~/.config/autostart/io.openmouse.bridge.desktop`.
 
 Bridge creates `config.json` in the operating system's per-user application
 configuration directory. At startup it refreshes the tracked-game catalog from
@@ -276,29 +253,35 @@ control panel. A selected profile is not proof that a hardware write succeeded.
 
 ## Tray panel
 
-> This section describes the current egui panel, which the GPUI shell will replace.
+The panel is a small borderless GPUI window in OpenMouse's dark look: near-black
+surfaces, the green accent, and a field of ASCII characters behind it. It has
+three views, all under the same title bar (drag the title to move it; the
+buttons are settings and close):
 
-The native tray panel uses OpenMouse's lit surfaces, inset controls, raised
-actions, trailing switches, Emerald palette and embedded DM Sans. Home starts at
-360 by 280 logical points; Settings is 360 by 420. Real content can grow Home up
-to 340 points high. Extended connection and battery reports live behind the info
-controls rather than filling the default view.
-Home separates the Bridge service, browser connection, live HID sessions, saved
-profile selection, and battery readings instead of treating them as one status.
-Settings keeps startup, battery alerts, notification sound, updates, and logs in
-one scrollable view.
+- **Home** lists the service, the active profile ("Default" unless a game's
+  profile is active), and every mouse Bridge has seen, with its battery and DPI
+  while it is plugged in or when it was last seen. An update card appears when
+  one is available, and a note on the first launch says the app lives in the
+  tray. A failed native write is shown under the card in red.
+- **Settings** has run on start, hybrid mode, the tray icon style (battery or
+  number), the low-battery alert level, notification sound and volume, update
+  automatically and check for updates, a test notification, open logs, and a
+  link to the info page.
+- **Info** shows the version, platform, address, uptime, whether the control
+  panel is connected, the device mode, and the config and log paths.
 
-Drag the header beside the OpenMouse name, or beside the Settings title, to move
-the borderless window. Settings and Back leave its position unchanged. Clicking
-the tray icon opens the panel near that icon, constrained to the monitor work
-area on Windows. The titlebar minimize and close controls hide to the tray;
-background operation continues. Escape also dismisses the panel. Quit Bridge
-stops the process.
+Clicking the tray icon (a left click, a double-click, or on macOS a right click)
+opens the panel beside it: centred under the icon below the menu bar on macOS,
+above a bottom taskbar on Windows. Closing it, or pressing Escape, hides it to
+the tray and Bridge keeps running; Quit stops the process. The first launch
+opens the panel and later launches start hidden (`OPENMOUSE_BRIDGE_SHOW_WINDOW=1`
+opens it anyway, and `OPENMOUSE_BRIDGE_START_VIEW=settings|info` opens straight
+onto a view, for development).
 
-`OPENMOUSE_BRIDGE_TEST_POSITION=x,y` starts the panel at an explicit logical
-position without requesting focus, for isolated secondary-monitor UI checks.
 Use `OPENMOUSE_BRIDGE_CONFIG` with a disposable configuration and set
-`autostartConfigured` to `true` to avoid first-run startup registration in tests.
+`autostartConfigured` to `true` to avoid first-run startup registration in
+tests. Turning the "Run on start" switch on or off in a development build
+changes the real login item, so leave it alone there.
 
 ## Verify
 

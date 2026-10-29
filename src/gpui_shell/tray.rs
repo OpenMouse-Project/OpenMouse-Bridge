@@ -1,9 +1,8 @@
 //! The tray icon for the GPUI shell: closing the panel hides it, a click on the
 //! icon brings it back, and the menu offers Open / Restart / Quit.
 //!
-//! macOS and Windows only for now. Linux needs the GTK main loop that
-//! `tray-icon` wants and GPUI does not provide; there the panel is a plain
-//! window and closing it quits.
+//! macOS and Windows only for now. Linux has no tray icon yet; there the panel
+//! is a plain window and closing it quits.
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -49,7 +48,7 @@ impl TrayHandle {
                         .set_tooltip(Some(tray_battery::tooltip(battery)))?;
                     Ok(())
                 }),
-                None => crate::desktop::tray_icon().and_then(|icon| {
+                None => crate::runtime::tray_icon().and_then(|icon| {
                     self.icon.set_icon(Some(icon))?;
                     self.icon.set_tooltip(Some("OpenMouse Bridge"))?;
                     Ok(())
@@ -61,6 +60,20 @@ impl TrayHandle {
             }
         }
         self.shown = battery;
+    }
+
+    /// Windows can drop the notification-area icon across sleep or hibernate
+    /// while the process keeps running; this adds a fresh one. The battery is
+    /// drawn on it again at the next poll.
+    pub fn recreate(&mut self) {
+        #[cfg(any(target_os = "macos", windows))]
+        match build_icon() {
+            Some(icon) => {
+                self.icon = icon;
+                self.shown = None;
+            }
+            None => tracing::warn!("Could not recreate the tray icon after resume"),
+        }
     }
 }
 
@@ -327,19 +340,14 @@ pub fn show(window: &mut Window, anchor: Option<Anchor>) {
     VISIBLE.store(true, Ordering::Relaxed);
 }
 
-/// Creates the tray icon and makes closing `window` hide it. Returns the
-/// channel its clicks and menu items arrive on and the icon itself, or `None`
-/// when there is no tray (then closing the window still quits).
+/// Builds the tray icon: the logo, the tooltip, and on Windows the menu.
 #[cfg(any(target_os = "macos", windows))]
-pub fn install(
-    cx: &mut App,
-    window: AnyWindowHandle,
-) -> Option<(mpsc::Receiver<Command>, TrayHandle)> {
+fn build_icon() -> Option<tray_icon::TrayIcon> {
+    use tray_icon::TrayIconBuilder;
     #[cfg(windows)]
-    use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-    use tray_icon::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+    use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
 
-    let icon = crate::desktop::tray_icon().ok()?;
+    let icon = crate::runtime::tray_icon().ok()?;
     let builder = TrayIconBuilder::new()
         .with_icon(icon)
         .with_tooltip("OpenMouse Bridge")
@@ -349,18 +357,31 @@ pub fn install(
     // double-click could show the panel. The panel has Restart and Quit
     // buttons of its own, so macOS gets no tray menu; Windows keeps one.
     #[cfg(windows)]
-    let tray = {
+    let builder = {
         let open = MenuItem::with_id("open", "Open OpenMouse Bridge", true, None);
         let restart = MenuItem::with_id("restart", "Restart", true, None);
         let quit = MenuItem::with_id("quit", "Quit Bridge", true, None);
         let menu = Menu::new();
         menu.append_items(&[&open, &PredefinedMenuItem::separator(), &restart, &quit])
             .ok()?;
-        let builder = builder.with_menu(Box::new(menu));
-        builder.build().ok()?
+        builder.with_menu(Box::new(menu))
     };
-    #[cfg(not(windows))]
-    let tray = builder.build().ok()?;
+    builder.build().ok()
+}
+
+/// Creates the tray icon and makes closing `window` hide it. Returns the
+/// channel its clicks and menu items arrive on and the icon itself, or `None`
+/// when there is no tray (then closing the window still quits).
+#[cfg(any(target_os = "macos", windows))]
+pub fn install(
+    cx: &mut App,
+    window: AnyWindowHandle,
+) -> Option<(mpsc::Receiver<Command>, TrayHandle)> {
+    #[cfg(windows)]
+    use tray_icon::menu::MenuEvent;
+    use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
+
+    let tray = build_icon()?;
 
     // The handlers run on the main thread inside the platform's event
     // dispatch; they only queue a command for the poll loop in `run`.
