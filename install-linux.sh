@@ -26,7 +26,7 @@ set -euo pipefail
 
 REPO="OpenMouse-Project/OpenMouse-Bridge"
 ASSET="openmouse-bridge-linux-x64-full.zip"
-# Releases before 1.0.0-beta.22 published the full package under this name;
+# Releases before 1.0.0-beta.21 published the full package under this name;
 # since then it is a small archive for older updaters, not a usable install.
 LEGACY_ASSET="openmouse-bridge-linux-x64.zip"
 RAW_BASE="https://raw.githubusercontent.com/${REPO}/main"
