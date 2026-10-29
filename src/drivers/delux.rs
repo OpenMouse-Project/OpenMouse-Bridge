@@ -47,7 +47,7 @@ const REPORT_ID_248A: u8 = 0x0c;
 /// or `Ok(false)` if no matching native device could be opened (allowing
 /// fallback to the Node.js native-hid helper).
 pub fn apply(profile: &ApplicationProfile) -> Result<bool> {
-    let api = match HidApi::new() {
+    let api = match crate::hid::new_api() {
         Ok(api) => api,
         Err(_) => return Ok(false),
     };

@@ -15,7 +15,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use hidapi::HidApi;
 
 use super::{NativeBattery, NativeStatus};
 use crate::config::ApplicationProfile;
@@ -213,7 +212,7 @@ impl PulsarDevice {
     /// channel, so wrong interfaces are expected to fail here and are
     /// skipped rather than treated as a hard error.
     pub fn open() -> Result<Self> {
-        let api = HidApi::new().context("could not initialize the HID subsystem")?;
+        let api = crate::hid::new_api().context("could not initialize the HID subsystem")?;
         let mut last_error: Option<anyhow::Error> = None;
         let candidates = api
             .device_list()

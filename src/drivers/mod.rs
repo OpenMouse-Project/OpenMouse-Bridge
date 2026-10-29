@@ -126,7 +126,7 @@ fn discovered_brand(info: &hidapi::DeviceInfo) -> Option<&'static str> {
 /// Deliberately does not open any device — enumeration only — so it is safe
 /// to call while a web panel session or another driver operation runs.
 pub fn detect_mice() -> Vec<DetectedMouse> {
-    let api = match hidapi::HidApi::new() {
+    let api = match crate::hid::new_api() {
         Ok(api) => api,
         Err(error) => {
             tracing::warn!(%error, "could not enumerate HID devices");

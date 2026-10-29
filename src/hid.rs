@@ -442,8 +442,7 @@ impl HidSession {
     fn new(session_id: u64, input_tx: InputSender) -> Result<Self, String> {
         Ok(Self {
             session_id,
-            api: HidApi::new()
-                .map_err(|error| format!("could not initialize native HID: {error}"))?,
+            api: new_api().map_err(|error| format!("could not initialize native HID: {error}"))?,
             next_key: 1,
             device_keys: HashMap::new(),
             last_device_keys: None,
@@ -567,8 +566,7 @@ impl HidSession {
             return Err("too many HID vendor ids were requested".into());
         }
         let vendors: HashSet<u16> = vendor_ids.into_iter().collect();
-        self.api
-            .refresh_devices()
+        refresh_api(&mut self.api)
             .map_err(|error| format!("could not refresh HID devices: {error}"))?;
 
         // Reconcile against the full inventory, not the requested vendor filter:
@@ -750,7 +748,7 @@ impl HidSession {
     fn handle_resume(&mut self) {
         let keys = self.open_devices.keys().cloned().collect::<Vec<_>>();
         if keys.is_empty() {
-            let _ = self.api.refresh_devices();
+            let _ = refresh_api(&mut self.api);
             return;
         }
         for key in keys {
@@ -775,8 +773,7 @@ impl HidSession {
     /// fresh inventory, and reopens it.
     fn recover(&mut self, key: &str) -> Result<(), String> {
         self.close(key)?;
-        self.api
-            .refresh_devices()
+        refresh_api(&mut self.api)
             .map_err(|error| format!("could not refresh HID devices: {error}"))?;
         let identity = self
             .device_keys
@@ -1086,6 +1083,58 @@ pub(crate) fn report_payload(data: &[u8], size: usize) -> Vec<u8> {
         .to_vec()
 }
 
+/// hidapi enumerates devices outside its own initialisation lock, and on macOS
+/// every enumeration shares one IOHIDManager and run loop, so two threads
+/// enumerating at once can crash the process with SIGTRAP. Bridge enumerates
+/// from the control-panel session, the battery poll, the 5-second device scan
+/// and the tests, so every enumeration goes through this lock.
+static ENUMERATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// hidapi's macOS backend schedules its IOHIDManager on the run loop of the
+/// thread that first initialises it. When that thread exits (a test thread, or
+/// a pool thread that went idle) the run loop goes with it, and the next
+/// enumeration from any other thread traps. So the one-time initialisation runs
+/// on a thread that lives as long as the process.
+#[cfg(target_os = "macos")]
+fn initialise_on_a_permanent_thread() {
+    static INITIALISED: std::sync::Once = std::sync::Once::new();
+    INITIALISED.call_once(|| {
+        let (done, wait) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("openmouse-hid-init".into())
+            .spawn(move || {
+                let _ = HidApi::new();
+                let _ = done.send(());
+                loop {
+                    std::thread::park();
+                }
+            });
+        if spawned.is_ok() {
+            let _ = wait.recv();
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn initialise_on_a_permanent_thread() {}
+
+/// A new HID context (which enumerates), serialised with every other one.
+pub(crate) fn new_api() -> hidapi::HidResult<HidApi> {
+    let _guard = ENUMERATION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    initialise_on_a_permanent_thread();
+    HidApi::new()
+}
+
+/// Refreshes a context's device list, serialised with every other enumeration.
+pub(crate) fn refresh_api(api: &mut HidApi) -> hidapi::HidResult<()> {
+    let _guard = ENUMERATION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    api.refresh_devices()
+}
+
 /// The interfaces of one device that declare a feature report, opened for a
 /// native driver that talks to the mouse itself rather than through a control
 /// panel session.
@@ -1110,7 +1159,7 @@ pub(crate) fn feature_interfaces(
     product_ids: &[u16],
     report_id: u8,
 ) -> Result<FeatureInterfaces, String> {
-    let api = HidApi::new().map_err(|error| error.to_string())?;
+    let api = new_api().map_err(|error| error.to_string())?;
     let mut seen = HashSet::new();
     let mut interfaces = Vec::new();
     for info in api.device_list() {
@@ -1624,7 +1673,7 @@ mod tests {
         if std::env::var_os("OPENMOUSE_SKIP_IOHID_TEST").is_some() {
             return;
         }
-        let api = HidApi::new().expect("HID subsystem should initialize");
+        let api = new_api().expect("HID subsystem should initialize");
         assert!(!api.get_open_exclusive());
     }
 
@@ -1775,6 +1824,25 @@ mod tests {
         // Undeclared (a Razer path without parsed descriptors): every path is a candidate, tried in order.
         assert_eq!(report_paths(&layouts, 0x00, true), vec![0, 1, 2]);
         assert!(report_paths(&[], 0x11, true).is_empty());
+    }
+
+    #[test]
+    fn concurrent_enumeration_does_not_crash() {
+        // Unserialised hidapi enumeration crashes macOS with SIGTRAP, only now
+        // and then, so this hammers it from several threads.
+        let threads: Vec<_> = (0..6)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..12 {
+                        let mut api = new_api().expect("HID subsystem should initialize");
+                        refresh_api(&mut api).expect("refresh");
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("enumeration thread");
+        }
     }
 
     #[test]
