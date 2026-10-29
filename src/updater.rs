@@ -321,6 +321,7 @@ fn stage_archive(archive: &[u8], version: &str) -> Result<()> {
     #[cfg(not(windows))]
     let parent = env::temp_dir();
     let parent = fs::canonicalize(parent).context("could not resolve update staging parent")?;
+    let parent = without_verbatim_prefix(parent);
     let mut staging = StagingDirectory::new_in(&parent)?;
     extract_archive(archive, &staging.path)?;
     verify_package(&staging.path)?;
@@ -352,6 +353,25 @@ fn stage_archive(archive: &[u8], version: &str) -> Result<()> {
     spawn_install_helper(&staging.path, install_directory, &current_executable)?;
     staging.handed_off = true;
     Ok(())
+}
+
+/// `fs::canonicalize` returns `\\?\C:\...` on Windows. Windows PowerShell 5.1
+/// cannot walk the parents of such a path, so the install helper threw before
+/// installing or relaunching anything; hand it the plain drive path instead.
+/// UNC and other verbatim forms are kept as they are.
+fn without_verbatim_prefix(path: std::path::PathBuf) -> std::path::PathBuf {
+    let Some(text) = path.to_str() else {
+        return path;
+    };
+    match text.strip_prefix(r"\\?\") {
+        Some(rest)
+            if rest.as_bytes().get(1) == Some(&b':')
+                && rest.as_bytes()[0].is_ascii_alphabetic() =>
+        {
+            rest.into()
+        }
+        _ => path,
+    }
 }
 
 /// Where an update package keeps the files Bridge needs, relative to the
