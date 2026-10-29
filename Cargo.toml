@@ -34,7 +34,7 @@ zip = { version = "9.0", default-features = false, features = ["deflate"] }
 gpui-kit = { version = "0.7", optional = true }
 
 [features]
-gpui = ["dep:gpui-kit"]
+gpui = ["dep:gpui-kit", "dep:raw-window-handle"]
 
 [target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
 eframe = { version = "0.36.1", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
@@ -85,6 +85,8 @@ objc2-core-foundation = { version = "0.3.2", default-features = false, features 
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGEvent", "CGEventTypes", "CGRemoteOperation"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+# Window handle for hiding the GPUI panel to the tray (feature `gpui`).
+raw-window-handle = { version = "0.6", optional = true }
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",

@@ -109,18 +109,28 @@ their own install helper fails before it swaps anything.
 
 ## Progress
 
-Phase 1 is started, not done.
+Phase 1 is under way.
 
 - `Cargo.toml` has an optional `gpui` feature (`gpui-kit` 0.7) and the
   `gpui-pre-apple` patch, vendored from Desktop into `vendor/gpui-pre-apple`.
-  Default builds do not use either; `cargo check --locked` passes.
+  Default builds do not use either.
 - `src/desktop.rs` exposes what a second shell needs (`BackgroundServer`,
   `BridgeCommand`, `UpdateEvent`, the label helpers, `tray_icon`,
   `restart_bridge`, window size constants). Behaviour is unchanged.
-- Next: add `src/gpui_shell/` behind `--features gpui`. It starts the same
-  `BackgroundServer`, polls the snapshot, update and notice channels on a timer
-  (pass an empty `OnceLock` as the egui waker), opens a borderless panel, and
-  installs the tray icon with Open / Restart / Quit, following Desktop's
-  `tray.rs`. Then port the Home view, then Settings. Select it with an env var
-  in `main.rs` until it reaches parity. Windows and Linux tray code is not
-  written or tested yet; macOS comes first.
+- `src/gpui_shell/` (feature `gpui`, selected with
+  `OPENMOUSE_BRIDGE_SHELL=gpui`) starts the same `BackgroundServer`, polls its
+  channels every 100 ms, opens a 360 by 280 borderless panel and installs a tray
+  icon with Open / Restart / Quit. The panel is read-only: service, profile,
+  mouse and battery rows, the update status text, and Open OpenMouse / Restart /
+  Quit buttons. System notifications stand in for the overlay.
+
+Checked on macOS: it builds, starts, serves the HTTP API, and the panel window
+is on screen at the right size; `PUT /v1/panel` is accepted. Not checked: how the
+panel and tray icon actually look or behave (no screenshots or clicks from the
+test environment), anything on Windows (the tray code is written but has never
+been compiled there), and Linux (no tray yet).
+
+Next: panel placement at the tray icon and hide-on-escape, Home view parity with
+the egui panel (device summary rows, battery details, remove-stale control),
+then Settings (startup, battery alerts, sound, updates, logs), then the GPUI
+overlay and notifications.
