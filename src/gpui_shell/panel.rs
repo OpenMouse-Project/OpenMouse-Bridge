@@ -26,7 +26,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use super::ascii;
 use crate::desktop::{
     BridgeCommand, UpdateEvent, WINDOW_HEIGHT, WINDOW_WIDTH, notify_natively, open_logs,
-    open_openmouse, profile_label, service_label,
+    open_openmouse, service_label,
 };
 use crate::overlay::Overlay;
 
@@ -220,6 +220,9 @@ impl PanelView {
                 if self.update_text.is_some() {
                     height += NOTE_HEIGHT;
                 }
+                if native_problem(self.snapshot.as_ref()).is_some() {
+                    height += NOTE_HEIGHT * 2.0;
+                }
             }
             View::Settings => {
                 if self.update_available.is_some() {
@@ -299,6 +302,42 @@ fn card(line: Hsla, fill: Hsla) -> Div {
         .bg(fill)
 }
 
+/// The profile row: the game's profile while one is active, otherwise Default.
+fn profile_name(snapshot: Option<&BridgeSnapshot>) -> String {
+    snapshot
+        .and_then(|snapshot| {
+            snapshot
+                .active_profile
+                .as_ref()
+                .filter(|_| !snapshot.active_profile_is_default)
+        })
+        .map_or_else(
+            || "Default".into(),
+            |profile| profile.application.name.clone(),
+        )
+}
+
+/// A failed or pending hardware write, kept out of the profile row so it stays
+/// readable; a selected profile is not proof the mouse took it.
+fn native_problem(snapshot: Option<&BridgeSnapshot>) -> Option<String> {
+    let snapshot = snapshot?;
+    if snapshot.pending_native_restores > 0 {
+        let mut text = format!(
+            "Native restore pending ({})",
+            snapshot.pending_native_restores
+        );
+        if let Some(error) = &snapshot.native_automation_error {
+            text.push_str(": ");
+            text.push_str(error);
+        }
+        return Some(text);
+    }
+    snapshot
+        .native_automation_error
+        .as_ref()
+        .map(|error| format!("Native settings not applied: {error}"))
+}
+
 fn format_age(seconds: u64) -> String {
     match seconds {
         0..=59 => "just now".into(),
@@ -351,19 +390,22 @@ fn known_device_text(device: &KnownDeviceStatus) -> String {
 }
 
 impl PanelView {
-    fn back_header(
+    /// The panel's title bar: an optional back button, the title (which, with
+    /// the space after it, drags the borderless window), the version, the
+    /// settings button on Home, and a close button that hides the panel to the
+    /// tray (or quits where there is no tray).
+    fn title_bar(
         &self,
         title: &'static str,
+        back: bool,
+        settings: bool,
         accent: Hsla,
         muted: Hsla,
         cx: &mut Context<Self>,
     ) -> Div {
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .child(
+        let mut bar = div().flex().flex_row().items_center().gap_1();
+        if back {
+            bar = bar.child(
                 Button::new("back")
                     .ghost()
                     .compact()
@@ -372,21 +414,64 @@ impl PanelView {
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.show_view(View::Home, cx);
                     })),
-            )
+            );
+        }
+        // Only the title area starts a window move, so the buttons keep their
+        // own clicks.
+        bar = bar
             .child(
                 div()
-                    .text_base()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(title),
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .items_center()
+                    .gap_2()
+                    .py_1()
+                    .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
+                    .child(div().size(px(8.)).flex_none().rounded_full().bg(accent))
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title),
+                    ),
             )
-            .child(div().flex_1())
-            .child(div().size(px(8.)).flex_none().rounded_full().bg(accent))
             .child(
                 div()
                     .text_xs()
                     .text_color(muted)
                     .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
-            )
+            );
+        if settings {
+            bar = bar.child(
+                Button::new("settings")
+                    .ghost()
+                    .compact()
+                    .icon(IconName::Settings)
+                    .tooltip("Settings")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_view(View::Settings, cx);
+                    })),
+            );
+        }
+        bar.child(
+            Button::new("close")
+                .ghost()
+                .compact()
+                .icon(IconName::Close)
+                .tooltip(if super::tray::can_hide() {
+                    "Hide to tray"
+                } else {
+                    "Quit"
+                })
+                .on_click(cx.listener(|_, _, window, cx| {
+                    if super::tray::can_hide() {
+                        super::tray::hide(window);
+                    } else {
+                        cx.quit();
+                    }
+                })),
+        )
     }
 
     fn home(
@@ -400,7 +485,7 @@ impl PanelView {
         let snapshot = self.snapshot.as_ref();
         let mut details = card(line, fill)
             .child(row(muted, "Service", service_label(snapshot)))
-            .child(row(muted, "Profile", profile_label(snapshot)));
+            .child(row(muted, "Profile", profile_name(snapshot)));
         let known = snapshot
             .map(|snapshot| snapshot.known_devices.as_slice())
             .unwrap_or(&[]);
@@ -438,51 +523,11 @@ impl PanelView {
             .size_full()
             .p_4()
             .gap_3()
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .justify_between()
-                    .items_center()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(div().size(px(8.)).flex_none().rounded_full().bg(accent))
-                            .child(
-                                div()
-                                    .text_base()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("OpenMouse Bridge"),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
-                            )
-                            .child(
-                                Button::new("settings")
-                                    .ghost()
-                                    .compact()
-                                    .icon(IconName::Settings)
-                                    .tooltip("Settings")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.show_view(View::Settings, cx);
-                                    })),
-                            ),
-                    ),
-            )
+            .child(self.title_bar("OpenMouse Bridge", false, true, accent, muted, cx))
             .child(details);
+        if let Some(problem) = native_problem(snapshot) {
+            content = content.child(div().text_xs().text_color(cx.theme().danger).child(problem));
+        }
         if let Some(text) = &self.update_text {
             content = content.child(div().text_xs().text_color(muted).child(text.clone()));
         }
@@ -534,7 +579,7 @@ impl PanelView {
             .size_full()
             .p_4()
             .gap_3()
-            .child(self.back_header("Settings", accent, muted, cx))
+            .child(self.title_bar("Settings", true, false, accent, muted, cx))
             .child(
                 card(line, fill).child(
                     div()
@@ -688,7 +733,7 @@ impl PanelView {
             .size_full()
             .p_4()
             .gap_3()
-            .child(self.back_header("Bridge info", accent, muted, cx))
+            .child(self.title_bar("Bridge info", true, false, accent, muted, cx))
             .child(details)
     }
 }

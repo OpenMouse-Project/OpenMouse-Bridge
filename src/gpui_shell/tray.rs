@@ -101,6 +101,12 @@ pub fn is_visible() -> bool {
     VISIBLE.load(Ordering::Relaxed)
 }
 
+/// Whether closing the panel can hide it to a tray icon; where it cannot, the
+/// close button quits.
+pub fn can_hide() -> bool {
+    cfg!(any(target_os = "macos", windows))
+}
+
 pub fn hide(window: &Window) {
     platform::hide_window(window);
     #[cfg(any(target_os = "macos", windows))]
