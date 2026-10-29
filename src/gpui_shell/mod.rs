@@ -22,7 +22,7 @@ use std::{
 
 use anyhow::Result;
 use gpui_kit::*;
-use panel::PanelView;
+use panel::{CoreLinks, PanelView};
 
 use crate::desktop::{
     BackgroundServer, WINDOW_HEIGHT, WINDOW_WIDTH, current_relaunch_generation, restart_bridge,
@@ -64,19 +64,26 @@ pub fn run() -> Result<()> {
         };
         let view_restart = Arc::clone(&app_restart);
         let (handle, view) = open_window(options, cx, move |_, cx| {
-            cx.new(|_| {
+            cx.new(|cx| {
                 PanelView::new(
-                    snapshots,
-                    commands,
-                    updates,
-                    notices,
-                    panel_requests,
+                    CoreLinks {
+                        snapshots,
+                        commands,
+                        updates,
+                        notices,
+                        panel_requests,
+                    },
                     view_restart,
+                    show_panel,
+                    cx.focus_handle(),
                 )
             })
         })
         .expect("failed to open the Bridge panel");
 
+        // The panel opens at launch on a first run, and when asked to by the
+        // environment, as in the egui shell.
+        let show_panel = show_panel || std::env::var_os("OPENMOUSE_BRIDGE_SHOW_WINDOW").is_some();
         let (tray_commands, mut tray_handle) = match tray::install(cx, handle) {
             Some((commands, tray)) => (Some(commands), Some(tray)),
             None => (None, None),

@@ -101,7 +101,12 @@ pub struct PanelView {
     update_text: Option<String>,
     update_available: Option<UpdateInfo>,
     update_busy: bool,
+    /// Shown on Home until the panel is first closed: the first launch opens
+    /// the panel, so the app's home in the tray needs saying.
+    first_run_hint: bool,
     error: Option<String>,
+    /// Lets the panel take key presses, so Escape can dismiss it.
+    focus: FocusHandle,
     field: ascii::Field,
     was_visible: bool,
     /// The on-screen banner for low-battery and game-profile notices. Without
@@ -117,15 +122,34 @@ pub struct Drained {
     pub overlay_delay: Option<Duration>,
 }
 
+/// The channels between the panel and the core.
+pub struct CoreLinks {
+    pub snapshots: mpsc::Receiver<BridgeSnapshot>,
+    pub commands: tokio_mpsc::UnboundedSender<BridgeCommand>,
+    pub updates: mpsc::Receiver<UpdateEvent>,
+    pub notices: mpsc::Receiver<Notice>,
+    pub panel_requests: mpsc::Receiver<()>,
+}
+
 impl PanelView {
     pub fn new(
-        snapshots: mpsc::Receiver<BridgeSnapshot>,
-        commands: tokio_mpsc::UnboundedSender<BridgeCommand>,
-        updates: mpsc::Receiver<UpdateEvent>,
-        notices: mpsc::Receiver<Notice>,
-        panel_requests: mpsc::Receiver<()>,
+        links: CoreLinks,
         restart: Arc<AtomicBool>,
+        first_run: bool,
+        focus: FocusHandle,
     ) -> Self {
+        let CoreLinks {
+            snapshots,
+            commands,
+            updates,
+            notices,
+            panel_requests,
+        } = links;
+        if first_run {
+            // Tell the core the tray hint was shown, so later launches start
+            // hidden in the tray instead of opening the panel again.
+            let _ = commands.send(BridgeCommand::AcknowledgeTrayHint);
+        }
         Self {
             snapshots,
             commands,
@@ -151,7 +175,9 @@ impl PanelView {
             update_text: None,
             update_available: None,
             update_busy: false,
+            first_run_hint: first_run,
             error: None,
+            focus,
             field: ascii::Field::default(),
             was_visible: true,
             overlay: Overlay::new()
@@ -276,6 +302,9 @@ impl PanelView {
                 if native_problem(self.snapshot.as_ref()).is_some() {
                     height += NOTE_HEIGHT * 2.0;
                 }
+                if self.first_run_hint {
+                    height += NOTE_HEIGHT * 2.0;
+                }
             }
             View::Settings => {}
             View::Info => {}
@@ -299,6 +328,12 @@ impl PanelView {
         let _ = self
             .commands
             .send(BridgeCommand::SetAutomaticUpdates(enabled));
+        cx.notify();
+    }
+
+    /// Forgets a remembered mouse that is no longer plugged in.
+    fn forget_device(&mut self, id: String, cx: &mut Context<Self>) {
+        let _ = self.commands.send(BridgeCommand::ForgetBattery(id));
         cx.notify();
     }
 
@@ -588,7 +623,8 @@ impl PanelView {
                 } else {
                     "Quit"
                 })
-                .on_click(cx.listener(|_, _, window, cx| {
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.first_run_hint = false;
                     if super::tray::can_hide() {
                         super::tray::hide(window);
                     } else {
@@ -630,7 +666,26 @@ impl PanelView {
                             .text_color(if device.connected { accent } else { muted })
                             .child(device.name.clone()),
                     )
-                    .child(div().flex_none().child(known_device_text(device))),
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_none()
+                            .items_center()
+                            .gap_1()
+                            .child(known_device_text(device))
+                            .children((!device.connected).then(|| {
+                                let id = device.id.clone();
+                                Button::new(SharedString::from(format!("forget-{}", device.id)))
+                                    .ghost()
+                                    .compact()
+                                    .icon(IconName::Close)
+                                    .tooltip("Forget this mouse")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.forget_device(id.clone(), cx);
+                                    }))
+                            })),
+                    ),
             );
         }
         if known.len() > HOME_DEVICE_ROWS {
@@ -649,6 +704,11 @@ impl PanelView {
             .gap_3()
             .child(self.title_bar("OpenMouse Bridge", false, true, accent, muted, cx))
             .child(details);
+        if self.first_run_hint {
+            content = content.child(div().text_xs().text_color(muted).child(
+                "Bridge keeps running in the tray. Click its icon to open this panel again.",
+            ));
+        }
         if let Some(problem) = native_problem(snapshot) {
             content = content.child(div().text_xs().text_color(cx.theme().danger).child(problem));
         }
@@ -974,10 +1034,21 @@ impl Render for PanelView {
         };
         // The ASCII field sits behind the content; the window's own Root paints
         // the background, so this shell stays clear.
+        // Escape hides the panel to the tray, where there is one. The panel
+        // takes focus whenever it is drawn and does not have it.
+        if !self.focus.is_focused(window) {
+            window.focus(&self.focus, cx);
+        }
         div()
             .relative()
             .size_full()
             .text_color(foreground)
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(|_, event: &KeyDownEvent, window, _| {
+                if event.keystroke.key == "escape" && super::tray::can_hide() {
+                    super::tray::hide(window);
+                }
+            }))
             .child(field)
             .child(content)
     }
