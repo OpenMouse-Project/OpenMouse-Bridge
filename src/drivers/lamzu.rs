@@ -231,7 +231,11 @@ mod tests {
         )
     }
 
-    fn run(replies: Vec<Vec<u8>>) -> (Result<Option<(u8, bool)>>, FakeLink, Vec<Duration>) {
+    /// What one scripted exchange produced: the result, the link (to see what
+    /// was sent) and the pauses taken.
+    type Run = (Result<Option<(u8, bool)>>, FakeLink, Vec<Duration>);
+
+    fn run(replies: Vec<Vec<u8>>) -> Run {
         let mut link = FakeLink::new(replies);
         let mut pauses = Vec::new();
         let result = read_battery(&mut link, &mut |duration| pauses.push(duration));
