@@ -118,19 +118,33 @@ Phase 1 is under way.
   `BridgeCommand`, `UpdateEvent`, the label helpers, `tray_icon`,
   `restart_bridge`, window size constants). Behaviour is unchanged.
 - `src/gpui_shell/` (feature `gpui`, selected with
-  `OPENMOUSE_BRIDGE_SHELL=gpui`) starts the same `BackgroundServer`, polls its
-  channels every 100 ms, opens a 360 by 280 borderless panel and installs a tray
-  icon with Open / Restart / Quit. The panel is read-only: service, profile,
-  mouse and battery rows, the update status text, and Open OpenMouse / Restart /
-  Quit buttons. System notifications stand in for the overlay.
+  `OPENMOUSE_BRIDGE_SHELL=gpui`) starts the same `BackgroundServer` and polls its
+  channels every 200 ms. The palette and the ASCII field are ported from
+  Desktop (dark only). The panel resizes to its content and does not repaint
+  while hidden in the tray.
+  - Home: service, profile and remembered mice, with Open OpenMouse / Restart /
+    Quit.
+  - Settings: run on start, update automatically, check for updates (with an
+    install button when one is found), open logs, and a link to the info page.
+  - Info: version, platform, address, uptime, control-panel connection, device
+    mode, profile and remembered-mouse counts, config and log paths.
+  - System notifications stand in for the overlay.
+- Core: `devices.json` (beside `config.json`) remembers every mouse seen: name,
+  last battery reading, DPI, polling rate and when it was last seen. It is
+  reported as `knownDevices` in `/v1/status`. The HID bus is listed every 5
+  seconds (about 5 ms, no device opened); "connected" follows the latest scan,
+  matched by brand because the control panel names a mouse differently from the
+  bus. A mouse that appears gets a battery read right away. Known limitation:
+  two mice of one brand cannot be told apart for the connected state. Discovery
+  is by driver brand, so a keyboard from such a brand (a Wooting) is listed too.
 
-Checked on macOS: it builds, starts, serves the HTTP API, and the panel window
-is on screen at the right size; `PUT /v1/panel` is accepted. Not checked: how the
-panel and tray icon actually look or behave (no screenshots or clicks from the
-test environment), anything on Windows (the tray code is written but has never
-been compiled there), and Linux (no tray yet).
+Checked on macOS: it builds, starts, serves the API, remembers mice across
+restarts (unit tests), and refreshes "last seen" every scan against real
+hardware. Idle CPU on a debug build was about 1.7% of a core with the panel
+hidden and 7% visible. Not checked: clicks on the tray icon, the switches and
+buttons, anything on Windows (the tray code has never been compiled there), and
+Linux (no tray yet).
 
-Next: panel placement at the tray icon and hide-on-escape, Home view parity with
-the egui panel (device summary rows, battery details, remove-stale control),
-then Settings (startup, battery alerts, sound, updates, logs), then the GPUI
-overlay and notifications.
+Next: panel placement at the tray icon and hide-on-escape, Home parity with the
+egui panel (battery details, remove-stale control), then the GPUI overlay and
+notifications.

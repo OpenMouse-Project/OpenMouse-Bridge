@@ -11,7 +11,7 @@
 
 | Area | Plan | Status |
 | --- | --- | --- |
-| Shell | Replace the egui tray panel, overlay and notifications with GPUI | Skeleton runs on macOS (read-only Home) |
+| Shell | Replace the egui tray panel, overlay and notifications with GPUI | Runs on macOS: Home, Settings and Info |
 | Windows | Custom per-user installer, no admin prompt | Not started |
 | macOS | Keep the signed `.app` and DMG | Exists today |
 | Linux | AppImage, with a one-time udev permission step | Not started |
@@ -22,12 +22,15 @@ What is on this branch so far:
 - [x] Migration plan in [`docs/gpui-migration.md`](docs/gpui-migration.md)
 - [x] Optional `gpui` cargo feature and the vendored `gpui-pre-apple` patch
 - [x] The seams a second shell needs, exposed from `src/desktop.rs`
-- [x] `src/gpui_shell/` skeleton: panel window, tray icon with Open / Restart /
-      Quit, and a read-only Home view fed by the existing core (macOS; the
-      Windows tray code is written but not built or run yet, and Linux has no
-      tray)
-- [ ] Home view parity with the egui panel, then the Settings view
-- [ ] Settings view, overlay and notifications
+- [x] `src/gpui_shell/`: panel window and tray icon (Open / Restart / Quit) in
+      Desktop's dark look with the ASCII field, a Home view, a Settings view (run
+      on start, update automatically, check for updates, open logs) and a Bridge
+      info page (macOS; the Windows tray code is written but not built or run
+      yet, and Linux has no tray)
+- [x] Remembered mice: `devices.json` keeps every mouse Bridge has seen, and the
+      HID bus is scanned every 5 seconds for what is plugged in
+- [ ] Home parity with the egui panel (battery details, remove-stale control),
+      overlay and notifications
 - [ ] In-app updater and `latest.json`
 - [ ] Windows installer, macOS update path, Linux AppImage
 

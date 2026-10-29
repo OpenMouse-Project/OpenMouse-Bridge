@@ -5,6 +5,9 @@
 //! notice and panel-request channels, which are polled on a timer. Select it
 //! with `OPENMOUSE_BRIDGE_SHELL=gpui`. See docs/gpui-migration.md.
 
+mod ascii;
+mod panel;
+mod theme;
 mod tray;
 
 use std::{
@@ -17,19 +20,16 @@ use std::{
 };
 
 use anyhow::Result;
-use gpui_kit::component::{ActiveTheme as _, button::Button};
 use gpui_kit::*;
-use openmouse_bridge::service::{BridgeSnapshot, Notice};
-use tokio::sync::mpsc as tokio_mpsc;
+use panel::PanelView;
 
 use crate::desktop::{
-    BackgroundServer, BridgeCommand, UpdateEvent, WINDOW_HEIGHT, WINDOW_WIDTH, battery_text,
-    current_relaunch_generation, device_label, notify_natively, open_openmouse, profile_label,
-    restart_bridge, service_label,
+    BackgroundServer, WINDOW_HEIGHT, WINDOW_WIDTH, current_relaunch_generation, restart_bridge,
 };
 
-/// How often the channels from the core are drained.
-const POLL: Duration = Duration::from_millis(100);
+/// How often the channels from the core are drained; a tray click waits at
+/// most this long.
+const POLL: Duration = Duration::from_millis(200);
 
 pub fn run() -> Result<()> {
     let (notice_tx, notices) = mpsc::channel();
@@ -45,6 +45,7 @@ pub fn run() -> Result<()> {
 
     application().with_assets(assets::AllAssets).run(move |cx| {
         init(cx);
+        theme::apply(cx);
         crate::desktop::configure_tray_only_application();
 
         let options = WindowOptions {
@@ -61,15 +62,15 @@ pub fn run() -> Result<()> {
         };
         let view_restart = Arc::clone(&app_restart);
         let (handle, view) = open_window(options, cx, move |_, cx| {
-            cx.new(|_| PanelView {
-                snapshots,
-                commands,
-                updates,
-                notices,
-                panel_requests,
-                restart: view_restart,
-                snapshot: None,
-                update_text: None,
+            cx.new(|_| {
+                PanelView::new(
+                    snapshots,
+                    commands,
+                    updates,
+                    notices,
+                    panel_requests,
+                    view_restart,
+                )
             })
         })
         .expect("failed to open the Bridge panel");
@@ -127,145 +128,4 @@ pub fn run() -> Result<()> {
         restart_bridge(current_relaunch_generation())?;
     }
     stopped
-}
-
-struct PanelView {
-    snapshots: mpsc::Receiver<BridgeSnapshot>,
-    #[allow(dead_code)] // Settings and update controls send these once ported.
-    commands: tokio_mpsc::UnboundedSender<BridgeCommand>,
-    updates: mpsc::Receiver<UpdateEvent>,
-    notices: mpsc::Receiver<Notice>,
-    panel_requests: mpsc::Receiver<()>,
-    restart: Arc<AtomicBool>,
-    snapshot: Option<BridgeSnapshot>,
-    update_text: Option<String>,
-}
-
-struct Drained {
-    changed: bool,
-    panel_requested: bool,
-}
-
-impl PanelView {
-    /// Takes everything the core has queued since the last poll. Notices become
-    /// system notifications for now; the GPUI overlay replaces that later.
-    fn drain(&mut self) -> Drained {
-        let mut changed = false;
-        while let Ok(snapshot) = self.snapshots.try_recv() {
-            self.snapshot = Some(snapshot);
-            changed = true;
-        }
-        while let Ok(event) = self.updates.try_recv() {
-            self.update_text = match event {
-                UpdateEvent::Checking => Some("Checking for updates…".into()),
-                UpdateEvent::UpToDate => Some("Bridge is up to date".into()),
-                UpdateEvent::Available(update) => {
-                    Some(format!("Version {} is available", update.version))
-                }
-                UpdateEvent::Downloading(version) => Some(format!("Downloading {version}…")),
-                UpdateEvent::Restarting(version) => Some(format!("Restarting into {version}…")),
-                UpdateEvent::Failed(error) => Some(format!("Update failed: {error}")),
-            };
-            changed = true;
-        }
-        while let Ok(notice) = self.notices.try_recv() {
-            notify_natively(&notice);
-        }
-        let mut panel_requested = false;
-        while self.panel_requests.try_recv().is_ok() {
-            panel_requested = true;
-        }
-        Drained {
-            changed,
-            panel_requested,
-        }
-    }
-}
-
-fn row(muted: Hsla, label: &'static str, value: impl Into<SharedString>) -> Div {
-    div()
-        .flex()
-        .flex_row()
-        .justify_between()
-        .gap_3()
-        .text_sm()
-        .child(div().text_color(muted).child(label))
-        .child(div().truncate().child(value.into()))
-}
-
-impl Render for PanelView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let muted = cx.theme().muted_foreground;
-        let snapshot = self.snapshot.as_ref();
-        let restart = Arc::clone(&self.restart);
-
-        let mut panel = div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .p_4()
-            .gap_2()
-            .bg(cx.theme().background)
-            .text_color(cx.theme().foreground)
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .justify_between()
-                    .items_center()
-                    .child(div().text_base().child("OpenMouse Bridge"))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
-                    ),
-            )
-            .child(row(muted, "Service", service_label(snapshot)))
-            .child(row(muted, "Profile", profile_label(snapshot)))
-            .child(row(muted, "Mouse", device_label(snapshot)));
-
-        if let Some(snapshot) = snapshot {
-            for battery in &snapshot.batteries {
-                panel = panel.child(div().text_sm().child(format!(
-                    "{}  {}",
-                    battery.device_name,
-                    battery_text(battery)
-                )));
-            }
-        }
-        if let Some(text) = &self.update_text {
-            panel = panel.child(div().text_xs().text_color(muted).child(text.clone()));
-        }
-
-        panel.child(div().flex_1()).child(
-            div()
-                .flex()
-                .flex_row()
-                .gap_2()
-                .child(
-                    Button::new("open-openmouse")
-                        .compact()
-                        .label("Open OpenMouse")
-                        .on_click(cx.listener(|_, _, _, _| {
-                            let _ = open_openmouse();
-                        })),
-                )
-                .child(
-                    Button::new("restart")
-                        .compact()
-                        .label("Restart")
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            restart.store(true, Ordering::Relaxed);
-                            cx.quit();
-                        })),
-                )
-                .child(
-                    Button::new("quit")
-                        .compact()
-                        .label("Quit")
-                        .on_click(cx.listener(|_, _, _, cx| cx.quit())),
-                ),
-        )
-    }
 }

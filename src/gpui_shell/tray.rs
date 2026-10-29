@@ -5,7 +5,10 @@
 //! `tray-icon` wants and GPUI does not provide; there the panel is a plain
 //! window and closing it quits.
 
-use std::sync::mpsc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 
 use gpui_kit::{AnyWindowHandle, App, AppContext as _, Window};
 
@@ -78,13 +81,24 @@ mod platform {
     pub fn show_window(_window: &mut Window) {}
 }
 
+/// Whether the panel is on screen. While it is hidden in the tray nothing
+/// repaints it. Stays true where there is no tray to hide it to.
+static VISIBLE: AtomicBool = AtomicBool::new(true);
+
+pub fn is_visible() -> bool {
+    VISIBLE.load(Ordering::Relaxed)
+}
+
 pub fn hide(window: &Window) {
     platform::hide_window(window);
+    #[cfg(any(target_os = "macos", windows))]
+    VISIBLE.store(false, Ordering::Relaxed);
 }
 
 pub fn show(window: &mut Window) {
     platform::show_window(window);
     window.activate_window();
+    VISIBLE.store(true, Ordering::Relaxed);
 }
 
 /// Creates the tray icon and makes closing `window` hide it. Returns the
