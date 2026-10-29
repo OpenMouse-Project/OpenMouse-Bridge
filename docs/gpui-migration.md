@@ -135,6 +135,14 @@ Phase 1 is under way.
     notification is the fallback when the overlay cannot be created.
   - On macOS only the panel's own window is hidden to the tray, not the whole
     app, so an overlay appearing never brings the panel back.
+  - The panel opens beside the tray icon: centred under it, just below the menu
+    bar, on macOS; with its right edge on the icon's, above a bottom taskbar, on
+    Windows. Launched visible with no click to go by, it opens in the tray's
+    corner of the main screen. A height change keeps its top edge fixed.
+  - macOS has no tray menu: an NSStatusItem with a menu attached opens it on any
+    click and the click handler never runs, so a click or double-click could not
+    show the panel. Left or right click shows the panel, which has Restart and
+    Quit buttons of its own. Windows keeps a tray menu.
 - Core: `devices.json` (beside `config.json`) remembers every mouse seen: name,
   last battery reading, DPI, polling rate and when it was last seen. It is
   reported as `knownDevices` in `/v1/status`. The HID bus is listed every 5

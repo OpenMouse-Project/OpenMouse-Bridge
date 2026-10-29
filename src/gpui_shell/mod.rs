@@ -79,12 +79,17 @@ pub fn run() -> Result<()> {
         if !show_panel && tray_commands.is_some() {
             let _ = cx.update_window(handle, |_, window, _| tray::hide(window));
         } else {
+            // Shown at launch (the first run): beside the tray, not mid-screen.
+            if tray_commands.is_some() {
+                let _ = cx.update_window(handle, |_, window, _| tray::place(window, None));
+            }
             cx.activate(true);
         }
 
         let view = view.downgrade();
         cx.spawn(async move |cx| {
             let mut wait = POLL;
+            let mut last_anchor: Option<tray::Anchor> = None;
             loop {
                 cx.background_executor().timer(wait).await;
                 let tray_requests: Vec<tray::Command> = tray_commands
@@ -104,16 +109,27 @@ pub fn run() -> Result<()> {
                 };
                 // A fading banner needs a frame every ~16 ms; otherwise idle.
                 wait = overlay_delay.map_or(POLL, |delay| delay.min(POLL));
-                let show = panel_wanted
-                    || tray_requests
-                        .iter()
-                        .any(|command| matches!(command, tray::Command::Show));
+                // The newest click says where the icon is; a request with no
+                // click (the API, a second launch) reuses where it last was.
+                let clicked_at = tray_requests
+                    .iter()
+                    .rev()
+                    .find_map(|command| match command {
+                        tray::Command::Show(anchor) => Some(*anchor),
+                        _ => None,
+                    });
+                if let Some(Some(anchor)) = clicked_at {
+                    last_anchor = Some(anchor);
+                }
+                let show = panel_wanted || clicked_at.is_some();
                 if show {
-                    let _ = cx.update_window(handle, |_, window, _| tray::show(window));
+                    tracing::debug!(panel_wanted, "showing the panel");
+                    let anchor = last_anchor;
+                    let _ = cx.update_window(handle, |_, window, _| tray::show(window, anchor));
                 }
                 for command in tray_requests {
                     match command {
-                        tray::Command::Show => {}
+                        tray::Command::Show(_) => {}
                         tray::Command::Restart => {
                             app_restart.store(true, Ordering::Relaxed);
                             cx.update(|cx| cx.quit());
