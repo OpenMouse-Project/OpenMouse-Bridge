@@ -392,7 +392,14 @@ pub async fn load_with_catalog() -> Result<(BridgeConfig, PathBuf)> {
     Ok((config, path))
 }
 
-pub fn save(path: &PathBuf, config: &BridgeConfig) -> Result<()> {
+pub fn save(path: &std::path::Path, config: &BridgeConfig) -> Result<()> {
+    let json = serde_json::to_vec_pretty(config)?;
+    write_atomically(path, &json)
+}
+
+/// Writes `bytes` to `path` through a temporary file and a rename, so a reader
+/// never sees a truncated file. Creates the parent directory when needed.
+pub(crate) fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     use std::{
         io::Write,
         sync::atomic::{AtomicU64, Ordering},
@@ -403,7 +410,6 @@ pub fn save(path: &PathBuf, config: &BridgeConfig) -> Result<()> {
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
     fs::create_dir_all(parent).with_context(|| format!("could not create {}", parent.display()))?;
-    let json = serde_json::to_vec_pretty(config)?;
     let name = path
         .file_name()
         .context("config path has no filename")?
@@ -419,7 +425,7 @@ pub fn save(path: &PathBuf, config: &BridgeConfig) -> Result<()> {
         .open(&temporary)
         .with_context(|| format!("could not create {}", temporary.display()))?;
     let result: std::io::Result<()> = (|| {
-        file.write_all(&json)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
         fs::rename(&temporary, path)?;

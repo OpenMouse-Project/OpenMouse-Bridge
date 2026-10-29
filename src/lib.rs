@@ -2,6 +2,7 @@ pub mod api;
 pub mod applications;
 pub mod buttons;
 pub mod config;
+pub mod devices;
 pub mod drivers;
 pub mod games;
 mod hid;

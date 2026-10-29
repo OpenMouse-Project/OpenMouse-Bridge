@@ -15,6 +15,7 @@ use tokio::sync::RwLock;
 use crate::{
     applications::{self, ApplicationInfo},
     config::{self, ApplicationProfile, BridgeConfig, GameConfig, LocalApplication},
+    devices::{self, DeviceStore, KnownDevice},
     drivers,
     games::GameDetector,
     platform,
@@ -104,6 +105,10 @@ const PROFILE_DEBOUNCE: Duration = Duration::from_millis(2500);
 /// How often Bridge reads mouse batteries itself, so low-battery alerts work
 /// without the control panel open. Each read spawns the native-hid helper.
 const BATTERY_POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// How often the HID bus is listed to see which mice are plugged in. One scan
+/// is about 5 ms and opens no device, so this costs well under 0.1% of a core.
+const DEVICE_SCAN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// A reading this old is shown as stale: more than two missed polls.
 const BATTERY_STALE_AFTER: Duration = Duration::from_secs(12 * 60);
@@ -464,6 +469,8 @@ pub struct BridgeService {
     show_panel: Arc<std::sync::Mutex<Option<PanelListener>>>,
     buttons: Arc<crate::buttons::ButtonListener>,
     native_automation: Arc<std::sync::Mutex<crate::drivers::automation::NativeAutomation>>,
+    // Set while a battery poll runs, so two never overlap.
+    battery_polling: Arc<AtomicBool>,
 }
 
 /// A control panel is connected when it holds a HID WebSocket session or
@@ -485,6 +492,10 @@ struct BridgeState {
     running_applications: Vec<ApplicationInfo>,
     application_icons: HashMap<String, Option<Vec<u8>>>,
     battery: HashMap<String, BatteryState>,
+    // Every mouse seen so far, kept in devices.json across restarts.
+    known: DeviceStore,
+    // The mice on the HID bus at the last scan; `None` until the first scan.
+    detected: Option<Vec<drivers::DetectedMouse>>,
     // Debounced active-profile tracking for switch notifications.
     active_profile_key: Option<String>,
     applied_profile: Option<ApplicationProfile>,
@@ -658,10 +669,36 @@ pub struct BridgeSnapshot {
     pub client_connected: bool,
     pub active_devices: Vec<ActiveDevice>,
     pub batteries: Vec<DeviceBattery>,
+    /// Every mouse Bridge has seen, connected or not, newest first. Unlike
+    /// `batteries` this survives restarts and includes mice with no battery
+    /// reader.
+    pub known_devices: Vec<KnownDeviceStatus>,
+}
+
+/// A remembered mouse as the status view shows it.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KnownDeviceStatus {
+    pub id: String,
+    pub name: String,
+    /// Detected or read within the stale window, like a fresh battery reading.
+    pub connected: bool,
+    pub last_seen_seconds_ago: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub percent: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub charging: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dpi: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub polling_rate_hz: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub switch_mode: Option<String>,
 }
 
 impl BridgeService {
     pub fn new(config: BridgeConfig, config_path: PathBuf) -> Self {
+        let known = DeviceStore::load(DeviceStore::path_for(&config_path));
         Self {
             inner: Arc::new(RwLock::new(BridgeState {
                 config,
@@ -671,6 +708,8 @@ impl BridgeService {
                 running_applications: Vec::new(),
                 application_icons: HashMap::new(),
                 battery: HashMap::new(),
+                known,
+                detected: None,
                 active_profile_key: None,
                 applied_profile: None,
                 native_automation_error: None,
@@ -686,6 +725,7 @@ impl BridgeService {
             show_panel: Arc::default(),
             buttons: Arc::default(),
             native_automation: Arc::default(),
+            battery_polling: Arc::default(),
         }
     }
 
@@ -794,6 +834,37 @@ impl BridgeService {
             })
             .collect::<Vec<_>>();
         batteries.sort_by(|a, b| a.device_id.cmp(&b.device_id));
+        let now = devices::unix_now();
+        let mut known_devices = state
+            .known
+            .devices()
+            .iter()
+            .map(|device| {
+                let age = now.saturating_sub(device.last_seen);
+                KnownDeviceStatus {
+                    id: device.id.clone(),
+                    name: device.name.clone(),
+                    connected: match &state.detected {
+                        // The latest scan decides; a brand match covers the id
+                        // the control panel uses for a scan-shaped one.
+                        Some(detected) => detected.iter().any(|mouse| {
+                            mouse.device_id == device.id
+                                || brand_of(&mouse.device_id) == brand_of(&device.id)
+                        }),
+                        // No scan yet (just started): fall back to how recent
+                        // the last sighting is.
+                        None => age < BATTERY_STALE_AFTER.as_secs(),
+                    },
+                    last_seen_seconds_ago: age,
+                    percent: device.percent,
+                    charging: device.charging,
+                    dpi: device.dpi,
+                    polling_rate_hz: device.polling_rate_hz,
+                    switch_mode: device.switch_mode.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        known_devices.sort_by_key(|device| device.last_seen_seconds_ago);
         let active_devices = crate::hid::active_devices()
             .into_iter()
             .map(|device| ActiveDevice {
@@ -869,6 +940,7 @@ impl BridgeService {
             client_connected,
             active_devices,
             batteries,
+            known_devices,
         }
     }
 
@@ -1151,7 +1223,13 @@ impl BridgeService {
     /// Forgets a lingering battery entry so a dead device leaves the list.
     /// Returns whether an entry was removed.
     pub async fn forget_battery(&self, device_id: &str) -> bool {
-        self.inner.write().await.battery.remove(device_id).is_some()
+        let mut state = self.inner.write().await;
+        let live = state.battery.remove(device_id).is_some();
+        let remembered = state.known.forget(device_id);
+        if remembered {
+            save_known(&mut state.known);
+        }
+        live || remembered
     }
 
     pub async fn record_battery(&self, reading: BatteryReading) -> Result<bool> {
@@ -1198,6 +1276,18 @@ impl BridgeService {
                     history,
                 },
             );
+            let entry = &state.battery[&reading.device_id];
+            let update = KnownDevice {
+                id: reading.device_id.clone(),
+                name: reading.device_name.clone(),
+                last_seen: devices::unix_now(),
+                percent: Some(entry.percent),
+                charging: Some(entry.charging),
+                dpi: entry.dpi,
+                polling_rate_hz: entry.polling_rate_hz,
+                switch_mode: entry.switch_mode.clone(),
+            };
+            remember_known(&mut state.known, update);
             should_alert
         };
         if alert {
@@ -1223,7 +1313,42 @@ impl BridgeService {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
-                poll_batteries_once(service.clone()).await;
+                poll_batteries(service.clone()).await;
+            }
+        });
+        self.start_device_scanner();
+    }
+
+    /// Lists the HID bus every few seconds to keep the connected state of the
+    /// remembered mice current, and reads a battery right away when a mouse
+    /// appears instead of waiting for the next poll.
+    fn start_device_scanner(&self) {
+        let service = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(DEVICE_SCAN_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut previous: Option<HashSet<String>> = None;
+            loop {
+                interval.tick().await;
+                let detected = tokio::task::spawn_blocking(drivers::detect_mice)
+                    .await
+                    .unwrap_or_default();
+                let ids: HashSet<String> = detected
+                    .iter()
+                    .map(|mouse| mouse.device_id.clone())
+                    .collect();
+                let appeared = previous
+                    .as_ref()
+                    .is_some_and(|before| ids.iter().any(|id| !before.contains(id)));
+                {
+                    let mut state = service.inner.write().await;
+                    remember_detected(&mut state.known, &detected);
+                    state.detected = Some(detected);
+                }
+                if appeared {
+                    tokio::spawn(poll_batteries(service.clone()));
+                }
+                previous = Some(ids);
             }
         });
     }
@@ -1472,15 +1597,86 @@ impl BridgeService {
 /// panel holds the session — it reports the battery itself over
 /// `PUT /v1/battery`) and records it. Used by the five-minute monitor and by
 /// onboard-mode handovers.
+/// Writes devices.json; a failure is logged and never stops Bridge.
+fn save_known(known: &mut DeviceStore) {
+    if let Err(error) = known.save() {
+        tracing::warn!(%error, "could not save the remembered mice");
+    }
+}
+
+fn remember_known(known: &mut DeviceStore, update: KnownDevice) {
+    if known.remember(update) {
+        save_known(known);
+    }
+}
+
+/// The brand half of a `<brand>:<rest>` device id.
+fn brand_of(id: &str) -> &str {
+    id.split(':').next().unwrap_or_default()
+}
+
+/// Records the mice found on the HID bus, so one with no battery reader is
+/// still listed. A brand that already has a remembered entry is that same mouse
+/// under the id the control panel uses, so the sighting refreshes that entry
+/// instead of adding a second row.
+fn remember_detected(known: &mut DeviceStore, discovered: &[drivers::DetectedMouse]) {
+    for mouse in discovered {
+        let (id, name) = known
+            .devices()
+            .iter()
+            .find(|device| {
+                device.id != mouse.device_id && brand_of(&device.id) == brand_of(&mouse.device_id)
+            })
+            .map(|device| (device.id.clone(), device.name.clone()))
+            .unwrap_or_else(|| (mouse.device_id.clone(), mouse.name.clone()));
+        remember_known(
+            known,
+            KnownDevice {
+                id,
+                name,
+                last_seen: devices::unix_now(),
+                percent: None,
+                charging: None,
+                dpi: None,
+                polling_rate_hz: None,
+                switch_mode: None,
+            },
+        );
+    }
+}
+
+/// Clears the polling flag when a poll ends, even by panic.
+struct PollGuard(Arc<AtomicBool>);
+
+impl Drop for PollGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// One battery poll at a time: a scan-triggered poll skips when the timed one
+/// is already running, and the reverse.
+async fn poll_batteries(service: BridgeService) {
+    if service.battery_polling.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let _guard = PollGuard(Arc::clone(&service.battery_polling));
+    poll_batteries_once(service).await;
+}
+
 async fn poll_batteries_once(service: BridgeService) {
     let profiled = profile_devices(&service.inner.read().await.config);
     let discovered = tokio::task::spawn_blocking(drivers::detect_mice)
         .await
         .unwrap_or_default();
     let devices = merge_detected_mice(profiled, &discovered);
-    // Pruning is in-memory only, so it runs even while the
-    // control panel holds a HID session and reads are paused.
-    prune_batteries(&mut service.inner.write().await.battery, &devices);
+    {
+        // Pruning the live readings is in-memory only, so it runs even while
+        // the control panel holds a HID session and reads are paused.
+        let mut state = service.inner.write().await;
+        prune_batteries(&mut state.battery, &devices);
+        remember_detected(&mut state.known, &discovered);
+    }
     if crate::hid::client_session_active() {
         return;
     }
@@ -1502,7 +1698,12 @@ async fn poll_batteries_once(service: BridgeService) {
                     .map(|name| canonical_battery_identity(&device_id, name))
                     .unwrap_or_else(|| device_id.clone());
                 if record_id != device_id {
-                    service.inner.write().await.battery.remove(&device_id);
+                    let mut state = service.inner.write().await;
+                    state.battery.remove(&device_id);
+                    // The discovery-shaped entry was this same mouse.
+                    if state.known.forget(&device_id) {
+                        save_known(&mut state.known);
+                    }
                 }
                 let record_name = status.battery.reported_name.clone().unwrap_or(device_name);
                 let reading = BatteryReading {
@@ -1585,7 +1786,7 @@ async fn resume_onboard(service: &BridgeService) {
             apply_natively(&profile);
         });
     }
-    tokio::spawn(poll_batteries_once(service.clone()));
+    tokio::spawn(poll_batteries(service.clone()));
 }
 
 fn apply_natively(profile: &ApplicationProfile) -> ApplyOutcome {
@@ -1624,7 +1825,21 @@ mod tests {
     use crate::remote_image::PNG_SIGNATURE;
 
     fn service(config: BridgeConfig) -> BridgeService {
-        BridgeService::new(config, PathBuf::from("unused-test-config.json"))
+        BridgeService::new(config, temp_config_path())
+    }
+
+    /// A config path in a fresh temp directory, so tests never write
+    /// devices.json into the working directory.
+    fn temp_config_path() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "openmouse-service-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        directory.join("config.json")
     }
 
     fn test_profile(
@@ -2426,6 +2641,164 @@ mod tests {
         assert_eq!(battery.dpi, Some(800));
         assert_eq!(battery.polling_rate_hz, Some(1000));
         assert_eq!(battery.switch_mode.as_deref(), Some("Hybrid"));
+    }
+
+    fn reading(id: &str, name: &str, percent: u8) -> BatteryReading {
+        BatteryReading {
+            device_id: id.into(),
+            device_name: name.into(),
+            percent,
+            charging: false,
+            dpi: Some(1600),
+            polling_rate_hz: None,
+            switch_mode: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_mouse_with_a_battery_reading_is_remembered_across_restarts() {
+        let path = temp_config_path();
+        let first = BridgeService::new(BridgeConfig::default(), path.clone());
+        first
+            .record_battery(reading("Logitech:G Pro", "G Pro", 72))
+            .await
+            .unwrap();
+        let known = first.snapshot().await.known_devices;
+        assert_eq!(known.len(), 1);
+        assert!(known[0].connected);
+        assert_eq!(known[0].percent, Some(72));
+
+        // A new service on the same config path, as after a restart: nothing
+        // is connected yet, but the mouse and its last reading are still there.
+        let second = BridgeService::new(BridgeConfig::default(), path);
+        let snapshot = second.snapshot().await;
+        assert!(snapshot.batteries.is_empty(), "no live reading yet");
+        assert_eq!(snapshot.known_devices.len(), 1);
+        assert_eq!(snapshot.known_devices[0].name, "G Pro");
+        assert_eq!(snapshot.known_devices[0].percent, Some(72));
+        assert_eq!(snapshot.known_devices[0].dpi, Some(1600));
+    }
+
+    #[tokio::test]
+    async fn a_mouse_not_seen_for_a_while_is_remembered_but_not_connected() {
+        let path = temp_config_path();
+        let old = devices::unix_now() - 3 * 60 * 60;
+        std::fs::write(
+            DeviceStore::path_for(&path),
+            format!(
+                r#"{{"version":1,"devices":[{{"id":"Razer:x","name":"Razer X","lastSeen":{old},"percent":40}}]}}"#
+            ),
+        )
+        .unwrap();
+        let bridge = BridgeService::new(BridgeConfig::default(), path);
+        let known = bridge.snapshot().await.known_devices;
+        assert_eq!(known.len(), 1);
+        assert!(!known[0].connected);
+        assert!(known[0].last_seen_seconds_ago >= 3 * 60 * 60);
+        assert_eq!(known[0].percent, Some(40));
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_mouse_removes_it_from_devices_json() {
+        let path = temp_config_path();
+        let bridge = BridgeService::new(BridgeConfig::default(), path.clone());
+        bridge
+            .record_battery(reading("Razer:x", "Razer X", 50))
+            .await
+            .unwrap();
+        assert!(bridge.forget_battery("Razer:x").await);
+        assert!(bridge.snapshot().await.known_devices.is_empty());
+        let reloaded = BridgeService::new(BridgeConfig::default(), path);
+        assert!(reloaded.snapshot().await.known_devices.is_empty());
+    }
+
+    #[test]
+    fn detected_mice_are_remembered_unless_their_brand_is_already_covered() {
+        let path = temp_config_path();
+        let mut known = DeviceStore::load(DeviceStore::path_for(&path));
+        let mouse = |id: &str, name: &str| drivers::DetectedMouse {
+            device_id: id.into(),
+            name: name.into(),
+        };
+        remember_detected(&mut known, &[mouse("Pulsar:1234", "Pulsar X2")]);
+        assert_eq!(known.devices().len(), 1);
+
+        // The control panel's id for the same Logitech mouse is already known,
+        // so the discovery-shaped id adds no second row.
+        remember_known(
+            &mut known,
+            KnownDevice {
+                id: "Logitech:G Pro".into(),
+                name: "G Pro".into(),
+                last_seen: devices::unix_now(),
+                percent: Some(60),
+                charging: Some(false),
+                dpi: None,
+                polling_rate_hz: None,
+                switch_mode: None,
+            },
+        );
+        remember_detected(&mut known, &[mouse("Logitech:046d:c547", "USB Receiver")]);
+        assert_eq!(known.devices().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn connected_follows_the_latest_scan_not_the_age_of_the_last_sighting() {
+        let bridge = BridgeService::new(BridgeConfig::default(), temp_config_path());
+        // Both were seen a moment ago.
+        bridge
+            .record_battery(reading("Logitech:G Pro", "G Pro", 60))
+            .await
+            .unwrap();
+        bridge
+            .record_battery(reading("Razer:Viper", "Viper", 80))
+            .await
+            .unwrap();
+        // Before any scan the recent sighting counts as connected.
+        let before = bridge.snapshot().await.known_devices;
+        assert!(before.iter().all(|device| device.connected));
+
+        // A scan finds only the Logitech, under its scan-shaped id.
+        bridge.inner.write().await.detected = Some(vec![drivers::DetectedMouse {
+            device_id: "Logitech:046d:c547".into(),
+            name: "USB Receiver".into(),
+        }]);
+        let after = bridge.snapshot().await.known_devices;
+        let find = |id: &str| after.iter().find(|device| device.id == id).unwrap();
+        assert!(find("Logitech:G Pro").connected, "matched by brand");
+        assert!(!find("Razer:Viper").connected, "unplugged: not in the scan");
+    }
+
+    #[test]
+    fn a_sighting_refreshes_the_covering_entry_and_keeps_its_name() {
+        let path = temp_config_path();
+        let mut known = DeviceStore::load(DeviceStore::path_for(&path));
+        let old = devices::unix_now() - 3_600;
+        remember_known(
+            &mut known,
+            KnownDevice {
+                id: "Logitech:G Pro".into(),
+                name: "G Pro".into(),
+                last_seen: old,
+                percent: Some(60),
+                charging: Some(false),
+                dpi: None,
+                polling_rate_hz: None,
+                switch_mode: None,
+            },
+        );
+        remember_detected(
+            &mut known,
+            &[drivers::DetectedMouse {
+                device_id: "Logitech:046d:c547".into(),
+                name: "USB Receiver".into(),
+            }],
+        );
+        assert_eq!(known.devices().len(), 1);
+        let device = &known.devices()[0];
+        assert_eq!(device.name, "G Pro");
+        assert!(device.last_seen > old, "touched by the sighting");
+        assert_eq!(device.percent, Some(60), "its reading is kept");
     }
 
     fn battery_entry(age: Duration) -> BatteryState {

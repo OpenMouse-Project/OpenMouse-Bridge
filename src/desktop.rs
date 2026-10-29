@@ -2407,6 +2407,7 @@ mod tests {
             client_connected: false,
             active_devices: vec![],
             batteries: vec![],
+            known_devices: vec![],
         }
     }
 
