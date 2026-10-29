@@ -20,6 +20,7 @@ use crate::config::ApplicationProfile;
 
 pub(crate) mod automation;
 pub mod delux;
+mod lamzu;
 mod native_hid;
 pub mod pulsar;
 
@@ -62,6 +63,20 @@ const KNOWN_BRANDS: &[(&str, &[u16])] = &[
     ("Microsoft", &[0x045e]),
     ("WALLHACK", &[0x3879, 0x1caa]),
 ];
+
+/// The brand a model name starts with ("Attack Shark R5 Ultra" is Attack
+/// Shark's), for mice that vendor-id discovery labels with another brand.
+pub fn brand_in_name(name: &str) -> Option<&'static str> {
+    let name = name.trim().to_ascii_lowercase();
+    KNOWN_BRANDS
+        .iter()
+        .map(|(brand, _)| *brand)
+        .filter(|brand| {
+            name.strip_prefix(&brand.to_ascii_lowercase())
+                .is_some_and(|rest| rest.starts_with(' '))
+        })
+        .max_by_key(|brand| brand.len())
+}
 
 /// Logitech is special: every Logitech-branded device (keyboards, headsets)
 /// shares vendor id 0x046d and the HID++ transport (`mouse-protocol`'s
@@ -269,6 +284,14 @@ pub fn read_status(device_id: &str) -> Result<Option<NativeStatus>> {
     ensure_native_ownership()?;
     if brand.eq_ignore_ascii_case(pulsar::BRAND) {
         return pulsar::read_status();
+    }
+    // The Attack Shark R5 Ultra is labelled "Delux" by its vendor id. The node
+    // helper cannot read it, so it is read natively; a mouse that is not
+    // plugged in falls through to the helper like any other Delux device.
+    if lamzu::handles(brand)
+        && let Some(status) = lamzu::read_status()?
+    {
+        return Ok(Some(status));
     }
     native_hid::read_status(brand)
 }

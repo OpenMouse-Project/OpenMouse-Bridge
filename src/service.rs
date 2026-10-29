@@ -1791,7 +1791,11 @@ async fn poll_batteries_once(service: BridgeService) {
 /// The device id the web panel would use for the same physical mouse:
 /// `<brand>:<model>`, from the driver's own `MouseStatus.name`.
 fn canonical_battery_identity(device_id: &str, reported_name: &str) -> String {
-    let brand = device_id.split(':').next().unwrap_or_default();
+    // A name that starts with a brand ("Attack Shark R5 Ultra") names the
+    // brand the control panel files the mouse under, which can differ from the
+    // discovery brand when brands share a vendor id.
+    let brand = drivers::brand_in_name(reported_name)
+        .unwrap_or_else(|| device_id.split(':').next().unwrap_or_default());
     format!("{brand}:{reported_name}")
 }
 
@@ -2855,6 +2859,21 @@ mod tests {
         assert_eq!(device.name, "G Pro");
         assert!(device.last_seen > old, "touched by the sighting");
         assert_eq!(device.percent, Some(60), "its reading is kept");
+    }
+
+    #[test]
+    fn a_reading_is_filed_under_the_brand_its_model_name_starts_with() {
+        // Discovery labels the R5 Ultra "Delux" (a shared vendor id); the
+        // control panel files it under "Attack Shark".
+        assert_eq!(
+            canonical_battery_identity("Delux:3719C0531974", "Attack Shark R5 Ultra"),
+            "Attack Shark:Attack Shark R5 Ultra"
+        );
+        // A name with no brand in front keeps the discovery brand.
+        assert_eq!(
+            canonical_battery_identity("Logitech:046d:c547", "PRO X SUPERLIGHT 2c"),
+            "Logitech:PRO X SUPERLIGHT 2c"
+        );
     }
 
     #[test]

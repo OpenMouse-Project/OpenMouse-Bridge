@@ -1080,10 +1080,69 @@ impl HidSession {
 /// The bytes after the report-id byte of a read into `data`. hidapi on Windows
 /// adds one to the count when the first byte is 0 (an unnumbered report), so a
 /// read that fills the buffer reports one byte more than the buffer holds.
-fn report_payload(data: &[u8], size: usize) -> Vec<u8> {
+pub(crate) fn report_payload(data: &[u8], size: usize) -> Vec<u8> {
     data.get(1..size.min(data.len()))
         .unwrap_or_default()
         .to_vec()
+}
+
+/// The interfaces of one device that declare a feature report, opened for a
+/// native driver that talks to the mouse itself rather than through a control
+/// panel session.
+pub(crate) struct FeatureInterfaces {
+    // Keeps the HID library initialised while the devices are open.
+    _api: HidApi,
+    pub interfaces: Vec<FeatureInterface>,
+}
+
+pub(crate) struct FeatureInterface {
+    pub device: HidDevice,
+    pub product_id: u16,
+    /// Buffer size to read the feature report into, report id byte included.
+    pub buffer_len: usize,
+}
+
+/// Opens every vendor-defined interface (usage page `0xff00` and up) of the
+/// given products whose report descriptor declares feature report `report_id`.
+/// Standard mouse, keyboard and consumer interfaces are never opened.
+pub(crate) fn feature_interfaces(
+    vendor_id: u16,
+    product_ids: &[u16],
+    report_id: u8,
+) -> Result<FeatureInterfaces, String> {
+    let api = HidApi::new().map_err(|error| error.to_string())?;
+    let mut seen = HashSet::new();
+    let mut interfaces = Vec::new();
+    for info in api.device_list() {
+        if info.vendor_id() != vendor_id
+            || !product_ids.contains(&info.product_id())
+            || info.usage_page() < 0xff00
+            || !seen.insert(info.path().to_bytes().to_vec())
+        {
+            continue;
+        }
+        let Ok(device) = api.open_path(info.path()) else {
+            continue;
+        };
+        let mut descriptor = vec![0; MAX_REPORT_DESCRIPTOR_SIZE];
+        let Ok(size) = device.get_report_descriptor(&mut descriptor) else {
+            continue;
+        };
+        let Ok((_, layout)) = parse_report_descriptor(&descriptor[..size]) else {
+            continue;
+        };
+        if let Ok(buffer_len) = layout.feature_buffer_len(report_id) {
+            interfaces.push(FeatureInterface {
+                device,
+                product_id: info.product_id(),
+                buffer_len,
+            });
+        }
+    }
+    Ok(FeatureInterfaces {
+        _api: api,
+        interfaces,
+    })
 }
 
 fn grouped_device_key(
