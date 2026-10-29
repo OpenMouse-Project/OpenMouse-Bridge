@@ -118,7 +118,7 @@ Phase 1 is under way.
   `BridgeCommand`, `UpdateEvent`, the label helpers, `tray_icon`,
   `restart_bridge`, window size constants). Behaviour is unchanged.
 - `src/gpui_shell/` (feature `gpui`, selected with
-  `OPENMOUSE_BRIDGE_SHELL=gpui`) starts the same `BackgroundServer` and polls its
+  `OPENMOUSE_BRIDGE_SHELL=egui` picks the old shell instead) starts the same `BackgroundServer` and polls its
   channels every 200 ms. The palette and the ASCII field are ported from
   Desktop (dark only). The panel resizes to its content and does not repaint
   while hidden in the tray.

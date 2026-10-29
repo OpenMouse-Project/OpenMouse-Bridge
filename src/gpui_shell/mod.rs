@@ -2,8 +2,9 @@
 //!
 //! Runs the same core as the egui shell: `BackgroundServer` owns the service,
 //! HTTP API and HID on its own thread and hands this module snapshot, update,
-//! notice and panel-request channels, which are polled on a timer. Select it
-//! with `OPENMOUSE_BRIDGE_SHELL=gpui`. See docs/gpui-migration.md.
+//! notice and panel-request channels, which are polled on a timer. It is the
+//! shell of a `--features gpui` build; `OPENMOUSE_BRIDGE_SHELL=egui` runs the
+//! egui one instead. See docs/gpui-migration.md.
 
 mod ascii;
 mod panel;
@@ -32,6 +33,7 @@ use crate::desktop::{
 const POLL: Duration = Duration::from_millis(200);
 
 pub fn run() -> Result<()> {
+    tracing::info!("starting the GPUI shell");
     let (notice_tx, notices) = mpsc::channel();
     // The egui shell wakes its repaint loop through this; GPUI polls instead.
     let waker = Arc::new(OnceLock::new());

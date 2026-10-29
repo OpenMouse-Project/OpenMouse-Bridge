@@ -81,12 +81,13 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
-/// The egui shell, unless `OPENMOUSE_BRIDGE_SHELL=gpui` picks the GPUI one
-/// (built with `--features gpui`; work in progress).
+/// The egui shell, except in a build with `--features gpui` (work in
+/// progress), which runs the GPUI shell instead. `OPENMOUSE_BRIDGE_SHELL=egui`
+/// brings the egui shell back in such a build.
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 fn run_shell() -> anyhow::Result<()> {
     #[cfg(feature = "gpui")]
-    if std::env::var("OPENMOUSE_BRIDGE_SHELL").as_deref() == Ok("gpui") {
+    if std::env::var("OPENMOUSE_BRIDGE_SHELL").as_deref() != Ok("egui") {
         return gpui_shell::run();
     }
     desktop::run()

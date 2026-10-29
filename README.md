@@ -41,11 +41,12 @@ What is on this branch so far:
 Try the GPUI shell (macOS, unreleased, expect rough edges):
 
 ```sh
-OPENMOUSE_BRIDGE_SHELL=gpui cargo run --features gpui
+cargo run --features gpui
 ```
 
-Without `OPENMOUSE_BRIDGE_SHELL=gpui` the usual egui panel runs, even in a build
-with the `gpui` feature.
+A build with the `gpui` feature runs the GPUI shell. Set
+`OPENMOUSE_BRIDGE_SHELL=egui` to run the egui panel from the same build; a build
+without the feature always runs the egui panel.
 
 Bridge stays a separate app from OpenMouse Desktop; Desktop is only a reference
 for patterns.
