@@ -17,7 +17,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::*;
 use openmouse_bridge::{
-    BRIDGE_PORT, config, platform,
+    BRIDGE_PORT, config,
+    platform::{self, TrayBatteryStyle},
     service::{BridgeSnapshot, KnownDeviceStatus, Notice},
     updater::UpdateInfo,
 };
@@ -29,6 +30,32 @@ use crate::desktop::{
     open_openmouse, service_label,
 };
 use crate::overlay::Overlay;
+
+/// The low-battery alert levels the egui panel offers.
+const BATTERY_THRESHOLDS: [u8; 7] = [10, 15, 20, 25, 30, 40, 50];
+const VOLUME_STEP: u8 = 10;
+
+/// The alert level `steps` places from `current` in [`BATTERY_THRESHOLDS`],
+/// stopping at either end; a stored value that is not on the list counts as the
+/// closest one.
+fn step_threshold(current: u8, steps: i32) -> u8 {
+    let nearest = BATTERY_THRESHOLDS
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, level)| level.abs_diff(current))
+        .map_or(0, |(index, _)| index);
+    let index = (nearest as i32 + steps).clamp(0, BATTERY_THRESHOLDS.len() as i32 - 1);
+    BATTERY_THRESHOLDS[index as usize]
+}
+
+/// The volume one step up or down, kept between 0 and 100.
+fn step_volume(current: u8, up: bool) -> u8 {
+    if up {
+        current.saturating_add(VOLUME_STEP).min(100)
+    } else {
+        current.saturating_sub(VOLUME_STEP)
+    }
+}
 
 /// How many remembered mice Home lists before summarising the rest.
 const HOME_DEVICE_ROWS: usize = 3;
@@ -45,7 +72,7 @@ impl View {
     fn base_height(self) -> f32 {
         match self {
             View::Home => WINDOW_HEIGHT,
-            View::Settings => 436.0,
+            View::Settings => 600.0,
             View::Info => 380.0,
         }
     }
@@ -66,6 +93,11 @@ pub struct PanelView {
     view: View,
     autostart: bool,
     automatic_updates: bool,
+    hybrid_mode: bool,
+    tray_style: TrayBatteryStyle,
+    battery_threshold: u8,
+    notification_sound: bool,
+    notification_volume: u8,
     update_text: Option<String>,
     update_available: Option<UpdateInfo>,
     update_busy: bool,
@@ -102,9 +134,20 @@ impl PanelView {
             panel_requests,
             restart,
             snapshot: None,
-            view: View::Home,
+            // A development aid: OPENMOUSE_BRIDGE_START_VIEW=settings|info opens
+            // straight onto that view.
+            view: match std::env::var("OPENMOUSE_BRIDGE_START_VIEW").as_deref() {
+                Ok("settings") => View::Settings,
+                Ok("info") => View::Info,
+                _ => View::Home,
+            },
             autostart: platform::autostart_enabled(),
             automatic_updates: false,
+            hybrid_mode: true,
+            tray_style: TrayBatteryStyle::Glyph,
+            battery_threshold: 20,
+            notification_sound: true,
+            notification_volume: 60,
             update_text: None,
             update_available: None,
             update_busy: false,
@@ -129,6 +172,11 @@ impl PanelView {
         while let Ok(snapshot) = self.snapshots.try_recv() {
             self.autostart = snapshot.autostart_enabled;
             self.automatic_updates = snapshot.automatic_updates;
+            self.hybrid_mode = snapshot.hybrid_mode;
+            self.tray_style = TrayBatteryStyle::from_config_str(&snapshot.tray_battery_style);
+            self.battery_threshold = snapshot.battery_threshold_percent;
+            self.notification_sound = snapshot.notification_sound;
+            self.notification_volume = snapshot.notification_volume;
             self.snapshot = Some(snapshot);
             changed = true;
         }
@@ -229,14 +277,7 @@ impl PanelView {
                     height += NOTE_HEIGHT * 2.0;
                 }
             }
-            View::Settings => {
-                if self.update_available.is_some() {
-                    height += 40.0;
-                }
-                if self.error.is_some() {
-                    height += NOTE_HEIGHT;
-                }
-            }
+            View::Settings => {}
             View::Info => {}
         }
         height
@@ -258,6 +299,44 @@ impl PanelView {
         let _ = self
             .commands
             .send(BridgeCommand::SetAutomaticUpdates(enabled));
+        cx.notify();
+    }
+
+    fn set_hybrid_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.hybrid_mode = enabled;
+        let _ = self.commands.send(BridgeCommand::SetHybridMode(enabled));
+        cx.notify();
+    }
+
+    fn set_tray_style(&mut self, style: TrayBatteryStyle, cx: &mut Context<Self>) {
+        self.tray_style = style;
+        let _ = self
+            .commands
+            .send(BridgeCommand::SetTrayBatteryStyle(style));
+        cx.notify();
+    }
+
+    fn step_battery_threshold(&mut self, steps: i32, cx: &mut Context<Self>) {
+        self.battery_threshold = step_threshold(self.battery_threshold, steps);
+        let _ = self
+            .commands
+            .send(BridgeCommand::SetBatteryThreshold(self.battery_threshold));
+        cx.notify();
+    }
+
+    fn set_notification_sound(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.notification_sound = enabled;
+        let _ = self
+            .commands
+            .send(BridgeCommand::SetNotificationSound(enabled));
+        cx.notify();
+    }
+
+    fn step_notification_volume(&mut self, up: bool, cx: &mut Context<Self>) {
+        self.notification_volume = step_volume(self.notification_volume, up);
+        let _ = self.commands.send(BridgeCommand::SetNotificationVolume(
+            self.notification_volume,
+        ));
         cx.notify();
     }
 
@@ -341,6 +420,46 @@ fn native_problem(snapshot: Option<&BridgeSnapshot>) -> Option<String> {
         .native_automation_error
         .as_ref()
         .map(|error| format!("Native settings not applied: {error}"))
+}
+
+/// A value with a minus and a plus button either side.
+fn stepper(
+    id: &'static str,
+    value: String,
+    on_minus: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_plus: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .child(
+            Button::new(SharedString::from(format!("{id}-down")))
+                .ghost()
+                .compact()
+                .icon(IconName::Minus)
+                .on_click(on_minus),
+        )
+        .child(div().w(px(44.)).text_center().text_sm().child(value))
+        .child(
+            Button::new(SharedString::from(format!("{id}-up")))
+                .ghost()
+                .compact()
+                .icon(IconName::Plus)
+                .on_click(on_plus),
+        )
+}
+
+fn switch_row(label: &'static str, control: impl IntoElement) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .justify_between()
+        .items_center()
+        .text_sm()
+        .child(label)
+        .child(control)
 }
 
 fn format_age(seconds: u64) -> String {
@@ -578,28 +697,93 @@ impl PanelView {
         danger: Hsla,
         cx: &mut Context<Self>,
     ) -> Div {
-        let mut content = div()
+        let content = div()
             .flex()
             .flex_col()
             .size_full()
             .p_4()
             .gap_3()
-            .child(self.title_bar("Settings", true, false, accent, muted, cx))
+            .child(self.title_bar("Settings", true, false, accent, muted, cx));
+        // The title bar stays put; everything below it scrolls, so the panel
+        // fits a short screen.
+        let mut body = div()
+            .id("settings-body")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .gap_3()
+            .overflow_y_scroll()
             .child(
-                card(line, fill).child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .justify_between()
-                        .items_center()
-                        .text_sm()
-                        .child("Run on start")
-                        .child(Switch::new("autostart").checked(self.autostart).on_change(
-                            cx.listener(|this, enabled: &bool, _, cx| {
+                card(line, fill)
+                    .child(switch_row(
+                        "Run on start",
+                        Switch::new("autostart")
+                            .checked(self.autostart)
+                            .on_change(cx.listener(|this, enabled: &bool, _, cx| {
                                 this.set_autostart(*enabled, cx);
-                            }),
-                        )),
-                ),
+                            })),
+                    ))
+                    .child(switch_row(
+                        "Hybrid mode",
+                        Switch::new("hybrid-mode")
+                            .checked(self.hybrid_mode)
+                            .on_change(cx.listener(|this, enabled: &bool, _, cx| {
+                                this.set_hybrid_mode(*enabled, cx);
+                            })),
+                    ))
+                    .child(div().text_xs().text_color(muted).child(
+                        "While OpenMouse is closed, Bridge applies the active profile \
+                         and reads the battery itself.",
+                    )),
+            )
+            .child(
+                card(line, fill)
+                    .child(switch_row(
+                        "Tray icon",
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_1()
+                            .child(self.style_button(
+                                "style-glyph",
+                                "Battery",
+                                TrayBatteryStyle::Glyph,
+                                cx,
+                            ))
+                            .child(self.style_button(
+                                "style-percentage",
+                                "Number",
+                                TrayBatteryStyle::Percentage,
+                                cx,
+                            )),
+                    ))
+                    .child(switch_row(
+                        "Low battery alert",
+                        stepper(
+                            "threshold",
+                            format!("{}%", self.battery_threshold),
+                            cx.listener(|this, _, _, cx| this.step_battery_threshold(-1, cx)),
+                            cx.listener(|this, _, _, cx| this.step_battery_threshold(1, cx)),
+                        ),
+                    ))
+                    .child(switch_row(
+                        "Notification sound",
+                        Switch::new("notification-sound")
+                            .checked(self.notification_sound)
+                            .on_change(cx.listener(|this, enabled: &bool, _, cx| {
+                                this.set_notification_sound(*enabled, cx);
+                            })),
+                    ))
+                    .child(switch_row(
+                        "Volume",
+                        stepper(
+                            "volume",
+                            format!("{}%", self.notification_volume),
+                            cx.listener(|this, _, _, cx| this.step_notification_volume(false, cx)),
+                            cx.listener(|this, _, _, cx| this.step_notification_volume(true, cx)),
+                        ),
+                    )),
             );
 
         let mut updates = card(line, fill)
@@ -648,7 +832,7 @@ impl PanelView {
         if let Some(text) = &self.update_text {
             updates = updates.child(div().text_xs().text_color(muted).child(text.clone()));
         }
-        content = content.child(updates).child(
+        body = body.child(updates).child(
             card(line, fill)
                 .child(
                     Button::new("test-notification")
@@ -678,9 +862,26 @@ impl PanelView {
                 ),
         );
         if let Some(error) = &self.error {
-            content = content.child(div().text_xs().text_color(danger).child(error.clone()));
+            body = body.child(div().text_xs().text_color(danger).child(error.clone()));
         }
-        content
+        content.child(body)
+    }
+
+    /// One of the tray icon's two styles, highlighted while it is the chosen one.
+    fn style_button(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        style: TrayBatteryStyle,
+        cx: &mut Context<Self>,
+    ) -> Button {
+        let button = Button::new(id).compact().label(label);
+        let button = if self.tray_style == style {
+            button.primary()
+        } else {
+            button.ghost()
+        };
+        button.on_click(cx.listener(move |this, _, _, cx| this.set_tray_style(style, cx)))
     }
 
     fn info(
@@ -779,5 +980,38 @@ impl Render for PanelView {
             .text_color(foreground)
             .child(field)
             .child(content)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `use super::*`: that pulls in GPUI's own `test` macro, which shadows
+    // `#[test]`.
+    use super::{step_threshold, step_volume};
+
+    #[test]
+    fn the_alert_level_steps_along_the_offered_list() {
+        assert_eq!(step_threshold(20, 1), 25);
+        assert_eq!(step_threshold(20, -1), 15);
+        assert_eq!(step_threshold(10, -1), 10, "stops at the lowest");
+        assert_eq!(step_threshold(50, 1), 50, "stops at the highest");
+        assert_eq!(step_threshold(30, 1), 40, "the list is uneven past 30");
+    }
+
+    #[test]
+    fn a_stored_level_off_the_list_steps_from_the_nearest() {
+        assert_eq!(step_threshold(22, 1), 25, "22 is nearest 20, so up is 25");
+        assert_eq!(step_threshold(100, -1), 40, "above the list counts as 50");
+        assert_eq!(step_threshold(0, 1), 15, "below the list counts as 10");
+    }
+
+    #[test]
+    fn the_volume_moves_by_ten_and_stays_in_range() {
+        assert_eq!(step_volume(60, true), 70);
+        assert_eq!(step_volume(60, false), 50);
+        assert_eq!(step_volume(95, true), 100);
+        assert_eq!(step_volume(100, true), 100);
+        assert_eq!(step_volume(5, false), 0);
+        assert_eq!(step_volume(0, false), 0);
     }
 }
