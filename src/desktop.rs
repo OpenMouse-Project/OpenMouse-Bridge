@@ -133,8 +133,8 @@ fn drain_tray_events(mut pending: impl FnMut() -> bool, mut iterate: impl FnMut(
     }
 }
 
-const WINDOW_WIDTH: f32 = 360.0;
-const WINDOW_HEIGHT: f32 = 280.0;
+pub(crate) const WINDOW_WIDTH: f32 = 360.0;
+pub(crate) const WINDOW_HEIGHT: f32 = 280.0;
 
 use crate::native_ui::{ACCENT, BACKGROUND, DANGER, DIVIDER, MUTED, ROW_HEIGHT, TEXT, WARNING};
 const BATTERY_THRESHOLDS: [u8; 7] = [10, 15, 20, 25, 30, 40, 50];
@@ -232,7 +232,7 @@ fn row(ui: &mut egui::Ui, label: &str, trailing: impl FnOnce(&mut egui::Ui)) {
     );
 }
 
-fn service_label(snapshot: Option<&BridgeSnapshot>) -> &'static str {
+pub(crate) fn service_label(snapshot: Option<&BridgeSnapshot>) -> &'static str {
     if snapshot.is_some() {
         "Bridge service ready"
     } else {
@@ -240,7 +240,7 @@ fn service_label(snapshot: Option<&BridgeSnapshot>) -> &'static str {
     }
 }
 
-fn profile_label(snapshot: Option<&BridgeSnapshot>) -> String {
+pub(crate) fn profile_label(snapshot: Option<&BridgeSnapshot>) -> String {
     if let Some(snapshot) = snapshot {
         if snapshot.pending_native_restores > 0 {
             let mut label = format!(
@@ -274,14 +274,14 @@ fn profile_label(snapshot: Option<&BridgeSnapshot>) -> String {
         .unwrap_or_else(|| "No game profile active".into())
 }
 
-fn device_label(snapshot: Option<&BridgeSnapshot>) -> String {
+pub(crate) fn device_label(snapshot: Option<&BridgeSnapshot>) -> String {
     snapshot
         .and_then(|snapshot| snapshot.active_devices.first())
         .map(|device| device.name.clone())
         .unwrap_or_else(|| "No mouse session".into())
 }
 
-fn battery_text(battery: &openmouse_bridge::service::DeviceBattery) -> String {
+pub(crate) fn battery_text(battery: &openmouse_bridge::service::DeviceBattery) -> String {
     match (battery.stale, battery.charging) {
         (true, true) => format!("{}% · Last known (was charging)", battery.percent),
         (true, false) => format!("{}% · Last known", battery.percent),
@@ -303,7 +303,7 @@ fn forget_battery_button(ui: &mut egui::Ui, stale: bool) -> Option<egui::Respons
     })
 }
 
-enum BridgeCommand {
+pub(crate) enum BridgeCommand {
     SetBatteryThreshold(u8),
     SetNotificationSound(bool),
     SetNotificationVolume(u8),
@@ -321,7 +321,7 @@ enum Startup {
     AlreadyRunning,
 }
 
-enum UpdateEvent {
+pub(crate) enum UpdateEvent {
     Checking,
     UpToDate,
     Available(UpdateInfo),
@@ -1586,16 +1586,16 @@ impl TrayApp {
     }
 }
 
-struct BackgroundServer {
+pub(crate) struct BackgroundServer {
     shutdown: Option<oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<Result<()>>>,
 }
 
 /// Where the runtime sends notices, and the tray app's context to
 /// wake so it shows them even while its panel is hidden.
-type NoticeSink = (Sender<Notice>, Arc<OnceLock<egui::Context>>);
+pub(crate) type NoticeSink = (Sender<Notice>, Arc<OnceLock<egui::Context>>);
 
-type BackgroundRuntime = (
+pub(crate) type BackgroundRuntime = (
     BackgroundServer,
     Receiver<BridgeSnapshot>,
     tokio_mpsc::UnboundedSender<BridgeCommand>,
@@ -1605,7 +1605,7 @@ type BackgroundRuntime = (
 );
 
 impl BackgroundServer {
-    fn start(notices: NoticeSink) -> Result<Option<BackgroundRuntime>> {
+    pub(crate) fn start(notices: NoticeSink) -> Result<Option<BackgroundRuntime>> {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (snapshot_tx, snapshots) = mpsc::sync_channel(1);
@@ -1661,7 +1661,7 @@ impl BackgroundServer {
         }
     }
 
-    fn stop(mut self) -> Result<()> {
+    pub(crate) fn stop(mut self) -> Result<()> {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
@@ -1784,7 +1784,7 @@ fn resume_gap(previous: SystemTime, now: SystemTime) -> Option<Duration> {
         .filter(|gap| *gap >= RESUME_GAP)
 }
 
-fn current_relaunch_generation() -> u32 {
+pub(crate) fn current_relaunch_generation() -> u32 {
     env::var(RELAUNCH_ENV)
         .ok()
         .and_then(|value| value.parse().ok())
@@ -1819,7 +1819,7 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
         .unwrap_or_else(|| "unknown panic".into())
 }
 
-fn restart_bridge(generation: u32) -> Result<()> {
+pub(crate) fn restart_bridge(generation: u32) -> Result<()> {
     let executable = env::current_exe().context("could not locate the Bridge executable")?;
     let working_directory = executable
         .parent()
@@ -2064,7 +2064,7 @@ async fn install_update(update: UpdateInfo, events: &SyncSender<UpdateEvent>) {
 }
 
 #[cfg(target_os = "macos")]
-fn configure_tray_only_application() {
+pub(crate) fn configure_tray_only_application() {
     use objc2::MainThreadMarker;
     use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 
@@ -2079,9 +2079,9 @@ fn configure_tray_only_application() {
 }
 
 #[cfg(any(target_os = "windows", target_os = "linux"))]
-fn configure_tray_only_application() {}
+pub(crate) fn configure_tray_only_application() {}
 
-fn notify_natively(notice: &Notice) {
+pub(crate) fn notify_natively(notice: &Notice) {
     if let Err(error) = platform::notify(&notice.title, &notice.detail) {
         tracing::warn!(%error, "Could not show the notification");
     }
@@ -2110,12 +2110,12 @@ fn openmouse_icon_rgba() -> Result<(Vec<u8>, u32, u32)> {
     Ok((pixels, info.width, info.height))
 }
 
-fn tray_icon() -> Result<Icon> {
+pub(crate) fn tray_icon() -> Result<Icon> {
     let (rgba, width, height) = openmouse_icon_rgba()?;
     Icon::from_rgba(rgba, width, height).context("could not create the OpenMouse tray icon")
 }
 
-fn open_logs() -> Result<()> {
+pub(crate) fn open_logs() -> Result<()> {
     let directory = config::log_dir()?;
     #[cfg(target_os = "windows")]
     let program = "explorer.exe";
@@ -2130,7 +2130,7 @@ fn open_logs() -> Result<()> {
     Ok(())
 }
 
-fn open_openmouse() -> Result<()> {
+pub(crate) fn open_openmouse() -> Result<()> {
     open_url(OPENMOUSE_URL)
 }
 

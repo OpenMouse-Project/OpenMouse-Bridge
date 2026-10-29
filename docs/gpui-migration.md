@@ -106,3 +106,21 @@ their own install helper fails before it swaps anything.
 - Whether the panel keeps its current layout or follows Desktop's design.
 - Code signing for the Windows installer, and where the certificate lives.
 - How long to keep publishing the legacy-named bridge archives.
+
+## Progress
+
+Phase 1 is started, not done.
+
+- `Cargo.toml` has an optional `gpui` feature (`gpui-kit` 0.7) and the
+  `gpui-pre-apple` patch, vendored from Desktop into `vendor/gpui-pre-apple`.
+  Default builds do not use either; `cargo check --locked` passes.
+- `src/desktop.rs` exposes what a second shell needs (`BackgroundServer`,
+  `BridgeCommand`, `UpdateEvent`, the label helpers, `tray_icon`,
+  `restart_bridge`, window size constants). Behaviour is unchanged.
+- Next: add `src/gpui_shell/` behind `--features gpui`. It starts the same
+  `BackgroundServer`, polls the snapshot, update and notice channels on a timer
+  (pass an empty `OnceLock` as the egui waker), opens a borderless panel, and
+  installs the tray icon with Open / Restart / Quit, following Desktop's
+  `tray.rs`. Then port the Home view, then Settings. Select it with an env var
+  in `main.rs` until it reaches parity. Windows and Linux tray code is not
+  written or tested yet; macOS comes first.
