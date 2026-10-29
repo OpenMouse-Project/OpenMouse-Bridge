@@ -77,7 +77,10 @@ pub fn run() -> Result<()> {
         })
         .expect("failed to open the Bridge panel");
 
-        let tray_commands = tray::install(cx, handle);
+        let (tray_commands, mut tray_handle) = match tray::install(cx, handle) {
+            Some((commands, tray)) => (Some(commands), Some(tray)),
+            None => (None, None),
+        };
         if !show_panel && tray_commands.is_some() {
             let _ = cx.update_window(handle, |_, window, _| tray::hide(window));
         } else {
@@ -98,17 +101,24 @@ pub fn run() -> Result<()> {
                     .as_ref()
                     .map(|commands| commands.try_iter().collect())
                     .unwrap_or_default();
-                let Ok((panel_wanted, overlay_delay)) =
+                let Ok((panel_wanted, overlay_delay, tray_battery)) =
                     view.update(cx, |view: &mut PanelView, cx| {
                         let drained = view.drain();
                         if drained.changed {
                             cx.notify();
                         }
-                        (drained.panel_requested, drained.overlay_delay)
+                        (
+                            drained.panel_requested,
+                            drained.overlay_delay,
+                            view.tray_battery(),
+                        )
                     })
                 else {
                     break;
                 };
+                if let Some(tray) = tray_handle.as_mut() {
+                    tray.show_battery(tray_battery);
+                }
                 // A fading banner needs a frame every ~16 ms; otherwise idle.
                 wait = overlay_delay.map_or(POLL, |delay| delay.min(POLL));
                 // The newest click says where the icon is; a request with no
@@ -151,4 +161,37 @@ pub fn run() -> Result<()> {
         restart_bridge(current_relaunch_generation())?;
     }
     stopped
+}
+
+/// An empty snapshot for tests of the shell's pieces.
+#[cfg(test)]
+pub(crate) fn test_snapshot() -> openmouse_bridge::service::BridgeSnapshot {
+    openmouse_bridge::service::BridgeSnapshot {
+        version: "test",
+        platform: "test",
+        linux_distribution: None,
+        uptime_seconds: 0,
+        active_games: vec![],
+        games: vec![],
+        tracked_game_count: 0,
+        battery_threshold_percent: 20,
+        tray_battery_style: "glyph".to_owned(),
+        hybrid_mode: true,
+        device_mode: "onboard".to_owned(),
+        autostart_enabled: false,
+        automatic_updates: false,
+        notification_sound: true,
+        notification_volume: 60,
+        foreground_application: None,
+        active_profile: None,
+        active_profile_is_default: false,
+        native_automation_error: None,
+        pending_native_restores: 0,
+        visible_application_count: 0,
+        profile_count: 0,
+        client_connected: false,
+        active_devices: vec![],
+        batteries: vec![],
+        known_devices: vec![],
+    }
 }

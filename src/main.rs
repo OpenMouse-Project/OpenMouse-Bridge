@@ -14,6 +14,11 @@ mod gpui_shell;
 mod native_ui;
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 mod overlay;
+#[cfg(all(
+    feature = "gpui",
+    any(target_os = "windows", target_os = "macos", target_os = "linux")
+))]
+mod tray_battery;
 
 use std::fs;
 

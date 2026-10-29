@@ -117,6 +117,11 @@ impl PanelView {
         }
     }
 
+    /// What the tray icon should show for the latest snapshot.
+    pub fn tray_battery(&self) -> Option<crate::tray_battery::TrayBattery> {
+        crate::tray_battery::from_snapshot(self.snapshot.as_ref())
+    }
+
     /// Takes everything the core has queued since the last poll. Notices become
     /// system notifications for now; the GPUI overlay replaces that later.
     pub fn drain(&mut self) -> Drained {

@@ -12,6 +12,8 @@ use std::sync::{
 
 use gpui_kit::{AnyWindowHandle, App, AppContext as _, Window};
 
+use crate::tray_battery::{self, TrayBattery};
+
 /// Where the tray icon was when it was clicked, so the panel opens beside it:
 /// the cursor in logical points with a bottom-left origin on macOS (the click
 /// is on the icon), the icon's rectangle in physical pixels with a top-left
@@ -22,6 +24,44 @@ pub struct Anchor {
     pub top: f64,
     pub right: f64,
     pub bottom: f64,
+}
+
+/// The tray icon, kept by the poll loop so it can show the battery on it.
+pub struct TrayHandle {
+    #[cfg(any(target_os = "macos", windows))]
+    icon: tray_icon::TrayIcon,
+    shown: Option<TrayBattery>,
+}
+
+impl TrayHandle {
+    /// Shows `battery` on the icon, or the plain logo for `None`, when that
+    /// differs from what is showing; calling this every poll is cheap.
+    pub fn show_battery(&mut self, battery: Option<TrayBattery>) {
+        if battery == self.shown {
+            return;
+        }
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            let outcome = match &battery {
+                Some(battery) => tray_battery::icon(battery).and_then(|icon| {
+                    self.icon.set_icon(Some(icon))?;
+                    self.icon
+                        .set_tooltip(Some(tray_battery::tooltip(battery)))?;
+                    Ok(())
+                }),
+                None => crate::desktop::tray_icon().and_then(|icon| {
+                    self.icon.set_icon(Some(icon))?;
+                    self.icon.set_tooltip(Some("OpenMouse Bridge"))?;
+                    Ok(())
+                }),
+            };
+            if let Err(error) = outcome {
+                tracing::warn!(%error, "Could not update the tray icon");
+                return;
+            }
+        }
+        self.shown = battery;
+    }
 }
 
 #[derive(Debug)]
@@ -288,10 +328,13 @@ pub fn show(window: &mut Window, anchor: Option<Anchor>) {
 }
 
 /// Creates the tray icon and makes closing `window` hide it. Returns the
-/// channel its clicks and menu items arrive on, or `None` when there is no tray
-/// (then closing the window still quits).
+/// channel its clicks and menu items arrive on and the icon itself, or `None`
+/// when there is no tray (then closing the window still quits).
 #[cfg(any(target_os = "macos", windows))]
-pub fn install(cx: &mut App, window: AnyWindowHandle) -> Option<mpsc::Receiver<Command>> {
+pub fn install(
+    cx: &mut App,
+    window: AnyWindowHandle,
+) -> Option<(mpsc::Receiver<Command>, TrayHandle)> {
     #[cfg(windows)]
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use tray_icon::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -377,23 +420,25 @@ pub fn install(cx: &mut App, window: AnyWindowHandle) -> Option<mpsc::Receiver<C
         }
     }));
 
-    // A task that never finishes owns the icon, so it lives as long as the app.
-    cx.spawn(async move |_cx| {
-        let _tray = tray;
-        std::future::pending::<()>().await;
-    })
-    .detach();
-
     let _ = cx.update_window(window, |_, window, cx| {
         window.on_window_should_close(cx, |window, _| {
             hide(window);
             false
         });
     });
-    Some(receiver)
+    Some((
+        receiver,
+        TrayHandle {
+            icon: tray,
+            shown: None,
+        },
+    ))
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
-pub fn install(_cx: &mut App, _window: AnyWindowHandle) -> Option<mpsc::Receiver<Command>> {
+pub fn install(
+    _cx: &mut App,
+    _window: AnyWindowHandle,
+) -> Option<(mpsc::Receiver<Command>, TrayHandle)> {
     None
 }
