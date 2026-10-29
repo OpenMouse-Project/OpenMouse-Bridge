@@ -1,5 +1,37 @@
 # OpenMouse Bridge
 
+> [!WARNING]
+> **Work in progress: the `GPUI` branch.** Bridge is being rebuilt on
+> [GPUI](https://www.gpui.rs/) with real installers and in-app updates. Nothing
+> on this branch is released, and the new shell does not exist yet. The rest of
+> this README documents Bridge as it works today. See
+> [docs/gpui-migration.md](docs/gpui-migration.md) for the full plan.
+
+## GPUI migration (WIP)
+
+| Area | Plan | Status |
+| --- | --- | --- |
+| Shell | Replace the egui tray panel, overlay and notifications with GPUI | Groundwork only |
+| Windows | Custom per-user installer, no admin prompt | Not started |
+| macOS | Keep the signed `.app` and DMG | Exists today |
+| Linux | AppImage, with a one-time udev permission step | Not started |
+| Updates | In-app download, verify, then "Restart to update" | Not started |
+
+What is on this branch so far:
+
+- [x] Migration plan in [`docs/gpui-migration.md`](docs/gpui-migration.md)
+- [x] Optional `gpui` cargo feature and the vendored `gpui-pre-apple` patch
+- [x] The seams a second shell needs, exposed from `src/desktop.rs`
+- [ ] `src/gpui_shell/`: tray icon, panel and the Home view
+- [ ] Settings view, overlay and notifications
+- [ ] In-app updater and `latest.json`
+- [ ] Windows installer, macOS update path, Linux AppImage
+
+Bridge stays a separate app from OpenMouse Desktop; Desktop is only a reference
+for patterns.
+
+---
+
 OpenMouse Bridge is a small per-user companion process for the OpenMouse web
 control panel on Windows, macOS, and Linux. Its core and loopback protocol remain
 portable so additional desktop adapters do not require changes to the web app.
@@ -216,6 +248,8 @@ Full settings snapshots are stored by Bridge but applied and restored by an open
 control panel. A selected profile is not proof that a hardware write succeeded.
 
 ## Tray panel
+
+> This section describes the current egui panel, which the GPUI shell will replace.
 
 The native tray panel uses OpenMouse's lit surfaces, inset controls, raised
 actions, trailing switches, Emerald palette and embedded DM Sans. Home starts at
