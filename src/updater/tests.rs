@@ -773,6 +773,15 @@ fn only_a_tiny_node_runtime_marks_an_install_as_a_stub() {
 }
 
 #[test]
+fn only_one_install_is_staged_per_process() {
+    claim_install().expect("first install claims the slot");
+    assert!(claim_install().is_err(), "a second install must be refused");
+    release_install_claim();
+    claim_install().expect("a failed install frees the slot");
+    release_install_claim();
+}
+
+#[test]
 fn checksum_must_match_archive() {
     let archive = b"bridge";
     let checksum = format!("{:x}  bridge.zip\n", Sha256::digest(archive));

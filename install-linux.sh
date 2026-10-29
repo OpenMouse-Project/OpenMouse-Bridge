@@ -280,6 +280,15 @@ download() {
     fi
 }
 
+# The HTTP status of a HEAD request for $1, empty when the server is unreachable.
+http_status() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -sIL -o /dev/null -w '%{http_code}' "$1" 2>/dev/null || true
+    elif command -v wget >/dev/null 2>&1; then
+        wget -S --spider "$1" 2>&1 | awk '/^ *HTTP\//{code=$2} END{print code}' || true
+    fi
+}
+
 release_url() {
     if [ "$TAG" = "latest" ]; then
         echo "https://github.com/${REPO}/releases/latest/download/${ASSET}"
@@ -381,8 +390,14 @@ main() {
     trap "rm -rf \"$tmp\"" EXIT
     log "Downloading OpenMouse Bridge ($TAG)..."
     if ! download "$(release_url)" "$tmp/$ASSET"; then
-        ASSET="$LEGACY_ASSET"
-        download "$(release_url)" "$tmp/$ASSET"
+        # Only a release that has no -full asset falls back; any other failure
+        # must not end in the legacy archive, which has no Node.js runtime.
+        if [ "$(http_status "$(release_url)")" = "404" ]; then
+            ASSET="$LEGACY_ASSET"
+            download "$(release_url)" "$tmp/$ASSET"
+        else
+            die "could not download $ASSET; check your connection and try again"
+        fi
     fi
     download "$(release_url).sha256" "$tmp/$ASSET.sha256"
     (

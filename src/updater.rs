@@ -75,7 +75,33 @@ async fn fetch_latest_release() -> Result<Release> {
     serde_json::from_slice::<Release>(&bytes).context("could not parse the latest Bridge release")
 }
 
+/// Set once an install is being prepared or has been handed to the update
+/// helper. Two helpers racing for the install lock would leave the loser
+/// relaunching the old binary, so this process stages at most one install.
+static INSTALL_CLAIMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn claim_install() -> Result<()> {
+    ensure!(
+        !INSTALL_CLAIMED.swap(true, std::sync::atomic::Ordering::AcqRel),
+        "another Bridge update is already being installed"
+    );
+    Ok(())
+}
+
+fn release_install_claim() {
+    INSTALL_CLAIMED.store(false, std::sync::atomic::Ordering::Release);
+}
+
 pub async fn download_and_stage(update: &UpdateInfo) -> Result<()> {
+    claim_install()?;
+    let result = download_and_stage_claimed(update).await;
+    if result.is_err() {
+        release_install_claim();
+    }
+    result
+}
+
+async fn download_and_stage_claimed(update: &UpdateInfo) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(DOWNLOAD_TIMEOUT)
         .build()
