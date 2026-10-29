@@ -20,7 +20,7 @@ use openmouse_bridge::{
     BRIDGE_PORT, config,
     platform::{self, TrayBatteryStyle},
     service::{BridgeSnapshot, KnownDeviceStatus, Notice},
-    updater::UpdateInfo,
+    updater::{DownloadProgress, UpdateInfo, download_progress},
 };
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -81,6 +81,10 @@ impl View {
 /// Extra height for one more line of content, in logical points.
 const ROW_HEIGHT: f32 = 24.0;
 const NOTE_HEIGHT: f32 = 22.0;
+/// The update card on Home.
+const NOTICE_HEIGHT: f32 = 58.0;
+/// The progress bar under the update card's headline, with its gap.
+const BAR_HEIGHT: f32 = 14.0;
 
 pub struct PanelView {
     snapshots: mpsc::Receiver<BridgeSnapshot>,
@@ -98,9 +102,12 @@ pub struct PanelView {
     battery_threshold: u8,
     notification_sound: bool,
     notification_volume: u8,
-    update_text: Option<String>,
-    update_available: Option<UpdateInfo>,
-    update_busy: bool,
+    update: UpdateState,
+    /// Bytes received of the archive being downloaded, while one is.
+    progress: Option<DownloadProgress>,
+    /// Set when the updater has staged a new version and handed off to its
+    /// helper, which waits for this process to exit before swapping files in.
+    quit_for_update: bool,
     /// Shown on Home until the panel is first closed: the first launch opens
     /// the panel, so the app's home in the tray needs saying.
     first_run_hint: bool,
@@ -118,8 +125,135 @@ pub struct PanelView {
 pub struct Drained {
     pub changed: bool,
     pub panel_requested: bool,
+    /// The updater has handed off: the app must exit now so its helper can
+    /// install the new version and relaunch it.
+    pub quit_for_update: bool,
     /// How soon the overlay needs the next tick while a banner is fading.
     pub overlay_delay: Option<Duration>,
+}
+
+/// Where the update flow stands, in the same states as the egui panel.
+#[derive(Clone)]
+enum UpdateState {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(UpdateInfo),
+    Downloading(String),
+    Restarting(String),
+    Failed(String),
+}
+
+impl UpdateState {
+    fn from_event(event: UpdateEvent) -> Self {
+        match event {
+            UpdateEvent::Checking => Self::Checking,
+            UpdateEvent::UpToDate => Self::UpToDate,
+            UpdateEvent::Available(update) => Self::Available(update),
+            UpdateEvent::Downloading(version) => Self::Downloading(version),
+            UpdateEvent::Restarting(version) => Self::Restarting(version),
+            UpdateEvent::Failed(error) => Self::Failed(error),
+        }
+    }
+
+    /// Something is in progress, so another check or install must wait.
+    fn busy(&self) -> bool {
+        matches!(
+            self,
+            Self::Checking | Self::Downloading(_) | Self::Restarting(_)
+        )
+    }
+
+    /// Worth a card on Home, not only a line in Settings.
+    fn is_notice(&self) -> bool {
+        matches!(
+            self,
+            Self::Available(_) | Self::Downloading(_) | Self::Restarting(_) | Self::Failed(_)
+        )
+    }
+
+    /// A progress bar goes under the headline.
+    fn shows_bar(&self) -> bool {
+        matches!(self, Self::Downloading(_) | Self::Restarting(_))
+    }
+
+    /// The one line Settings shows for any state.
+    fn text(&self, progress: Option<DownloadProgress>) -> Option<String> {
+        Some(match self {
+            Self::Idle => return None,
+            Self::Checking => "Checking for updates…".into(),
+            Self::UpToDate => "Bridge is up to date".into(),
+            Self::Available(update) => format!("Version {} is available", update.version),
+            Self::Downloading(version) => downloading_text(version, progress),
+            Self::Restarting(version) => format!("Restarting into {version}…"),
+            Self::Failed(error) => format!("Update failed: {error}"),
+        })
+    }
+
+    /// The short headline of the card on Home.
+    fn headline(&self, progress: Option<DownloadProgress>) -> Option<String> {
+        Some(match self {
+            Self::Failed(_) => "Update failed".into(),
+            Self::Available(_) | Self::Downloading(_) | Self::Restarting(_) => {
+                self.text(progress)?
+            }
+            Self::Idle | Self::Checking | Self::UpToDate => return None,
+        })
+    }
+}
+
+/// "Downloading 2.0.0…" with the percentage once the size is known, and
+/// "Preparing" for the checks and unpacking after the last byte.
+fn downloading_text(version: &str, progress: Option<DownloadProgress>) -> String {
+    match progress {
+        Some(progress) if progress.is_complete() => format!("Preparing {version}…"),
+        Some(progress) => match progress.fraction() {
+            Some(fraction) => format!("Downloading {version} · {}%", (fraction * 100.0) as u32),
+            None => format!("Downloading {version}…"),
+        },
+        None => format!("Downloading {version}…"),
+    }
+}
+
+/// A thin progress bar. With a fraction it fills that far; without one (the
+/// size is unknown, or the download is being checked and unpacked) a segment
+/// sweeps across it.
+fn progress_bar(fraction: Option<f32>, fill: Hsla, track: Hsla) -> AnyElement {
+    let bar = div()
+        .relative()
+        .h(px(4.))
+        .w_full()
+        .flex_none()
+        .rounded_full()
+        .overflow_hidden()
+        .bg(track);
+    match fraction {
+        Some(fraction) => bar
+            .child(
+                div()
+                    .h_full()
+                    .w(relative(fraction.clamp(0.0, 1.0)))
+                    .rounded_full()
+                    .bg(fill),
+            )
+            .into_any_element(),
+        None => bar
+            .child(
+                div()
+                    .absolute()
+                    .top(px(0.))
+                    .h_full()
+                    .w(relative(0.35))
+                    .rounded_full()
+                    .bg(fill)
+                    .with_animation(
+                        "update-sweep",
+                        Animation::new(Duration::from_millis(1100)).repeat(),
+                        |segment, delta| segment.left(relative(delta * 1.35 - 0.35)),
+                    ),
+            )
+            .into_any_element(),
+    }
 }
 
 /// The channels between the panel and the core.
@@ -172,9 +306,9 @@ impl PanelView {
             battery_threshold: 20,
             notification_sound: true,
             notification_volume: 60,
-            update_text: None,
-            update_available: None,
-            update_busy: false,
+            update: UpdateState::Idle,
+            progress: None,
+            quit_for_update: false,
             first_run_hint: first_run,
             error: None,
             focus,
@@ -207,32 +341,19 @@ impl PanelView {
             changed = true;
         }
         while let Ok(event) = self.updates.try_recv() {
-            self.update_busy = false;
-            self.update_text = Some(match event {
-                UpdateEvent::Checking => {
-                    self.update_busy = true;
-                    "Checking for updates…".into()
-                }
-                UpdateEvent::UpToDate => {
-                    self.update_available = None;
-                    "Bridge is up to date".into()
-                }
-                UpdateEvent::Available(update) => {
-                    let text = format!("Version {} is available", update.version);
-                    self.update_available = Some(update);
-                    text
-                }
-                UpdateEvent::Downloading(version) => {
-                    self.update_busy = true;
-                    format!("Downloading {version}…")
-                }
-                UpdateEvent::Restarting(version) => {
-                    self.update_available = None;
-                    self.update_busy = true;
-                    format!("Restarting into {version}…")
-                }
-                UpdateEvent::Failed(error) => format!("Update failed: {error}"),
-            });
+            self.quit_for_update |= matches!(event, UpdateEvent::Restarting(_));
+            self.update = UpdateState::from_event(event);
+            changed = true;
+        }
+        // The counter is a shared atomic, not an event, so sample it while a
+        // download runs and repaint when it moved.
+        if matches!(self.update, UpdateState::Downloading(_)) {
+            let progress = download_progress();
+            if self.progress != Some(progress) {
+                self.progress = Some(progress);
+                changed = true;
+            }
+        } else if self.progress.take().is_some() {
             changed = true;
         }
         while let Ok(notice) = self.notices.try_recv() {
@@ -250,6 +371,7 @@ impl PanelView {
         Drained {
             changed: (changed && visible) || became_visible,
             panel_requested,
+            quit_for_update: self.quit_for_update,
             overlay_delay: self.overlay.as_mut().and_then(Overlay::tick),
         }
     }
@@ -296,8 +418,14 @@ impl PanelView {
                 if known > HOME_DEVICE_ROWS {
                     height += NOTE_HEIGHT;
                 }
-                if self.update_text.is_some() {
-                    height += NOTE_HEIGHT;
+                if self.update.is_notice() {
+                    height += NOTICE_HEIGHT;
+                    if self.update.shows_bar() {
+                        height += BAR_HEIGHT;
+                    }
+                    if matches!(self.update, UpdateState::Failed(_)) {
+                        height += NOTE_HEIGHT * 2.0;
+                    }
                 }
                 if native_problem(self.snapshot.as_ref()).is_some() {
                     height += NOTE_HEIGHT * 2.0;
@@ -376,9 +504,14 @@ impl PanelView {
     }
 
     fn check_for_updates(&mut self, cx: &mut Context<Self>) {
-        self.update_busy = true;
-        self.update_text = Some("Checking for updates…".into());
+        self.update = UpdateState::Checking;
         let _ = self.commands.send(BridgeCommand::CheckForUpdates);
+        cx.notify();
+    }
+
+    fn install_update(&mut self, update: UpdateInfo, cx: &mut Context<Self>) {
+        self.update = UpdateState::Downloading(update.version.clone());
+        let _ = self.commands.send(BridgeCommand::InstallUpdate(update));
         cx.notify();
     }
 
@@ -712,8 +845,70 @@ impl PanelView {
         if let Some(problem) = native_problem(snapshot) {
             content = content.child(div().text_xs().text_color(cx.theme().danger).child(problem));
         }
-        if let Some(text) = &self.update_text {
-            content = content.child(div().text_xs().text_color(muted).child(text.clone()));
+        if let Some(headline) = self.update.headline(self.progress) {
+            let action = match &self.update {
+                UpdateState::Available(update) => {
+                    let update = update.clone();
+                    Some(
+                        Button::new("home-install-update")
+                            .primary()
+                            .compact()
+                            .label("Install")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.install_update(update.clone(), cx);
+                            })),
+                    )
+                }
+                UpdateState::Failed(_) => Some(
+                    Button::new("home-retry-update")
+                        .compact()
+                        .label("Retry")
+                        .on_click(cx.listener(|this, _, _, cx| this.check_for_updates(cx))),
+                ),
+                _ => None,
+            };
+            let percent = match (&self.update, self.progress) {
+                (UpdateState::Downloading(_), Some(progress)) if !progress.is_complete() => {
+                    progress
+                        .fraction()
+                        .map(|fraction| format!("{}%", (fraction * 100.0) as u32))
+                }
+                _ => None,
+            };
+            let mut notice = card(line, fill).child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .items_center()
+                    .gap_3()
+                    .text_sm()
+                    .child(div().truncate().child(headline))
+                    .children(action)
+                    .children(
+                        percent.map(|percent| div().flex_none().text_color(muted).child(percent)),
+                    ),
+            );
+            if self.update.shows_bar() {
+                // Downloading shows how far; the checks after the last byte,
+                // and the restart, have no length to show.
+                let fraction = match (&self.update, self.progress) {
+                    (UpdateState::Downloading(_), Some(progress)) if !progress.is_complete() => {
+                        progress.fraction()
+                    }
+                    _ => None,
+                };
+                notice = notice.child(progress_bar(fraction, accent, line));
+            }
+            if let UpdateState::Failed(error) = &self.update {
+                notice = notice.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().danger)
+                        .child(error.clone()),
+                );
+            }
+            content = content.child(notice);
         }
         content.child(div().flex_1()).child(
             div()
@@ -868,28 +1063,32 @@ impl PanelView {
                     Button::new("check-updates")
                         .compact()
                         .label("Check for updates")
-                        .loading(self.update_busy)
-                        .disabled(self.update_busy)
+                        .loading(self.update.busy())
+                        .disabled(self.update.busy())
                         .on_click(cx.listener(|this, _, _, cx| this.check_for_updates(cx))),
                 ),
             );
-        if let Some(update) = self.update_available.clone() {
+        if let UpdateState::Available(update) = self.update.clone() {
             updates = updates.child(
                 Button::new("install-update")
                     .primary()
                     .compact()
                     .label(format!("Install {}", update.version))
-                    .disabled(self.update_busy)
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.update_busy = true;
-                        let _ = this
-                            .commands
-                            .send(BridgeCommand::InstallUpdate(update.clone()));
-                        cx.notify();
+                        this.install_update(update.clone(), cx);
                     })),
             );
         }
-        if let Some(text) = &self.update_text {
+        if self.update.shows_bar() {
+            let fraction = match (&self.update, self.progress) {
+                (UpdateState::Downloading(_), Some(progress)) if !progress.is_complete() => {
+                    progress.fraction()
+                }
+                _ => None,
+            };
+            updates = updates.child(progress_bar(fraction, accent, line));
+        }
+        if let Some(text) = self.update.text(self.progress) {
             updates = updates.child(div().text_xs().text_color(muted).child(text.clone()));
         }
         body = body.child(updates).child(
@@ -1058,7 +1257,8 @@ impl Render for PanelView {
 mod tests {
     // Not `use super::*`: that pulls in GPUI's own `test` macro, which shadows
     // `#[test]`.
-    use super::{step_threshold, step_volume};
+    use super::{UpdateState, step_threshold, step_volume};
+    use crate::desktop::UpdateEvent;
 
     #[test]
     fn the_alert_level_steps_along_the_offered_list() {
@@ -1084,5 +1284,57 @@ mod tests {
         assert_eq!(step_volume(100, true), 100);
         assert_eq!(step_volume(5, false), 0);
         assert_eq!(step_volume(0, false), 0);
+    }
+
+    fn state(event: UpdateEvent) -> UpdateState {
+        UpdateState::from_event(event)
+    }
+
+    #[test]
+    fn only_work_in_progress_is_busy() {
+        assert!(state(UpdateEvent::Checking).busy());
+        assert!(state(UpdateEvent::Downloading("2.0.0".into())).busy());
+        assert!(state(UpdateEvent::Restarting("2.0.0".into())).busy());
+        assert!(!UpdateState::Idle.busy());
+        assert!(!state(UpdateEvent::UpToDate).busy());
+        assert!(!state(UpdateEvent::Failed("no network".into())).busy());
+    }
+
+    #[test]
+    fn home_gets_a_card_for_updates_that_need_attention_only() {
+        assert!(!UpdateState::Idle.is_notice());
+        assert!(!state(UpdateEvent::Checking).is_notice());
+        assert!(!state(UpdateEvent::UpToDate).is_notice());
+        assert!(state(UpdateEvent::Downloading("2.0.0".into())).is_notice());
+        assert!(state(UpdateEvent::Restarting("2.0.0".into())).is_notice());
+        assert!(state(UpdateEvent::Failed("no network".into())).is_notice());
+    }
+
+    #[test]
+    fn the_texts_name_the_version_and_the_failure() {
+        assert_eq!(UpdateState::Idle.text(None), None);
+        assert_eq!(
+            state(UpdateEvent::UpToDate).text(None).as_deref(),
+            Some("Bridge is up to date")
+        );
+        assert_eq!(
+            state(UpdateEvent::Downloading("2.0.0".into()))
+                .headline(None)
+                .as_deref(),
+            Some("Downloading 2.0.0…")
+        );
+        assert_eq!(
+            state(UpdateEvent::Restarting("2.0.0".into()))
+                .headline(None)
+                .as_deref(),
+            Some("Restarting into 2.0.0…")
+        );
+        let failed = state(UpdateEvent::Failed("no network".into()));
+        assert_eq!(failed.headline(None).as_deref(), Some("Update failed"));
+        assert_eq!(
+            failed.text(None).as_deref(),
+            Some("Update failed: no network")
+        );
+        assert_eq!(state(UpdateEvent::Checking).headline(None), None);
     }
 }

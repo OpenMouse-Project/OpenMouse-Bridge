@@ -152,6 +152,17 @@ Phase 1 is under way.
   two mice of one brand cannot be told apart for the connected state. Discovery
   is by driver brand, so a keyboard from such a brand (a Wooting) is listed too.
 
+Updates are wired to the existing updater (the zip-swap one, until the in-app
+updater below replaces it). The updater now exposes how far the archive download
+has got; the panel draws a bar with a percentage, a sweeping bar while the
+download is being checked and unpacked, and exits when the updater reports it is
+restarting, since the helper waits for the process to end before it installs.
+Checked end to end on macOS against a local fake release: the whole archive
+downloaded, the app exited by itself, the helper installed the new version and
+relaunched it, and no lock or temporary folders were left behind. This build is
+version 1.0.0; semver ranks it above every 1.0.0-beta build, so beta installs see
+it as an update.
+
 Checked on macOS: it builds, starts, serves the API, remembers mice across
 restarts (unit tests), and refreshes "last seen" every scan against real
 hardware. Idle CPU on a debug build was about 1.7% of a core with the panel

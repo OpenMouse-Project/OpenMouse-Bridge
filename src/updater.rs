@@ -9,6 +9,8 @@ use std::{
     time::Duration,
 };
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use anyhow::{Context, Result, anyhow, ensure};
 use semver::Version;
 use serde::Deserialize;
@@ -92,6 +94,41 @@ fn release_install_claim() {
     INSTALL_CLAIMED.store(false, std::sync::atomic::Ordering::Release);
 }
 
+/// Bytes of the update archive received so far, for a shell to draw a progress
+/// bar. Only the archive is counted, never the checksum or a release listing.
+static DOWNLOADED: AtomicU64 = AtomicU64::new(0);
+/// The archive's size as the server announced it, or 0 while it has not.
+static DOWNLOAD_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// How far the update download has got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DownloadProgress {
+    pub downloaded: u64,
+    /// `None` when the server did not say how big the archive is.
+    pub total: Option<u64>,
+}
+
+impl DownloadProgress {
+    /// 0.0 to 1.0, or `None` while the total is unknown.
+    pub fn fraction(self) -> Option<f32> {
+        let total = self.total?;
+        Some((self.downloaded as f32 / total as f32).clamp(0.0, 1.0))
+    }
+
+    /// Every byte has arrived; checking and unpacking it come next.
+    pub fn is_complete(self) -> bool {
+        self.total.is_some_and(|total| self.downloaded >= total)
+    }
+}
+
+pub fn download_progress() -> DownloadProgress {
+    let total = DOWNLOAD_TOTAL.load(Ordering::Relaxed);
+    DownloadProgress {
+        downloaded: DOWNLOADED.load(Ordering::Relaxed),
+        total: (total > 0).then_some(total),
+    }
+}
+
 pub async fn download_and_stage(update: &UpdateInfo) -> Result<()> {
     claim_install()?;
     let result = download_and_stage_claimed(update).await;
@@ -106,9 +143,11 @@ async fn download_and_stage_claimed(update: &UpdateInfo) -> Result<()> {
         .timeout(DOWNLOAD_TIMEOUT)
         .build()
         .context("could not create the update download client")?;
+    DOWNLOADED.store(0, Ordering::Relaxed);
+    DOWNLOAD_TOTAL.store(0, Ordering::Relaxed);
     let (archive, checksum) = tokio::try_join!(
-        download(&client, &update.archive_url, MAX_ARCHIVE_BYTES),
-        download(&client, &update.checksum_url, MAX_CHECKSUM_BYTES),
+        download(&client, &update.archive_url, MAX_ARCHIVE_BYTES, true),
+        download(&client, &update.checksum_url, MAX_CHECKSUM_BYTES, false),
     )?;
     verify_checksum(&archive, &checksum)?;
     let version = update.version.clone();
@@ -118,7 +157,12 @@ async fn download_and_stage_claimed(update: &UpdateInfo) -> Result<()> {
     Ok(())
 }
 
-async fn download(client: &reqwest::Client, url: &str, limit: usize) -> Result<Vec<u8>> {
+async fn download(
+    client: &reqwest::Client,
+    url: &str,
+    limit: usize,
+    track: bool,
+) -> Result<Vec<u8>> {
     let response = client
         .get(url)
         .header(reqwest::header::USER_AGENT, USER_AGENT)
@@ -127,12 +171,22 @@ async fn download(client: &reqwest::Client, url: &str, limit: usize) -> Result<V
         .with_context(|| format!("could not download {url}"))?
         .error_for_status()
         .with_context(|| format!("update download failed for {url}"))?;
-    read_bounded_response(response, limit).await
+    read_bounded(response, limit, track).await
 }
 
 pub(crate) async fn read_bounded_response(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>> {
+    read_bounded(response, limit, false).await
+}
+
+/// Reads a response up to `limit` bytes; with `track`, records its progress in
+/// [`download_progress`].
+async fn read_bounded(
     mut response: reqwest::Response,
     limit: usize,
+    track: bool,
 ) -> Result<Vec<u8>> {
     if let Some(length) = response.headers().get(reqwest::header::CONTENT_LENGTH) {
         let length = length
@@ -140,6 +194,9 @@ pub(crate) async fn read_bounded_response(
             .parse::<u64>()
             .context("invalid download content length")?;
         ensure!(length <= limit as u64, "download exceeds byte limit");
+        if track {
+            DOWNLOAD_TOTAL.store(length, Ordering::Relaxed);
+        }
     }
     let mut bytes = Vec::new();
     while let Some(chunk) = response
@@ -159,6 +216,9 @@ pub(crate) async fn read_bounded_response(
                 .context("could not allocate bounded download buffer")?;
         }
         bytes.extend_from_slice(&chunk);
+        if track {
+            DOWNLOADED.store(bytes.len() as u64, Ordering::Relaxed);
+        }
     }
     Ok(bytes)
 }

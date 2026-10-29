@@ -1023,3 +1023,96 @@ fn canonical_staging_parent_is_a_plain_drive_path() {
     assert!(!text.starts_with(r"\\?\"), "{text}");
     assert!(parent.is_dir());
 }
+
+#[test]
+fn download_progress_reports_a_fraction_only_when_the_size_is_known() {
+    let unknown = DownloadProgress {
+        downloaded: 500,
+        total: None,
+    };
+    assert_eq!(unknown.fraction(), None);
+    assert!(!unknown.is_complete());
+
+    let half = DownloadProgress {
+        downloaded: 500,
+        total: Some(1000),
+    };
+    assert_eq!(half.fraction(), Some(0.5));
+    assert!(!half.is_complete());
+
+    let done = DownloadProgress {
+        downloaded: 1000,
+        total: Some(1000),
+    };
+    assert_eq!(done.fraction(), Some(1.0));
+    assert!(done.is_complete());
+
+    // More bytes than announced cannot push the bar past the end.
+    let over = DownloadProgress {
+        downloaded: 1500,
+        total: Some(1000),
+    };
+    assert_eq!(over.fraction(), Some(1.0));
+}
+
+/// Serves `body` once over HTTP, in pieces, and returns its address.
+fn serve_once(body: Vec<u8>) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0u8; 1024];
+        let _ = stream.read(&mut request);
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        // In pieces, so the download sees more than one chunk.
+        for piece in body.chunks(25_000) {
+            stream.write_all(piece).unwrap();
+            stream.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+    (address, server)
+}
+
+// One test, not two: the progress counter is shared by the whole process, so
+// separate tests would overwrite each other's numbers.
+#[tokio::test]
+async fn only_a_tracked_download_moves_the_progress() {
+    DOWNLOADED.store(0, Ordering::Relaxed);
+    DOWNLOAD_TOTAL.store(0, Ordering::Relaxed);
+
+    // A tracked download records its announced size and every byte.
+    let (address, server) = serve_once(vec![7u8; 100_000]);
+    let response = reqwest::Client::new()
+        .get(format!("http://{address}/archive.zip"))
+        .send()
+        .await
+        .unwrap();
+    let bytes = read_bounded(response, 1_000_000, true).await.unwrap();
+    server.join().unwrap();
+    assert_eq!(bytes.len(), 100_000);
+    let progress = download_progress();
+    assert_eq!(progress.downloaded, 100_000);
+    assert_eq!(progress.total, Some(100_000));
+    assert!(progress.is_complete());
+    assert_eq!(progress.fraction(), Some(1.0));
+
+    // A later download that is not tracked (the checksum) leaves it alone.
+    let (address, server) = serve_once(b"abcd".to_vec());
+    let response = reqwest::Client::new()
+        .get(format!("http://{address}/checksum"))
+        .send()
+        .await
+        .unwrap();
+    let bytes = read_bounded(response, 1_000, false).await.unwrap();
+    server.join().unwrap();
+    assert_eq!(bytes, b"abcd");
+    assert_eq!(download_progress(), progress);
+}

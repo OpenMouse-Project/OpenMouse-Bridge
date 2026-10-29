@@ -5578,7 +5578,7 @@ dependencies = [
 
 [[package]]
 name = "openmouse-bridge"
-version = "1.0.0-beta.21"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "axum",

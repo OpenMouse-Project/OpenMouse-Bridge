@@ -108,23 +108,27 @@ pub fn run() -> Result<()> {
                     .as_ref()
                     .map(|commands| commands.try_iter().collect())
                     .unwrap_or_default();
-                let Ok((panel_wanted, overlay_delay, tray_battery)) =
-                    view.update(cx, |view: &mut PanelView, cx| {
-                        let drained = view.drain();
-                        if drained.changed {
-                            cx.notify();
-                        }
-                        (
-                            drained.panel_requested,
-                            drained.overlay_delay,
-                            view.tray_battery(),
-                        )
-                    })
-                else {
+                let Ok((drained, tray_battery)) = view.update(cx, |view: &mut PanelView, cx| {
+                    let drained = view.drain();
+                    if drained.changed {
+                        cx.notify();
+                    }
+                    (drained, view.tray_battery())
+                }) else {
                     break;
                 };
+                let (panel_wanted, overlay_delay) =
+                    (drained.panel_requested, drained.overlay_delay);
                 if let Some(tray) = tray_handle.as_mut() {
                     tray.show_battery(tray_battery);
+                }
+                if drained.quit_for_update {
+                    // The updater has staged the new version and started its
+                    // helper, which waits for this process to exit, installs,
+                    // and relaunches. Exiting without a restart of our own.
+                    tracing::info!("exiting so the staged update can be installed");
+                    cx.update(|cx| cx.quit());
+                    break;
                 }
                 // A fading banner needs a frame every ~16 ms; otherwise idle.
                 wait = overlay_delay.map_or(POLL, |delay| delay.min(POLL));

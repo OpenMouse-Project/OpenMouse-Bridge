@@ -34,7 +34,13 @@ What is on this branch so far:
       Settings
 - [x] The Attack Shark R5 Ultra's battery is read natively (the Node helper
       cannot read it)
-- [ ] Home parity with the egui panel (battery details, remove-stale control)
+- [x] Updates in the GPUI shell: an update card on Home with Install and Retry,
+      a progress bar and percentage while it downloads, and the app exits when
+      the update is staged so the installer helper can swap it in and relaunch
+- [x] Settings: hybrid mode, tray icon style, alert level, sound and volume
+- [x] First-run behaviour, forgetting a stale mouse, Escape hides the panel
+- [ ] Still to port from the egui panel: the tray icon after sleep or hibernate,
+      relaunch after a crash, and the extended battery details
 - [ ] In-app updater and `latest.json`
 - [ ] Windows installer, macOS update path, Linux AppImage
 
