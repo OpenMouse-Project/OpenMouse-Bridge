@@ -46,7 +46,7 @@ ASSUME_YES=false
 # (Pulsar 0x3710 in src/drivers/pulsar.rs, Delux 0x1d57/0x248a/0x373e in
 # src/drivers/delux.rs) plus each brand in native-hid/src/brands.mjs.
 # Keep in sync when a brand is added there.
-VENDOR_IDS="045e 046d 0483 093a 1532 1915 1caa 1d57 248a 25a7 2fe3 31e3 3151 3367 3434 3554 361d 36a7 3710 373b 373e 3879"
+VENDOR_IDS="045e 046d 0483 093a 1532 1915 1caa 1d57 248a 25a7 2fe3 31e3 3151 3367 33e4 3434 3554 361d 36a7 3710 373b 373e 3879"
 
 log() { printf '==> %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }

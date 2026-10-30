@@ -9,17 +9,25 @@
 // - "Pulsar": Bridge has a dependency-free native Rust driver for it
 //   (src/drivers/pulsar.rs) that claims the brand before this helper is ever
 //   invoked — see src/drivers/mod.rs.
-// - G-Wolves: not yet a finished, exported driver in the local mouse-protocol
-//   checkout (untracked src/g-wolves/, src/drivers/g-wolves/, no package.json
-//   export or registry.ts entry as of this writing) — add it here once it
-//   ships upstream.
 //
 // Vendor ids are copied from mouse-protocol/src/drivers/vendors.ts and each
 // driver's own `isSupported()`; class import paths use the package's
 // "./drivers/*" subpath export (mouse-protocol/package.json), which maps
 // straight onto its compiled dist/drivers/ layout.
 
-const client = (module, exportName) => ({ module, exportName });
+// The G-Wolves catalog is plain data with no `window` use, so importing it
+// before apply.mjs aliases `window` is safe.
+import { GWOLVES_PRODUCTS } from "@openmouse/protocol/drivers/gwolves/products";
+
+// `productIds` limits a class to the products it speaks for, when one vendor
+// id carries several wire protocols that a probe could confuse.
+const client = (module, exportName, productIds) => ({ module, exportName, productIds });
+
+// G-Wolves ships three protocols under one vendor id; each driver class only
+// checks its product's protocol in the collection-based isSupported(), which
+// this adapter cannot run, so the catalog picks the class instead.
+const gwolvesProducts = (protocol) =>
+  [...GWOLVES_PRODUCTS].filter(([, product]) => product.protocol === protocol).map(([productId]) => productId);
 
 export const BRAND_DRIVERS = {
   zaunkoenig: {
@@ -121,6 +129,14 @@ export const BRAND_DRIVERS = {
       client("@openmouse/protocol/drivers/wallhack/keyboard-hid", "WallhackKeyboardHidClient"),
     ],
   },
+  "g-wolves": {
+    vendorIds: [0x33e4],
+    classes: [
+      client("@openmouse/protocol/drivers/gwolves/xvi-hid", "GWolvesXviHidClient", gwolvesProducts("xvi")),
+      client("@openmouse/protocol/drivers/gwolves/xvi-new-hid", "GWolvesXviNewHidClient", gwolvesProducts("xvi-new")),
+      client("@openmouse/protocol/drivers/gwolves/hid", "GWolvesHidClient", gwolvesProducts("gwolves")),
+    ],
+  },
   delux: {
     vendorIds: [0x1d57, 0x248a, 0x373e],
     classes: [
@@ -135,4 +151,10 @@ export const BRAND_DRIVERS = {
  * a BRAND_DRIVERS key. */
 export function brandKey(brand) {
   return brand.trim().toLowerCase();
+}
+
+/** The classes of a BRAND_DRIVERS entry worth probing on a device with this
+ * product id: every class, minus those whose `productIds` leave it out. */
+export function classesFor(entry, productId) {
+  return entry.classes.filter((candidate) => !candidate.productIds || candidate.productIds.includes(productId));
 }

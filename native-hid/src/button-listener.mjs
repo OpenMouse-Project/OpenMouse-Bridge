@@ -19,7 +19,7 @@ globalThis.window ??= globalThis;
 
 import { createInterface } from "node:readline";
 
-import { BRAND_DRIVERS, brandKey } from "./brands.mjs";
+import { BRAND_DRIVERS, brandKey, classesFor } from "./brands.mjs";
 import { candidateDevices } from "./hid-device-adapter.mjs";
 
 const EXIT_OK = 0;
@@ -60,7 +60,7 @@ async function findClient(entry, wantedName) {
   const closeOthers = () => Promise.all(others.map((other) => other.client.close().catch(() => undefined)));
   for (const vendorId of entry.vendorIds) {
     for (const device of candidateDevices(vendorId)) {
-      for (const candidate of entry.classes) {
+      for (const candidate of classesFor(entry, device.productId)) {
         try {
           const found = await probe(device, candidate);
           // The listener only exists on a client built from a protocol release that has it.

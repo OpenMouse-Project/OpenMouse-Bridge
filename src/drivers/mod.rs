@@ -61,6 +61,7 @@ const KNOWN_BRANDS: &[(&str, &[u16])] = &[
     ("Wooting", &[0x31e3]),
     ("Microsoft", &[0x045e]),
     ("WALLHACK", &[0x3879, 0x1caa]),
+    ("G-Wolves", &[0x33e4]),
 ];
 
 /// Logitech is special: every Logitech-branded device (keyboards, headsets)
