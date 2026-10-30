@@ -26,6 +26,11 @@ const SHARED_READ_IDLE: std::time::Duration = std::time::Duration::from_millis(2
 const MICROSOFT_VENDOR_ID: u16 = 0x045E;
 const RAZER_VENDOR_ID: u16 = 0x1532;
 const RAZER_FEATURE_BUFFER_LEN: usize = 91;
+const THERMALTAKE_VENDOR_ID: u16 = 0x264A;
+/// The Iris's config collection holds only constant items, so Windows gives it
+/// no caps and hidapi's rebuilt descriptor declares none of its 2052-byte
+/// feature reports. Reads use this buffer (report id plus 2052 bytes) instead.
+const THERMALTAKE_FEATURE_BUFFER_LEN: usize = 2053;
 const RESUME_WATCH_STEP: Duration = Duration::from_secs(2);
 /// A step that overshoots by this much means the machine was suspended.
 const RESUME_GAP_THRESHOLD: Duration = Duration::from_secs(15);
@@ -1037,6 +1042,7 @@ impl HidSession {
                 Ok(length) => length,
                 Err(_) if open.vendor_id == RAZER_VENDOR_ID => RAZER_FEATURE_BUFFER_LEN,
                 Err(_) if open.vendor_id == MICROSOFT_VENDOR_ID => 64,
+                Err(_) if open.vendor_id == THERMALTAKE_VENDOR_ID => THERMALTAKE_FEATURE_BUFFER_LEN,
                 Err(_) => continue,
             };
             available = true;
