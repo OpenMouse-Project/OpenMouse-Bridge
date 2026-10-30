@@ -1,9 +1,7 @@
 name: GPUI build
 
-# Builds the GPUI Bridge as a macOS DMG and a Linux AppImage and uploads them as
-# workflow artifacts, so any push can be downloaded and tried. Windows is added
-# from the Windows machine (see the marked section at the bottom). Publishing a
-# release from these artifacts is a later step; nothing here publishes.
+# Builds the GPUI Bridge for macOS, Linux, and Windows and uploads downloadable
+# workflow artifacts. Publishing a release from these artifacts is a later step.
 on:
   workflow_dispatch:
   push:
@@ -236,17 +234,72 @@ jobs:
             OpenMouse-Bridge-linux-x86_64.AppImage.sha256
           if-no-files-found: error
 
-  # ---------------------------------------------------------------------------
-  # Windows: to be added from the Windows machine.
-  #
-  # Left out on purpose: the Windows side of the GPUI shell (tray icon, panel
-  # placement, hide-to-tray) is written but has never been built or run, so the
-  # job should be added together with what that turns up. It needs to:
-  #   - build on windows-latest;
-  #   - prepare native-hid with the win-x64 Node.js runtime, as ci.yml does;
-  #   - produce the installer (a per-user, no-admin installer is the plan; see
-  #     docs/gpui-migration.md and Desktop's gpui/installer for the approach);
-  #   - sign it when WINDOWS_CERTIFICATE_BASE64 and WINDOWS_CERTIFICATE_PASSWORD
-  #     exist, as release.yml does for the exe;
-  #   - upload it as the `bridge-windows` artifact.
-  # ---------------------------------------------------------------------------
+  windows-zip:
+    name: Windows x64 ZIP
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gpui-windows
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: native-hid/package-lock.json
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: Sign executable
+        if: env.WINDOWS_CERTIFICATE_BASE64 != ''
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $certificate = Join-Path $env:RUNNER_TEMP 'openmouse-bridge.pfx'
+          [IO.File]::WriteAllBytes($certificate, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64))
+          & signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificate /p $env:WINDOWS_CERTIFICATE_PASSWORD target/release/openmouse-bridge.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Signing failed' }
+      - name: Prepare native-hid (deps + bundled Node.js runtime)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm ci --prefix native-hid --omit=dev
+          if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
+          Get-ChildItem native-hid/node_modules/node-hid/prebuilds -Directory |
+            Where-Object { $_.Name -ne 'HID-win32-x64' } |
+            Remove-Item -Recurse -Force
+          Invoke-WebRequest -Uri "https://nodejs.org/dist/$env:NATIVE_HID_NODE_VERSION/node-$env:NATIVE_HID_NODE_VERSION-win-x64.zip" -OutFile node.zip
+          Expand-Archive node.zip -DestinationPath node-extracted
+          New-Item -ItemType Directory -Force -Path native-hid/node | Out-Null
+          Copy-Item "node-extracted/node-$env:NATIVE_HID_NODE_VERSION-win-x64/node.exe" native-hid/node/node.exe
+      - name: Package and verify ZIP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:RUNNER_TEMP 'bridge-windows-package'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target/release/openmouse-bridge.exe, README.md $stage
+          Copy-Item assets/fonts/DM-Sans-OFL.txt $stage
+          Copy-Item native-hid $stage -Recurse
+          Compress-Archive -Path "$stage/*" -DestinationPath OpenMouse-Bridge-windows-x64.zip
+          $verify = Join-Path $env:RUNNER_TEMP 'bridge-windows-verify'
+          Expand-Archive OpenMouse-Bridge-windows-x64.zip -DestinationPath $verify
+          foreach ($path in @('openmouse-bridge.exe', 'native-hid/node/node.exe', 'native-hid/src/apply.mjs', 'DM-Sans-OFL.txt')) {
+            if (-not (Test-Path (Join-Path $verify $path))) { throw "Missing from ZIP: $path" }
+          }
+          (Get-FileHash OpenMouse-Bridge-windows-x64.zip -Algorithm SHA256).Hash.ToLower() + '  OpenMouse-Bridge-windows-x64.zip' | Set-Content OpenMouse-Bridge-windows-x64.zip.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bridge-windows
+          path: |
+            OpenMouse-Bridge-windows-x64.zip
+            OpenMouse-Bridge-windows-x64.zip.sha256
+          if-no-files-found: error
