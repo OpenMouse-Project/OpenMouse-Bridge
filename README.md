@@ -9,9 +9,9 @@
 
 ## Where it stands
 
-GPUI is the only window: there is no other shell. It runs on macOS today; the
-Windows side is written but has never been built or run, and Linux has no tray
-icon yet.
+GPUI is the only window: there is no other shell. CI builds macOS, Linux, and
+Windows artifacts. Windows tray and panel behavior still need testing on a
+Windows desktop; Linux has no tray icon yet.
 
 - [x] A panel in Desktop's dark look with its ASCII background: Home, Settings
       and a Bridge info page, opening beside the tray icon
@@ -23,8 +23,10 @@ icon yet.
 - [x] Updates with an update card and a progress bar
 - [x] First-run behaviour, Escape and the close button hide the panel, the tray
       icon is recreated after sleep, and Bridge relaunches after a crash
-- [ ] Windows: build and run it, then an installer
-- [ ] Linux: a tray icon, and the AppImage
+- [x] Windows: build and test a portable x64 ZIP in CI
+- [ ] Windows: run the tray app on a desktop, then build an installer
+- [x] Linux: build and verify the AppImage in CI
+- [ ] Linux: add a tray icon
 - [ ] The in-app updater with `latest.json`, replacing the zip-swap one
 - [ ] Moving installs of earlier versions across
 
