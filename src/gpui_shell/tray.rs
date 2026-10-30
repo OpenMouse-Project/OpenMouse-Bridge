@@ -9,9 +9,13 @@ use std::sync::{
     mpsc,
 };
 
-use gpui_kit::{AnyWindowHandle, App, AppContext as _, Window};
+use gpui_kit::{AnyWindowHandle, App, Window};
+#[cfg(any(target_os = "macos", windows))]
+use gpui_kit::AppContext as _;
 
-use crate::tray_battery::{self, TrayBattery};
+#[cfg(any(target_os = "macos", windows))]
+use crate::tray_battery;
+use crate::tray_battery::TrayBattery;
 
 /// Where the tray icon was when it was clicked, so the panel opens beside it:
 /// the cursor in logical points with a bottom-left origin on macOS (the click
@@ -80,6 +84,7 @@ impl TrayHandle {
 #[derive(Debug)]
 pub enum Command {
     /// Show the panel, beside the icon when the icon was clicked.
+    #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
     Show(Option<Anchor>),
     // Only the Windows tray has a menu to send these from.
     #[cfg_attr(not(windows), allow(dead_code))]

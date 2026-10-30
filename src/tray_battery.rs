@@ -1,6 +1,7 @@
 //! What the tray icon shows for the connected mouse's battery: which battery,
 //! the colour it is drawn in, the tooltip and the icon.
 
+#[cfg(any(target_os = "macos", windows))]
 use anyhow::{Context, Result};
 use openmouse_bridge::{
     platform::{self, TrayBatteryStyle},
@@ -16,6 +17,7 @@ const MUTED: (u8, u8, u8) = (170, 176, 183);
 
 /// Windows' tooltip buffer tops out at 128 UTF-16 units and device names can be
 /// long, so the tooltip is cut here.
+#[cfg(any(target_os = "macos", windows, test))]
 const TOOLTIP_CHARS: usize = 120;
 
 /// What the tray shows. Comparing two of these is how the shell knows nothing
@@ -93,6 +95,7 @@ pub fn from_snapshot(snapshot: Option<&BridgeSnapshot>) -> Option<TrayBattery> {
     })
 }
 
+#[cfg(any(target_os = "macos", windows, test))]
 pub fn remaining_text(minutes: u32) -> String {
     let days = minutes / (24 * 60);
     let hours = minutes % (24 * 60) / 60;
@@ -107,6 +110,7 @@ pub fn remaining_text(minutes: u32) -> String {
 }
 
 /// `Device — 87% · Charging · full in 45 m`.
+#[cfg(any(target_os = "macos", windows, test))]
 pub fn tooltip(battery: &TrayBattery) -> String {
     let status = match (battery.charging, battery.stale) {
         (true, _) => " · Charging",
@@ -222,6 +226,7 @@ mod tests {
         assert_eq!(tooltip(&long).chars().count(), TOOLTIP_CHARS);
     }
 
+    #[cfg(any(target_os = "macos", windows))]
     #[test]
     fn the_icon_renders_for_both_styles_and_every_state() {
         for style in [TrayBatteryStyle::Glyph, TrayBatteryStyle::Percentage] {
