@@ -110,6 +110,7 @@ export class HidDeviceAdapter {
       device.close();
     }
     this._devices = [];
+    this._featureLengths.clear();
     this.opened = false;
   }
 
@@ -141,7 +142,6 @@ export class HidDeviceAdapter {
   async sendFeatureReport(reportId, data) {
     this._requireOpen();
     const frame = this._frame(reportId, data);
-    this._featureLengths.set(reportId, frame.length);
     let sent = false;
     let lastError;
     for (const device of this._devices) {
@@ -153,6 +153,7 @@ export class HidDeviceAdapter {
       }
     }
     if (!sent) throw lastError ?? new Error("No HID interface accepted the feature report.");
+    this._featureLengths.set(reportId, frame.length);
   }
 
   /**
