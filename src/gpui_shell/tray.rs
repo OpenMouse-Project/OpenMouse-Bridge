@@ -9,9 +9,9 @@ use std::sync::{
     mpsc,
 };
 
-use gpui_kit::{AnyWindowHandle, App, Window};
 #[cfg(any(target_os = "macos", windows))]
 use gpui_kit::AppContext as _;
+use gpui_kit::{AnyWindowHandle, App, Window};
 
 #[cfg(any(target_os = "macos", windows))]
 use crate::tray_battery;
