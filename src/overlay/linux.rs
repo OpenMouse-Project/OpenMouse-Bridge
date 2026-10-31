@@ -438,12 +438,16 @@ impl Speaker {
             tracing::warn!("No audio player (paplay or aplay) for the notification chime");
             return Ok(());
         };
-        if let Some(mut stdin) = child.stdin.take()
-            && stdin.write_all(&wav).is_err()
-        {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Ok(());
+        // The player reads the pipe while it plays, so writing a long sound
+        // here would hold up the caller for as long as the sound lasts. A
+        // separate thread feeds it instead; closing the pipe, or killing the
+        // player, ends that thread.
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = std::thread::Builder::new()
+                .name("chime-writer".into())
+                .spawn(move || {
+                    let _ = stdin.write_all(&wav);
+                });
         }
         self.playback = Some(child);
         Ok(())

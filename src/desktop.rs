@@ -624,6 +624,8 @@ struct TrayApp {
     automatic_updates: bool,
     notification_sound: bool,
     notification_volume: u8,
+    notification_sound_path: String,
+    notification_repeat: u32,
     // While the volume slider is dragged, snapshots would snap it back to the
     // saved value; it is saved once released.
     adjusting_volume: bool,
@@ -693,6 +695,8 @@ impl TrayApp {
             automatic_updates: false,
             notification_sound: true,
             notification_volume: 60,
+            notification_sound_path: String::new(),
+            notification_repeat: 1,
             adjusting_volume: false,
             last_tick: SystemTime::now(),
             panel_requests,
@@ -752,6 +756,8 @@ impl TrayApp {
             self.hybrid_mode = snapshot.hybrid_mode;
             self.automatic_updates = snapshot.automatic_updates;
             self.notification_sound = snapshot.notification_sound;
+            self.notification_sound_path = snapshot.notification_sound_path.clone();
+            self.notification_repeat = snapshot.notification_repeat;
             if !self.adjusting_volume {
                 self.notification_volume = snapshot.notification_volume;
             }
@@ -854,10 +860,20 @@ impl TrayApp {
             volume = self.notification_volume,
             "Showed a notice on the overlay"
         );
-        if self.notification_sound
-            && let Err(error) = overlay.chime(self.notification_volume)
-        {
-            tracing::warn!(%error, "Could not play the notification sound");
+        if self.notification_sound {
+            match overlay.chime(
+                self.notification_volume,
+                self.notification_repeat,
+                &self.notification_sound_path,
+            ) {
+                Ok(None) => {}
+                Ok(Some(problem)) => {
+                    // The built-in chime played instead; say why on the panel.
+                    tracing::warn!(%problem, "Could not use the custom notification sound");
+                    self.last_error = Some(problem);
+                }
+                Err(error) => tracing::warn!(%error, "Could not play the notification sound"),
+            }
         }
     }
 
@@ -2397,6 +2413,8 @@ mod tests {
             automatic_updates: false,
             notification_sound: true,
             notification_volume: 60,
+            notification_sound_path: String::new(),
+            notification_repeat: 1,
             foreground_application: None,
             active_profile: None,
             active_profile_is_default: false,
