@@ -25,6 +25,8 @@ const READ_TIMEOUT_MS: i32 = 100;
 const SHARED_READ_IDLE: std::time::Duration = std::time::Duration::from_millis(2);
 const MICROSOFT_VENDOR_ID: u16 = 0x045E;
 const RAZER_VENDOR_ID: u16 = 0x1532;
+/// Where Linux lists hidraw nodes; each links `device` to its sysfs HID device.
+const HIDRAW_CLASS: &str = "/sys/class/hidraw";
 const RAZER_FEATURE_BUFFER_LEN: usize = 91;
 const RESUME_WATCH_STEP: Duration = Duration::from_secs(2);
 /// A step that overshoots by this much means the machine was suspended.
@@ -223,6 +225,10 @@ struct InputReport {
     #[serde(rename = "type")]
     kind: &'static str,
     device: String,
+    /// Which of the device's HID paths sent the report: the `interface` of its
+    /// top-level collections in the `list` reply. A device grouped from several
+    /// interfaces can send the same report ID from more than one of them.
+    interface: usize,
     #[serde(rename = "reportId")]
     report_id: u8,
     data: Vec<u8>,
@@ -272,6 +278,10 @@ struct DeviceSummary {
 struct CollectionInfo {
     usage_page: u16,
     usage: u16,
+    /// Set on top-level collections: the HID path they belong to, matching the
+    /// `interface` of that path's input reports.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    interface: Option<usize>,
     input_reports: Vec<ReportInfo>,
     output_reports: Vec<ReportInfo>,
     feature_reports: Vec<ReportInfo>,
@@ -350,6 +360,8 @@ struct Candidate {
 }
 
 struct OpenPath {
+    /// The path's index in the candidate, kept when another path fails to open.
+    interface: usize,
     #[cfg(target_os = "windows")]
     path: CString,
     device: Arc<Mutex<HidDevice>>,
@@ -672,9 +684,10 @@ impl HidSession {
             .ok_or_else(|| "the selected HID interface is no longer available".to_owned())?;
         let mut paths = Vec::with_capacity(candidate.paths.len());
         let mut errors = Vec::new();
-        for candidate_path in &candidate.paths {
+        for (interface, candidate_path) in candidate.paths.iter().enumerate() {
             match self.api.open_path(&candidate_path.path) {
                 Ok(device) => paths.push(OpenPath {
+                    interface,
                     #[cfg(target_os = "windows")]
                     path: candidate_path.path.clone(),
                     device: Arc::new(Mutex::new(device)),
@@ -841,6 +854,7 @@ impl HidSession {
                     #[cfg(not(target_os = "windows"))]
                     let device = ReaderHandle::Shared(Arc::clone(&path.device));
                     Ok((
+                        path.interface,
                         device,
                         path.layout.input_buffer_len(),
                         path.layout.input_uses_report_ids(),
@@ -857,12 +871,12 @@ impl HidSession {
         // Stored before any reader starts, so a later spawn failure can stop and
         // join the readers already running instead of leaving them to block cleanup.
         open.stop = Some(Arc::clone(&stop));
-        for (index, (device, buffer_len, uses_report_ids)) in reader_specs.into_iter().enumerate() {
+        for (interface, device, buffer_len, uses_report_ids) in reader_specs {
             let thread_stop = Arc::clone(&stop);
             let tx = self.input_tx.clone();
             let device_key = key.to_owned();
             let reader = thread::Builder::new()
-                .name(format!("openmouse-hid-{key}-{index}"))
+                .name(format!("openmouse-hid-{key}-{interface}"))
                 .spawn(move || {
                     let mut buffer = vec![0; buffer_len];
                     while !thread_stop.load(Ordering::Acquire) {
@@ -878,6 +892,7 @@ impl HidSession {
                                     .send(InputReport {
                                         kind: "inputreport",
                                         device: device_key.clone(),
+                                        interface,
                                         report_id,
                                         data,
                                     })
@@ -890,7 +905,7 @@ impl HidSession {
                             Err(error) => {
                                 tracing::warn!(
                                     device = %device_key,
-                                    interface = index,
+                                    interface,
                                     %error,
                                     "Native HID input reader stopped"
                                 );
@@ -1093,11 +1108,13 @@ fn report_payload(data: &[u8], size: usize) -> Vec<u8> {
         .to_vec()
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 fn grouped_device_key(
     vendor_id: u16,
     product_id: u16,
     path: &[u8],
     serial: Option<&str>,
+    hidraw_class: &std::path::Path,
 ) -> Vec<u8> {
     // A serial is a verified physical identity, so every collection of that
     // device is one candidate. Without one, Windows collections group by their
@@ -1106,7 +1123,7 @@ fn grouped_device_key(
     let serial = serial.filter(|serial| !serial.is_empty());
     let parent = collection_interface(path).map(|interface| (2, interface));
     #[cfg(target_os = "linux")]
-    let parent = parent.or_else(|| hidraw_usb_device(path).map(|device| (3, device)));
+    let parent = parent.or_else(|| hidraw_usb_device(hidraw_class, path).map(|device| (3, device)));
     let (kind, identity) = match (serial, &parent) {
         (Some(serial), _) => (1, serial.as_bytes()),
         (None, Some((kind, parent))) => (*kind, parent.as_bytes()),
@@ -1127,6 +1144,7 @@ fn device_group_key(info: &hidapi::DeviceInfo) -> Vec<u8> {
         info.product_id(),
         info.path().to_bytes(),
         info.serial_number(),
+        std::path::Path::new(HIDRAW_CLASS),
     )
 }
 
@@ -1166,15 +1184,13 @@ fn collection_interface(path: &[u8]) -> Option<String> {
 /// interfaces into one candidate, as Chromium's WebHID does. Bluetooth and
 /// virtual (uhid) nodes have no USB interface above them and stay apart.
 #[cfg(target_os = "linux")]
-fn hidraw_usb_device(path: &[u8]) -> Option<String> {
+fn hidraw_usb_device(hidraw_class: &std::path::Path, path: &[u8]) -> Option<String> {
     use std::os::unix::ffi::OsStrExt;
     let node = std::path::Path::new(std::ffi::OsStr::from_bytes(path)).file_name()?;
     if !node.as_bytes().starts_with(b"hidraw") {
         return None;
     }
-    let device = std::path::Path::new("/sys/class/hidraw")
-        .join(node)
-        .join("device");
+    let device = hidraw_class.join(node).join("device");
     usb_device_above(&std::fs::canonicalize(device).ok()?)
 }
 
@@ -1204,6 +1220,8 @@ fn inspect_candidate(
             unique_paths.push(info.path().to_owned());
         }
     }
+    // Sorted so a path keeps its `interface` index across enumerations.
+    unique_paths.sort();
 
     // Opening every Razer path to read its descriptor is too slow on Windows.
     // Linux hidraw opens are cheap, and its grouped USB interfaces need the
@@ -1211,7 +1229,7 @@ fn inspect_candidate(
     let inspect_descriptors = cfg!(target_os = "linux") || primary.vendor_id() != RAZER_VENDOR_ID;
     let mut collections = Vec::new();
     let mut paths = Vec::with_capacity(unique_paths.len());
-    for path in unique_paths {
+    for (interface, path) in unique_paths.into_iter().enumerate() {
         let parsed = inspect_descriptors
             .then(|| {
                 api.open_path(&path).ok().and_then(|device| {
@@ -1221,8 +1239,15 @@ fn inspect_candidate(
                 })
             })
             .flatten();
-        let layout = if let Some((mut path_collections, path_layout)) = parsed {
-            collections.append(&mut path_collections);
+        let layout = if let Some((path_collections, path_layout)) = parsed {
+            collections.extend(
+                path_collections
+                    .into_iter()
+                    .map(|collection| CollectionInfo {
+                        interface: Some(interface),
+                        ..collection
+                    }),
+            );
             path_layout
         } else {
             collections.extend(
@@ -1232,6 +1257,7 @@ fn inspect_candidate(
                     .map(|info| CollectionInfo {
                         usage_page: info.usage_page(),
                         usage: info.usage(),
+                        interface: Some(interface),
                         ..CollectionInfo::default()
                     }),
             );
@@ -1638,6 +1664,7 @@ mod tests {
         let report = || InputReport {
             kind: "inputreport",
             device: "fake".into(),
+            interface: 0,
             report_id: 1,
             data: vec![7],
         };
@@ -1709,62 +1736,118 @@ mod tests {
     #[test]
     fn opaque_interfaces_do_not_merge_without_verified_physical_identity() {
         assert_ne!(
-            grouped_device_key(0x046d, 0xc54d, b"opaque-A", None),
-            grouped_device_key(0x046d, 0xc54d, b"opaque-B", None)
+            grouped_device_key(0x046d, 0xc54d, b"opaque-A", None, NO_SYSFS.as_ref()),
+            grouped_device_key(0x046d, 0xc54d, b"opaque-B", None, NO_SYSFS.as_ref())
         );
         assert_eq!(
-            grouped_device_key(0x046d, 0xc54d, b"opaque-A", None),
-            grouped_device_key(0x046d, 0xc54d, b"opaque-A", None)
+            grouped_device_key(0x046d, 0xc54d, b"opaque-A", None, NO_SYSFS.as_ref()),
+            grouped_device_key(0x046d, 0xc54d, b"opaque-A", None, NO_SYSFS.as_ref())
         );
         assert_ne!(
-            grouped_device_key(0x046d, 0xc54d, b"opaque-A", None),
-            grouped_device_key(0x1532, 0xc54d, b"opaque-A", None)
+            grouped_device_key(0x046d, 0xc54d, b"opaque-A", None, NO_SYSFS.as_ref()),
+            grouped_device_key(0x1532, 0xc54d, b"opaque-A", None, NO_SYSFS.as_ref())
         );
         assert_ne!(
-            grouped_device_key(0x046d, 0xc54d, b"opaque-A", Some("")),
-            grouped_device_key(0x046d, 0xc54d, b"opaque-B", Some("")),
+            grouped_device_key(0x046d, 0xc54d, b"opaque-A", Some(""), NO_SYSFS.as_ref()),
+            grouped_device_key(0x046d, 0xc54d, b"opaque-B", Some(""), NO_SYSFS.as_ref()),
             "an empty serial is no identity"
         );
     }
 
+    /// A sysfs root that does not exist, so no path resolves to a USB device.
+    const NO_SYSFS: &str = "/nonexistent/openmouse-sysfs";
+
     #[cfg(target_os = "linux")]
     #[test]
-    fn hidraw_interfaces_resolve_to_their_usb_device() {
+    fn hidraw_nodes_of_one_usb_device_group_together() {
         let root = std::env::temp_dir().join(format!("openmouse-sysfs-{}", std::process::id()));
-        let usb_device = root.join("usb7/7-2");
-        let hid = |interface: &str, node: &str| {
-            let interface = usb_device.join(interface);
-            std::fs::create_dir_all(interface.join(node)).unwrap();
-            std::fs::write(interface.join("bInterfaceNumber"), "00\n").unwrap();
-            interface.join(node)
+        let class = root.join("class/hidraw");
+        let node = |name: &str, hid_device: std::path::PathBuf| {
+            std::fs::create_dir_all(&hid_device).unwrap();
+            std::fs::create_dir_all(class.join(name)).unwrap();
+            std::os::unix::fs::symlink(&hid_device, class.join(name).join("device")).unwrap();
         };
-        let mouse = hid("7-2:1.0", "0003:1532:00A7.0001");
-        let keyboard = hid("7-2:1.1", "0003:1532:00A7.0002");
-        let bluetooth = root.join("hci0/hci0:256/0005:1532:00A7.0003");
-        std::fs::create_dir_all(&bluetooth).unwrap();
+        let usb_interface = |device: &str, interface: &str| {
+            let interface = root.join("devices/usb7").join(device).join(interface);
+            std::fs::create_dir_all(&interface).unwrap();
+            std::fs::write(interface.join("bInterfaceNumber"), "00\n").unwrap();
+            interface
+        };
+        node(
+            "hidraw0",
+            usb_interface("7-2", "7-2:1.0").join("0003:1532:00A7.0001"),
+        );
+        node(
+            "hidraw1",
+            usb_interface("7-2", "7-2:1.1").join("0003:1532:00A7.0002"),
+        );
+        node(
+            "hidraw2",
+            usb_interface("7-3", "7-3:1.0").join("0003:1532:00A7.0003"),
+        );
+        node(
+            "hidraw3",
+            root.join("devices/hci0/hci0:256/0005:1532:00A7.0004"),
+        );
+        node(
+            "hidraw4",
+            root.join("devices/hci0/hci0:257/0005:1532:00A7.0005"),
+        );
+        let key = |path: &[u8]| grouped_device_key(0x1532, 0x00a7, path, None, &class);
 
-        let expected = usb_device.to_str().map(str::to_owned);
-        assert_eq!(usb_device_above(&mouse), expected);
-        assert_eq!(usb_device_above(&keyboard), expected);
-        assert_eq!(usb_device_above(&bluetooth), None);
-        assert_eq!(hidraw_usb_device(b"/dev/not-hidraw"), None);
+        assert_eq!(key(b"/dev/hidraw0"), key(b"/dev/hidraw1"), "one USB device");
+        assert_ne!(
+            key(b"/dev/hidraw0"),
+            key(b"/dev/hidraw2"),
+            "two identical mice"
+        );
+        assert_ne!(key(b"/dev/hidraw3"), key(b"/dev/hidraw4"), "no USB parent");
+        assert_ne!(
+            key(b"/dev/hidraw0"),
+            grouped_device_key(0x1532, 0x00a7, b"/dev/hidraw0", None, NO_SYSFS.as_ref()),
+            "a USB identity is not a path identity"
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn collections_of_one_serial_bearing_device_group_together() {
         assert_eq!(
-            grouped_device_key(0x1532, 0x00b0, b"col01", Some("receiver-123")),
-            grouped_device_key(0x1532, 0x00b0, b"col02", Some("receiver-123"))
+            grouped_device_key(
+                0x1532,
+                0x00b0,
+                b"col01",
+                Some("receiver-123"),
+                NO_SYSFS.as_ref()
+            ),
+            grouped_device_key(
+                0x1532,
+                0x00b0,
+                b"col02",
+                Some("receiver-123"),
+                NO_SYSFS.as_ref()
+            )
         );
         assert_ne!(
-            grouped_device_key(0x1532, 0x00b0, b"col01", Some("receiver-123")),
-            grouped_device_key(0x1532, 0x00b0, b"col01", Some("receiver-456"))
+            grouped_device_key(
+                0x1532,
+                0x00b0,
+                b"col01",
+                Some("receiver-123"),
+                NO_SYSFS.as_ref()
+            ),
+            grouped_device_key(
+                0x1532,
+                0x00b0,
+                b"col01",
+                Some("receiver-456"),
+                NO_SYSFS.as_ref()
+            )
         );
         // A serial that happens to equal another device's path is still a different identity.
         assert_ne!(
-            grouped_device_key(0x1532, 0x00b0, b"same", Some("same")),
-            grouped_device_key(0x1532, 0x00b0, b"same", None)
+            grouped_device_key(0x1532, 0x00b0, b"same", Some("same"), NO_SYSFS.as_ref()),
+            grouped_device_key(0x1532, 0x00b0, b"same", None, NO_SYSFS.as_ref())
         );
     }
 

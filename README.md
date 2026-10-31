@@ -195,7 +195,11 @@ enumeration details.
   can also be removed from the native panel's connection details.
 - `GET /v1/hid` upgrades to the native HID WebSocket transport. It enumerates
   only vendor IDs requested by OpenMouse, reports parsed HID collections, and
-  supports open, close, input, output, and feature-report operations. This lets
+  supports open, close, input, output, and feature-report operations. A device
+  whose interfaces share a serial or a parent (a Windows HID interface or a
+  Linux USB device) is listed once; each top-level collection and each
+  `inputreport` carries an `interface` index so reports with the same ID from
+  different interfaces stay distinguishable. This lets
   the existing `@openmouse/protocol` drivers run unchanged when WebHID is absent
   or blocks a protected collection.
 
