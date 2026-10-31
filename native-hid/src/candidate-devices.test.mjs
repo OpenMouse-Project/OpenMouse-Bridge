@@ -48,6 +48,17 @@ test("the Scyrox entry opens only the dongle's 0xff02 collection", () => {
   assert.equal(adapters[0].productId, 0xf517);
 });
 
+// src/drivers/mod.rs routes 0xf515 and 0xf517 to "Scyrox"; 0xf5f7 joins this
+// list with the mouse-protocol release that adds it to SCYROX_PRODUCT_IDS.
+test("each product Rust routes to Scyrox reaches the Scyrox entry", () => {
+  for (const productId of [0xf515, 0xf517]) {
+    const adapters = candidateDevices(0x3554, BRAND_DRIVERS.scyrox, () =>
+      WINDOWS_DONGLE.map((info) => ({ ...info, productId })),
+    );
+    assert.deepEqual(adapters.map((adapter) => adapter.productId), [productId]);
+  }
+});
+
 test("a product the entry does not list is left out", () => {
   const adapters = candidateDevices(0x3554, { productIds: [0xf515] }, () => [...WINDOWS_DONGLE, TERRA_PRO]);
   assert.deepEqual(adapters, []);
