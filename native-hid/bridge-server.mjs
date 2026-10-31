@@ -36,7 +36,7 @@ async function probeForBrand(brand) {
   const entry = BRAND_DRIVERS[brandKey(brand)];
   if (!entry) return null;
   for (const vendorId of entry.vendorIds) {
-    for (const device of candidateDevices(vendorId)) {
+    for (const device of candidateDevices(vendorId, entry)) {
       for (const candidate of entry.classes) {
         try {
           const client = await probe(device, candidate);
