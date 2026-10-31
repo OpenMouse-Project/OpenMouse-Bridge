@@ -1156,6 +1156,14 @@ impl BridgeService {
         .await
     }
 
+    pub async fn set_notification_repeat(&self, count: u32) -> Result<()> {
+        self.update_config(|config| {
+            config.notification_repeat = count;
+            Ok(())
+        })
+        .await
+    }
+
     /// Forgets a lingering battery entry so a dead device leaves the list.
     /// Returns whether an entry was removed.
     pub async fn forget_battery(&self, device_id: &str) -> bool {

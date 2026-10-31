@@ -110,7 +110,8 @@ release API endpoint.
 
 Notifications play a built-in two-note chime once. Two optional settings in
 `config.json` change that (quit Bridge before editing the file, then start it
-again):
+again). The repeat count can also be chosen in the tray panel under
+Settings > Notifications > Notification repeat (1 to 5).
 
 - `notificationRepeat` is how many times in a row the sound plays, from 1 to 10
   (default 1; other values are clamped into that range).
