@@ -648,6 +648,12 @@ pub struct BridgeSnapshot {
     pub automatic_updates: bool,
     pub notification_sound: bool,
     pub notification_volume: u8,
+    /// Read from `config.json` for the tray app only; kept out of
+    /// `GET /v1/status` so a local file path is not sent to web pages.
+    #[serde(skip)]
+    pub notification_sound_path: String,
+    #[serde(skip)]
+    pub notification_repeat: u32,
     pub foreground_application: Option<ApplicationInfo>,
     pub active_profile: Option<ApplicationProfile>,
     pub active_profile_is_default: bool,
@@ -859,6 +865,8 @@ impl BridgeService {
             automatic_updates: state.config.automatic_updates,
             notification_sound: state.config.notification_sound,
             notification_volume: state.config.notification_volume,
+            notification_sound_path: state.config.notification_sound_path.clone(),
+            notification_repeat: state.config.notification_repeat,
             foreground_application,
             active_profile,
             active_profile_is_default,
@@ -1143,6 +1151,14 @@ impl BridgeService {
     pub async fn set_notification_volume(&self, percent: u8) -> Result<()> {
         self.update_config(|config| {
             config.notification_volume = percent;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn set_notification_repeat(&self, count: u32) -> Result<()> {
+        self.update_config(|config| {
+            config.notification_repeat = count;
             Ok(())
         })
         .await

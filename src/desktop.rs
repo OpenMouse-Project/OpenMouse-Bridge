@@ -138,6 +138,9 @@ const WINDOW_HEIGHT: f32 = 280.0;
 
 use crate::native_ui::{ACCENT, BACKGROUND, DANGER, DIVIDER, MUTED, ROW_HEIGHT, TEXT, WARNING};
 const BATTERY_THRESHOLDS: [u8; 7] = [10, 15, 20, 25, 30, 40, 50];
+/// What the panel offers for how often a notification sound repeats;
+/// `notificationRepeat` in `config.json` accepts up to ten.
+const NOTIFICATION_REPEATS: [u32; 5] = [1, 2, 3, 4, 5];
 /// Glow/winit often tear down after Windows hibernate. If the tray loop ends
 /// without an Exit or in-app update, spawn a replacement (issue #16).
 const RELAUNCH_ENV: &str = "OPENMOUSE_BRIDGE_RELAUNCH";
@@ -307,6 +310,7 @@ enum BridgeCommand {
     SetBatteryThreshold(u8),
     SetNotificationSound(bool),
     SetNotificationVolume(u8),
+    SetNotificationRepeat(u32),
     SetAutomaticUpdates(bool),
     SetHybridMode(bool),
     SetTrayBatteryStyle(platform::TrayBatteryStyle),
@@ -624,6 +628,8 @@ struct TrayApp {
     automatic_updates: bool,
     notification_sound: bool,
     notification_volume: u8,
+    notification_sound_path: String,
+    notification_repeat: u32,
     // While the volume slider is dragged, snapshots would snap it back to the
     // saved value; it is saved once released.
     adjusting_volume: bool,
@@ -693,6 +699,8 @@ impl TrayApp {
             automatic_updates: false,
             notification_sound: true,
             notification_volume: 60,
+            notification_sound_path: String::new(),
+            notification_repeat: 1,
             adjusting_volume: false,
             last_tick: SystemTime::now(),
             panel_requests,
@@ -752,6 +760,8 @@ impl TrayApp {
             self.hybrid_mode = snapshot.hybrid_mode;
             self.automatic_updates = snapshot.automatic_updates;
             self.notification_sound = snapshot.notification_sound;
+            self.notification_sound_path = snapshot.notification_sound_path.clone();
+            self.notification_repeat = snapshot.notification_repeat;
             if !self.adjusting_volume {
                 self.notification_volume = snapshot.notification_volume;
             }
@@ -854,10 +864,20 @@ impl TrayApp {
             volume = self.notification_volume,
             "Showed a notice on the overlay"
         );
-        if self.notification_sound
-            && let Err(error) = overlay.chime(self.notification_volume)
-        {
-            tracing::warn!(%error, "Could not play the notification sound");
+        if self.notification_sound {
+            match overlay.chime(
+                self.notification_volume,
+                self.notification_repeat,
+                &self.notification_sound_path,
+            ) {
+                Ok(None) => {}
+                Ok(Some(problem)) => {
+                    // The built-in chime played instead; say why on the panel.
+                    tracing::warn!(%problem, "Could not use the custom notification sound");
+                    self.last_error = Some(problem);
+                }
+                Err(error) => tracing::warn!(%error, "Could not play the notification sound"),
+            }
         }
     }
 
@@ -1369,6 +1389,43 @@ impl TrayApp {
                             BridgeCommand::SetNotificationVolume(self.notification_volume),
                             "Volume setting could not be sent",
                         );
+                    }
+                    divider(ui);
+                    let mut repeat = self.notification_repeat;
+                    row(ui, "Notification repeat", |ui| {
+                        ui.add_enabled_ui(self.notification_sound, |ui| {
+                            let choice = egui::ComboBox::from_id_salt("notification-repeat")
+                                .width(62.0)
+                                .selected_text(format!("{repeat}x"))
+                                .show_ui(ui, |ui| {
+                                    for count in NOTIFICATION_REPEATS {
+                                        if ui
+                                            .selectable_value(&mut repeat, count, format!("{count}x"))
+                                            .clicked()
+                                        {
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                            choice.response.widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::WidgetType::ComboBox,
+                                    ui.is_enabled(),
+                                    "Notification repeat",
+                                )
+                            });
+                            choice
+                                .response
+                                .on_hover_text("How many times the notification sound plays.");
+                        });
+                    });
+                    if repeat != self.notification_repeat
+                        && self.send_command(
+                            BridgeCommand::SetNotificationRepeat(repeat),
+                            "Repeat setting could not be sent",
+                        )
+                    {
+                        self.notification_repeat = repeat;
                     }
                     divider(ui);
                     let mut test = false;
@@ -1933,6 +1990,11 @@ fn run_server(
                             tracing::error!(%error, "could not save Bridge settings");
                         }
                     }
+                    BridgeCommand::SetNotificationRepeat(count) => {
+                        if let Err(error) = command_service.set_notification_repeat(count).await {
+                            tracing::error!(%error, "could not save Bridge settings");
+                        }
+                    }
                     BridgeCommand::SetAutomaticUpdates(enabled) => {
                         match command_service.set_automatic_updates(enabled).await {
                             Ok(()) if enabled => check_for_updates(true, &update_events).await,
@@ -2339,6 +2401,16 @@ mod tests {
     }
 
     #[test]
+    fn the_panel_offers_one_to_five_repeats_within_the_config_limit() {
+        assert_eq!(NOTIFICATION_REPEATS, [1, 2, 3, 4, 5]);
+        assert!(
+            NOTIFICATION_REPEATS
+                .iter()
+                .all(|count| (1..=config::MAX_NOTIFICATION_REPEAT).contains(count))
+        );
+    }
+
+    #[test]
     fn device_summary_rows_grow_the_home_view() {
         assert_eq!(panel_height(View::Home, false, false, false, true), 302.0);
         assert_eq!(panel_height(View::Home, false, true, false, true), 320.0);
@@ -2397,6 +2469,8 @@ mod tests {
             automatic_updates: false,
             notification_sound: true,
             notification_volume: 60,
+            notification_sound_path: String::new(),
+            notification_repeat: 1,
             foreground_application: None,
             active_profile: None,
             active_profile_is_default: false,

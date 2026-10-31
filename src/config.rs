@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 const DEFAULT_BATTERY_THRESHOLD: u8 = 20;
 const DEFAULT_ALERT_COOLDOWN_MINUTES: u64 = 360;
 const DEFAULT_NOTIFICATION_VOLUME: u8 = 60;
+const DEFAULT_NOTIFICATION_REPEAT: u32 = 1;
+/// The most times a notification sound repeats (`notificationRepeat`).
+pub const MAX_NOTIFICATION_REPEAT: u32 = 10;
 const OFFICIAL_ORIGINS: &[&str] = &[
     "https://control.openmouse.app",
     "https://dev.openmouse.app",
@@ -28,6 +31,13 @@ pub struct BridgeConfig {
     pub notification_sound: bool,
     #[serde(default = "default_notification_volume")]
     pub notification_volume: u8,
+    /// A `.wav` file to play instead of the built-in chime; empty keeps the
+    /// chime. A bare file name is looked up beside `config.json`.
+    #[serde(default)]
+    pub notification_sound_path: String,
+    /// How many times in a row the notification sound plays (1–10).
+    #[serde(default = "default_notification_repeat")]
+    pub notification_repeat: u32,
     /// What the tray battery icon shows: `"glyph"` (the native battery icon)
     /// or `"percentage"` (just the number). Other values read as `"glyph"`.
     #[serde(default = "default_tray_battery_style")]
@@ -195,6 +205,8 @@ impl Default for BridgeConfig {
             automatic_updates: false,
             notification_sound: true,
             notification_volume: DEFAULT_NOTIFICATION_VOLUME,
+            notification_sound_path: String::new(),
+            notification_repeat: DEFAULT_NOTIFICATION_REPEAT,
             tray_battery_style: default_tray_battery_style(),
             hybrid_mode: true,
             games: Vec::new(),
@@ -213,6 +225,14 @@ impl BridgeConfig {
     pub fn normalized(mut self) -> Self {
         self.battery_threshold_percent = self.battery_threshold_percent.min(100);
         self.notification_volume = self.notification_volume.min(100);
+        self.notification_repeat = self.notification_repeat.clamp(1, MAX_NOTIFICATION_REPEAT);
+        // Quotes pasted around a path are not part of it.
+        self.notification_sound_path = self
+            .notification_sound_path
+            .trim()
+            .trim_matches('"')
+            .trim()
+            .to_owned();
         self.alert_cooldown_minutes = self.alert_cooldown_minutes.max(1);
         // Only the two known tray styles are honored; anything else (a
         // hand-edited config, an older panel) reads as the default glyph.
@@ -443,6 +463,10 @@ const fn default_notification_volume() -> u8 {
     DEFAULT_NOTIFICATION_VOLUME
 }
 
+const fn default_notification_repeat() -> u32 {
+    DEFAULT_NOTIFICATION_REPEAT
+}
+
 fn default_tray_battery_style() -> String {
     "glyph".to_owned()
 }
@@ -604,6 +628,8 @@ mod tests {
             automatic_updates: false,
             notification_sound: true,
             notification_volume: 180,
+            notification_sound_path: "  \"sounds/ding.wav\"  ".to_owned(),
+            notification_repeat: 99,
             custom_games: Vec::new(),
             tray_battery_style: " percentage ".to_owned(),
             hybrid_mode: true,
@@ -618,6 +644,8 @@ mod tests {
         assert_eq!(config.battery_threshold_percent, 100);
         assert_eq!(config.alert_cooldown_minutes, 1);
         assert_eq!(config.notification_volume, 100);
+        assert_eq!(config.notification_repeat, MAX_NOTIFICATION_REPEAT);
+        assert_eq!(config.notification_sound_path, "sounds/ding.wav");
         assert_eq!(config.tray_battery_style, "percentage");
         let valorant = config
             .games
@@ -655,6 +683,26 @@ mod tests {
             .collect();
         assert_eq!(names, ["Valorant", "My Game"]);
         assert_eq!(config.custom_games[0].executables, ["mygame.exe"]);
+    }
+
+    #[test]
+    fn notification_sound_settings_default_to_the_built_in_chime_played_once() {
+        let config: BridgeConfig = serde_json::from_str("{}").expect("empty config parses");
+        assert_eq!(config.notification_sound_path, "");
+        assert_eq!(config.notification_repeat, 1);
+
+        let json = r#"{"notificationSoundPath":"C:/Sounds/ding.wav","notificationRepeat":3}"#;
+        let config: BridgeConfig = serde_json::from_str(json).expect("custom sound parses");
+        let config = config.normalized();
+        assert_eq!(config.notification_sound_path, "C:/Sounds/ding.wav");
+        assert_eq!(config.notification_repeat, 3);
+        let saved = serde_json::to_value(&config).unwrap();
+        assert_eq!(saved["notificationSoundPath"], "C:/Sounds/ding.wav");
+        assert_eq!(saved["notificationRepeat"], 3);
+
+        let zero: BridgeConfig =
+            serde_json::from_str(r#"{"notificationRepeat":0}"#).expect("zero parses");
+        assert_eq!(zero.normalized().notification_repeat, 1);
     }
 
     #[test]

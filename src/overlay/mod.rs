@@ -17,7 +17,10 @@ mod platform;
 #[path = "linux.rs"]
 mod platform;
 
-use std::time::{Duration, Instant};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 
@@ -48,9 +51,29 @@ impl Overlay {
         Ok(())
     }
 
-    /// Plays the chime at `volume` (0–100), cutting off one still playing.
-    pub fn chime(&mut self, volume: u8) -> Result<()> {
-        self.speaker.play(chime::wav(volume))
+    /// Plays the notification sound at `volume` (0–100), `repeats` times in a
+    /// row, cutting off one still playing. It is the `.wav` file at
+    /// `sound_path` (a bare name is looked up beside `config.json`) or, when
+    /// that is empty, the built-in chime. If the file cannot be used the chime
+    /// plays instead and the reason comes back as `Some`.
+    pub fn chime(&mut self, volume: u8, repeats: u32, sound_path: &str) -> Result<Option<String>> {
+        let mut problem = None;
+        let mut wav = None;
+        if !sound_path.trim().is_empty() {
+            let config_dir: Option<PathBuf> = openmouse_bridge::config::config_path()
+                .ok()
+                .and_then(|path| path.parent().map(Path::to_path_buf));
+            let path = chime::resolve_sound_path(sound_path, config_dir.as_deref());
+            match chime::custom_wav(&path, volume, repeats) {
+                Ok(bytes) => wav = Some(bytes),
+                Err(reason) => {
+                    problem = Some(format!("Notification sound not used: {reason}"));
+                }
+            }
+        }
+        let wav = wav.unwrap_or_else(|| chime::wav(volume, repeats));
+        self.speaker.play(wav)?;
+        Ok(problem)
     }
 
     /// Advances the fade in, hold and fade out. Returns how soon it needs the
