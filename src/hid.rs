@@ -1150,8 +1150,10 @@ fn device_group_key(info: &hidapi::DeviceInfo) -> Vec<u8> {
 
 /// The paths to try for a report, in order: those whose descriptor declares it,
 /// or every path when none does (Razer descriptors are not parsed outside
-/// Linux). The sender
-/// stops at the first path that takes the report.
+/// Linux). The sender stops at the first path that takes the report. Unlike a
+/// feature read, a send never falls back to an undeclared path once one
+/// declares the report: a hidraw node can accept a report its descriptor
+/// lacks, so the fallback could deliver a command to the wrong interface.
 fn report_paths(layouts: &[&ReportLayout], report_id: u8, feature: bool) -> Vec<usize> {
     let declares = |layout: &ReportLayout| {
         if feature {
@@ -1179,30 +1181,60 @@ fn collection_interface(path: &[u8]) -> Option<String> {
     Some(format!("{hardware}#{parent}"))
 }
 
-/// The sysfs path of the USB device a hidraw node belongs to. Each USB HID
-/// interface gets its own hidraw node, so this is what joins a mouse's
-/// interfaces into one candidate, as Chromium's WebHID does. Bluetooth and
-/// virtual (uhid) nodes have no USB interface above them and stay apart.
+/// The sysfs USB interface (the directory that has `bInterfaceNumber`) a hidraw
+/// node's HID device sits directly in. Bluetooth, virtual (uhid), and
+/// receiver-paired devices sit deeper, under an adapter or receiver that may
+/// itself be a USB interface, so they have none and stay apart.
 #[cfg(target_os = "linux")]
-fn hidraw_usb_device(hidraw_class: &std::path::Path, path: &[u8]) -> Option<String> {
+fn hidraw_usb_interface(hidraw_class: &std::path::Path, path: &[u8]) -> Option<std::path::PathBuf> {
     use std::os::unix::ffi::OsStrExt;
     let node = std::path::Path::new(std::ffi::OsStr::from_bytes(path)).file_name()?;
     if !node.as_bytes().starts_with(b"hidraw") {
         return None;
     }
-    let device = hidraw_class.join(node).join("device");
-    usb_device_above(&std::fs::canonicalize(device).ok()?)
+    let hid_device = std::fs::canonicalize(hidraw_class.join(node).join("device")).ok()?;
+    let interface = hid_device.parent()?;
+    interface
+        .join("bInterfaceNumber")
+        .is_file()
+        .then(|| interface.to_owned())
 }
 
-/// The USB device directory above a sysfs HID device: the parent of the
-/// nearest USB interface (the directory that has `bInterfaceNumber`).
+/// The sysfs path of the USB device a hidraw node belongs to. Each USB HID
+/// interface gets its own hidraw node, so this is what joins a mouse's
+/// interfaces into one candidate, as Chromium's WebHID does.
 #[cfg(target_os = "linux")]
-fn usb_device_above(hid_device: &std::path::Path) -> Option<String> {
-    let interface = hid_device
-        .ancestors()
-        .skip(1)
-        .find(|dir| dir.join("bInterfaceNumber").is_file())?;
-    interface.parent()?.to_str().map(str::to_owned)
+fn hidraw_usb_device(hidraw_class: &std::path::Path, path: &[u8]) -> Option<String> {
+    hidraw_usb_interface(hidraw_class, path)?
+        .parent()?
+        .to_str()
+        .map(str::to_owned)
+}
+
+/// The USB interface number of a hidraw node, which, unlike the node's own
+/// number, survives a replug.
+#[cfg(target_os = "linux")]
+fn hidraw_interface_number(hidraw_class: &std::path::Path, path: &[u8]) -> Option<u8> {
+    let interface = hidraw_usb_interface(hidraw_class, path)?;
+    let number = std::fs::read_to_string(interface.join("bInterfaceNumber")).ok()?;
+    u8::from_str_radix(number.trim(), 16).ok()
+}
+
+/// Orders a candidate's paths so each keeps its `interface` index across
+/// enumerations. Linux hidraw nodes go by USB interface number: the kernel
+/// renumbers nodes on replug, and `hidraw10` sorts before `hidraw9`. Anything
+/// else, including a tie, goes by path.
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+fn sort_candidate_paths(paths: &mut [CString], hidraw_class: &std::path::Path) {
+    #[cfg(target_os = "linux")]
+    paths.sort_by_cached_key(|path| {
+        (
+            hidraw_interface_number(hidraw_class, path.to_bytes()),
+            path.clone(),
+        )
+    });
+    #[cfg(not(target_os = "linux"))]
+    paths.sort();
 }
 
 fn inspect_candidate(
@@ -1220,8 +1252,7 @@ fn inspect_candidate(
             unique_paths.push(info.path().to_owned());
         }
     }
-    // Sorted so a path keeps its `interface` index across enumerations.
-    unique_paths.sort();
+    sort_candidate_paths(&mut unique_paths, std::path::Path::new(HIDRAW_CLASS));
 
     // Opening every Razer path to read its descriptor is too slow on Windows.
     // Linux hidraw opens are cheap, and its grouped USB interfaces need the
@@ -1759,53 +1790,87 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn hidraw_nodes_of_one_usb_device_group_together() {
+    fn hidraw_nodes_group_and_order_by_usb_interface() {
         let root = std::env::temp_dir().join(format!("openmouse-sysfs-{}", std::process::id()));
+        // A failed run, or an earlier process with this id, can leave a tree behind.
+        let _ = std::fs::remove_dir_all(&root);
         let class = root.join("class/hidraw");
         let node = |name: &str, hid_device: std::path::PathBuf| {
             std::fs::create_dir_all(&hid_device).unwrap();
             std::fs::create_dir_all(class.join(name)).unwrap();
             std::os::unix::fs::symlink(&hid_device, class.join(name).join("device")).unwrap();
         };
-        let usb_interface = |device: &str, interface: &str| {
-            let interface = root.join("devices/usb7").join(device).join(interface);
+        let usb_interface = |interface: &str, number: &str| {
+            let interface = root.join("devices/usb7").join(interface);
             std::fs::create_dir_all(&interface).unwrap();
-            std::fs::write(interface.join("bInterfaceNumber"), "00\n").unwrap();
+            std::fs::write(interface.join("bInterfaceNumber"), format!("{number}\n")).unwrap();
             interface
         };
+        // The kernel numbers nodes in probe order, not interface order.
         node(
-            "hidraw0",
-            usb_interface("7-2", "7-2:1.0").join("0003:1532:00A7.0001"),
+            "hidraw10",
+            usb_interface("7-2/7-2:1.0", "00").join("0003:1532:00A7.0001"),
         );
         node(
-            "hidraw1",
-            usb_interface("7-2", "7-2:1.1").join("0003:1532:00A7.0002"),
+            "hidraw9",
+            usb_interface("7-2/7-2:1.1", "01").join("0003:1532:00A7.0002"),
+        );
+        node(
+            "hidraw11",
+            usb_interface("7-2/7-2:1.2", "02").join("0003:1532:00A7.0003"),
         );
         node(
             "hidraw2",
-            usb_interface("7-3", "7-3:1.0").join("0003:1532:00A7.0003"),
+            usb_interface("7-3/7-3:1.0", "00").join("0003:1532:00A7.0004"),
         );
-        node(
-            "hidraw3",
-            root.join("devices/hci0/hci0:256/0005:1532:00A7.0004"),
-        );
-        node(
-            "hidraw4",
-            root.join("devices/hci0/hci0:257/0005:1532:00A7.0005"),
-        );
+        // A USB Bluetooth adapter's interface sits above every device paired to it.
+        let adapter = usb_interface("7-4/7-4:1.0", "00").join("bluetooth/hci0");
+        node("hidraw3", adapter.join("hci0:256/0005:1532:00A7.0005"));
+        node("hidraw4", adapter.join("hci0:257/0005:1532:00A7.0006"));
+        // So does a wireless receiver's, above the devices paired to it.
+        let receiver = usb_interface("7-5/7-5:1.2", "02").join("0003:1532:00A7.0007");
+        node("hidraw5", receiver.join("0003:1532:00A7.0008"));
+        node("hidraw6", receiver.join("0003:1532:00A7.0009"));
         let key = |path: &[u8]| grouped_device_key(0x1532, 0x00a7, path, None, &class);
 
-        assert_eq!(key(b"/dev/hidraw0"), key(b"/dev/hidraw1"), "one USB device");
+        assert_eq!(
+            key(b"/dev/hidraw10"),
+            key(b"/dev/hidraw9"),
+            "one USB device"
+        );
+        assert_eq!(
+            key(b"/dev/hidraw10"),
+            key(b"/dev/hidraw11"),
+            "one USB device"
+        );
         assert_ne!(
-            key(b"/dev/hidraw0"),
+            key(b"/dev/hidraw10"),
             key(b"/dev/hidraw2"),
             "two identical mice"
         );
-        assert_ne!(key(b"/dev/hidraw3"), key(b"/dev/hidraw4"), "no USB parent");
         assert_ne!(
-            key(b"/dev/hidraw0"),
-            grouped_device_key(0x1532, 0x00a7, b"/dev/hidraw0", None, NO_SYSFS.as_ref()),
+            key(b"/dev/hidraw3"),
+            key(b"/dev/hidraw4"),
+            "two Bluetooth mice on one USB adapter"
+        );
+        assert_ne!(
+            key(b"/dev/hidraw5"),
+            key(b"/dev/hidraw6"),
+            "two mice paired to one USB receiver"
+        );
+        assert_ne!(
+            key(b"/dev/hidraw10"),
+            grouped_device_key(0x1532, 0x00a7, b"/dev/hidraw10", None, NO_SYSFS.as_ref()),
             "a USB identity is not a path identity"
+        );
+
+        let mut paths = ["/dev/hidraw11", "/dev/hidraw9", "/dev/hidraw10"]
+            .map(|path| CString::new(path).unwrap());
+        sort_candidate_paths(&mut paths, &class);
+        assert_eq!(
+            paths.map(|path| path.into_string().unwrap()),
+            ["/dev/hidraw10", "/dev/hidraw9", "/dev/hidraw11"],
+            "by USB interface number, not node name"
         );
         std::fs::remove_dir_all(&root).unwrap();
     }
