@@ -934,7 +934,8 @@ impl HidSession {
             .get(key)
             .ok_or_else(|| "the HID interface is not open".to_owned())?;
         // An open device has several paths only when `grouped_device_key` matched
-        // them by serial or Windows HID interface. A report still goes to exactly one.
+        // them by serial, Windows HID interface, or Linux USB device. A report
+        // still goes to exactly one.
         if open.paths.is_empty() {
             return Err("the HID interface has no open path".into());
         }
@@ -1032,7 +1033,13 @@ impl HidSession {
         let mut available = false;
         let mut fallback_response = None;
         let mut last_error = None;
-        for path in &open.paths {
+        // Paths whose descriptor declares the report go first, so a grouped
+        // device asks the right interface before any vendor fallback guesses.
+        let (declared, undeclared): (Vec<_>, Vec<_>) = open
+            .paths
+            .iter()
+            .partition(|path| path.layout.feature_buffer_len(report_id).is_ok());
+        for path in declared.into_iter().chain(undeclared) {
             let buffer_len = match path.layout.feature_buffer_len(report_id) {
                 Ok(length) => length,
                 Err(_) if open.vendor_id == RAZER_VENDOR_ID => RAZER_FEATURE_BUFFER_LEN,
@@ -1094,12 +1101,15 @@ fn grouped_device_key(
 ) -> Vec<u8> {
     // A serial is a verified physical identity, so every collection of that
     // device is one candidate. Without one, Windows collections group by their
-    // interface's OS-assigned parent instance; anything else stays apart by path.
+    // interface's OS-assigned parent instance and Linux hidraw nodes by their
+    // USB device in sysfs; anything else stays apart by path.
     let serial = serial.filter(|serial| !serial.is_empty());
-    let interface = collection_interface(path);
-    let (kind, identity) = match (serial, &interface) {
+    let parent = collection_interface(path).map(|interface| (2, interface));
+    #[cfg(target_os = "linux")]
+    let parent = parent.or_else(|| hidraw_usb_device(path).map(|device| (3, device)));
+    let (kind, identity) = match (serial, &parent) {
         (Some(serial), _) => (1, serial.as_bytes()),
-        (None, Some(interface)) => (2, interface.as_bytes()),
+        (None, Some((kind, parent))) => (*kind, parent.as_bytes()),
         (None, None) => (0, path),
     };
     let mut key = Vec::with_capacity(13 + identity.len());
@@ -1121,7 +1131,8 @@ fn device_group_key(info: &hidapi::DeviceInfo) -> Vec<u8> {
 }
 
 /// The paths to try for a report, in order: those whose descriptor declares it,
-/// or every path when none does (Razer descriptors are not parsed). The sender
+/// or every path when none does (Razer descriptors are not parsed outside
+/// Linux). The sender
 /// stops at the first path that takes the report.
 fn report_paths(layouts: &[&ReportLayout], report_id: u8, feature: bool) -> Vec<usize> {
     let declares = |layout: &ReportLayout| {
@@ -1150,6 +1161,34 @@ fn collection_interface(path: &[u8]) -> Option<String> {
     Some(format!("{hardware}#{parent}"))
 }
 
+/// The sysfs path of the USB device a hidraw node belongs to. Each USB HID
+/// interface gets its own hidraw node, so this is what joins a mouse's
+/// interfaces into one candidate, as Chromium's WebHID does. Bluetooth and
+/// virtual (uhid) nodes have no USB interface above them and stay apart.
+#[cfg(target_os = "linux")]
+fn hidraw_usb_device(path: &[u8]) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
+    let node = std::path::Path::new(std::ffi::OsStr::from_bytes(path)).file_name()?;
+    if !node.as_bytes().starts_with(b"hidraw") {
+        return None;
+    }
+    let device = std::path::Path::new("/sys/class/hidraw")
+        .join(node)
+        .join("device");
+    usb_device_above(&std::fs::canonicalize(device).ok()?)
+}
+
+/// The USB device directory above a sysfs HID device: the parent of the
+/// nearest USB interface (the directory that has `bInterfaceNumber`).
+#[cfg(target_os = "linux")]
+fn usb_device_above(hid_device: &std::path::Path) -> Option<String> {
+    let interface = hid_device
+        .ancestors()
+        .skip(1)
+        .find(|dir| dir.join("bInterfaceNumber").is_file())?;
+    interface.parent()?.to_str().map(str::to_owned)
+}
+
 fn inspect_candidate(
     api: &HidApi,
     key: String,
@@ -1166,7 +1205,10 @@ fn inspect_candidate(
         }
     }
 
-    let inspect_descriptors = primary.vendor_id() != RAZER_VENDOR_ID;
+    // Opening every Razer path to read its descriptor is too slow on Windows.
+    // Linux hidraw opens are cheap, and its grouped USB interfaces need the
+    // descriptors so a report goes to the interface that declares it.
+    let inspect_descriptors = cfg!(target_os = "linux") || primary.vendor_id() != RAZER_VENDOR_ID;
     let mut collections = Vec::new();
     let mut paths = Vec::with_capacity(unique_paths.len());
     for path in unique_paths {
@@ -1683,6 +1725,30 @@ mod tests {
             grouped_device_key(0x046d, 0xc54d, b"opaque-B", Some("")),
             "an empty serial is no identity"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hidraw_interfaces_resolve_to_their_usb_device() {
+        let root = std::env::temp_dir().join(format!("openmouse-sysfs-{}", std::process::id()));
+        let usb_device = root.join("usb7/7-2");
+        let hid = |interface: &str, node: &str| {
+            let interface = usb_device.join(interface);
+            std::fs::create_dir_all(interface.join(node)).unwrap();
+            std::fs::write(interface.join("bInterfaceNumber"), "00\n").unwrap();
+            interface.join(node)
+        };
+        let mouse = hid("7-2:1.0", "0003:1532:00A7.0001");
+        let keyboard = hid("7-2:1.1", "0003:1532:00A7.0002");
+        let bluetooth = root.join("hci0/hci0:256/0005:1532:00A7.0003");
+        std::fs::create_dir_all(&bluetooth).unwrap();
+
+        let expected = usb_device.to_str().map(str::to_owned);
+        assert_eq!(usb_device_above(&mouse), expected);
+        assert_eq!(usb_device_above(&keyboard), expected);
+        assert_eq!(usb_device_above(&bluetooth), None);
+        assert_eq!(hidraw_usb_device(b"/dev/not-hidraw"), None);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
