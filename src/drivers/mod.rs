@@ -73,6 +73,27 @@ const LOGITECH_VENDOR_ID: u16 = 0x046d;
 const HIDPP_USAGE_PAGE: u16 = 0xff00;
 const HIDPP_BLUETOOTH_USAGE_PAGE: u16 = 0xff43;
 
+/// CompX's vendor id, shared by several brands' report-8 hardware.
+const COMPX_VENDOR_ID: u16 = 0x3554;
+
+/// Scyrox's products on CompX's vendor id (`mouse-protocol`'s
+/// `SCYROX_PRODUCT_IDS`): the V8S wired and on its Turbo 8k dongle, and the
+/// V8's 8K dongle.
+const SCYROX_PRODUCT_IDS: &[u16] = &[0xf515, 0xf517, 0xf5f7];
+
+/// The brand of a product on CompX's vendor id. Teevolution, VGN and Scyrox
+/// share it with disjoint product ids (pulsar-hid.ts's
+/// CLAIMED_VGN_PRODUCT_IDS); Noir Gear's 0xf500 rides it too but has no
+/// native driver.
+fn compx_brand(product_id: u16) -> Option<&'static str> {
+    match product_id {
+        0xfb56 | 0xfb57 => Some("VGN"),
+        id if SCYROX_PRODUCT_IDS.contains(&id) => Some("Scyrox"),
+        0xf500 => None,
+        _ => Some("Teevolution"),
+    }
+}
+
 /// The brand a discovered HID interface belongs to, or `None` when the
 /// interface should be skipped (other vendors' hardware, Logitech non-HID++
 /// interfaces, Noir's undriven receiver PID).
@@ -88,15 +109,8 @@ fn discovered_brand(info: &hidapi::DeviceInfo) -> Option<&'static str> {
             || usage_page == HIDPP_BLUETOOTH_USAGE_PAGE;
         return hidpp_transport.then_some("Logitech");
     }
-    if vendor_id == 0x3554 {
-        // Teevolution and VGN share this vendor page; their product ids are
-        // disjoint (pulsar-hid.ts's CLAIMED_VGN_PRODUCT_IDS). Noir Gear's
-        // 0xf500 rides it too but has no native driver.
-        return match info.product_id() {
-            0xfb56 | 0xfb57 => Some("VGN"),
-            0xf500 => None,
-            _ => Some("Teevolution"),
-        };
+    if vendor_id == COMPX_VENDOR_ID {
+        return compx_brand(info.product_id());
     }
     KNOWN_BRANDS
         .iter()
@@ -627,10 +641,10 @@ mod tests {
             "parsed no vendor ids — did brands.mjs's format change?"
         );
         let discoverable = |id: u16| {
-            // The special-cased vendor ids in `discovered_brand`: the shared
-            // Teevolution/VGN page, Logitech's HID++ transport, and Pulsar's
-            // own Rust-driver vendor id.
-            [pulsar::VENDOR_ID, 0x3554, LOGITECH_VENDOR_ID].contains(&id)
+            // The special-cased vendor ids in `discovered_brand`: CompX's
+            // shared page, Logitech's HID++ transport, and Pulsar's own
+            // Rust-driver vendor id.
+            [pulsar::VENDOR_ID, COMPX_VENDOR_ID, LOGITECH_VENDOR_ID].contains(&id)
                 || delux::SUPPORTED_VENDOR_IDS.contains(&id)
                 || KNOWN_BRANDS.iter().any(|(_, ids)| ids.contains(&id))
         };
@@ -640,12 +654,30 @@ mod tests {
                 "vendor id 0x{id:04x} is in brands.mjs but discovery cannot see it"
             );
         }
-        for (brand, _) in KNOWN_BRANDS {
+        let compx_brands = [0xf520, 0xfb56, 0xf5f7].map(|id| compx_brand(id).unwrap());
+        for brand in KNOWN_BRANDS
+            .iter()
+            .map(|(brand, _)| *brand)
+            .chain(compx_brands)
+        {
             let key = brand.trim().to_lowercase();
             assert!(
                 helper_keys.contains(&key),
                 "discovery brand {brand:?} has no {key:?} key in brands.mjs"
             );
+        }
+    }
+
+    #[test]
+    fn compx_products_go_to_their_own_brand() {
+        // Teevolution Terra Pro, VGN Dragonfly F2 Master+, Noir Gear M1-NEX.
+        assert_eq!(compx_brand(0xf520), Some("Teevolution"));
+        assert_eq!(compx_brand(0xfb57), Some("VGN"));
+        assert_eq!(compx_brand(0xf500), None);
+        // Scyrox V8S wired, its Turbo 8k dongle and the V8's 8K dongle, which
+        // the Teevolution client cannot drive.
+        for id in [0xf515, 0xf517, 0xf5f7] {
+            assert_eq!(compx_brand(id), Some("Scyrox"));
         }
     }
 

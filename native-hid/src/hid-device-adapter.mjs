@@ -249,13 +249,27 @@ export class HidDeviceAdapter {
  * HidDeviceAdapter per interface, merging any node-hid entries that split
  * off the same interface into separate top-level collections (see module
  * docs above).
+ *
+ * A brand entry can narrow the list (see brands.mjs): `productIds` drops
+ * other products sharing the vendor id, and `usagePage` keeps only the
+ * interface's collections on that page. Opening a collection starts a reader
+ * on it, and some receivers stop answering on their config collection while
+ * a sibling collection is read: the Scyrox V8's dongle (0x3554:0xf5f7)
+ * answered 0 of 5 battery queries with all seven of its interface-1
+ * collections open on Windows, and 5 of 5 with only 0xff02 read. Where the
+ * platform lists one entry per interface instead (hidraw on Linux), the
+ * entry has no usage page to match and the interface is kept whole.
  * @param {number} vendorId
+ * @param {{ productIds?: readonly number[], usagePage?: number }} [hints]
+ * @param {() => import("node-hid").Device[]} [list]
  * @returns {HidDeviceAdapter[]}
  */
-export function candidateDevices(vendorId) {
+export function candidateDevices(vendorId, hints = {}, list = devices) {
+  const { productIds, usagePage } = hints;
   const groups = new Map();
-  for (const info of devices()) {
+  for (const info of list()) {
     if (info.vendorId !== vendorId) continue;
+    if (productIds && !productIds.includes(info.productId)) continue;
     // Skip keyboard collections (macOS denies IOHIDDeviceOpen with privilege violation 0xE00002C1)
     if (info.usagePage === 1 && info.usage === 6) continue;
     // Skip standard boot mouse collections (exclusive system cursor access 0xE00002C5, no vendor feature reports)
@@ -265,7 +279,9 @@ export function candidateDevices(vendorId) {
     if (group) group.push(info);
     else groups.set(key, [info]);
   }
-  return [...groups.values()].map((infos) => {
+  return [...groups.values()].map((group) => {
+    const onPage = usagePage === undefined ? [] : group.filter((info) => info.usagePage === usagePage);
+    const infos = onPage.length > 0 ? onPage : group;
     // Several node-hid entries for one interface commonly share the same
     // underlying `path` (one physical device, listed once per top-level
     // collection its descriptor declares) — open each distinct path once.
