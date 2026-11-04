@@ -1,9 +1,8 @@
 # OpenMouse Bridge
 
 > [!WARNING]
-> **Work in progress: the `GPUI` branch.** This is the new OpenMouse Bridge,
-> rebuilt on [GPUI](https://www.gpui.rs/), and it will replace `main`. It is
-> version 1.0.0 and not released yet. See
+> **Work in progress.** This is the new OpenMouse Bridge,
+> rebuilt on [GPUI](https://www.gpui.rs/). It is version 1.0.0 and not released yet. See
 > [docs/gpui-migration.md](docs/gpui-migration.md) for the plan and what has and
 > has not been checked.
 

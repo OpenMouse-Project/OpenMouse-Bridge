@@ -1,6 +1,6 @@
 # Bridge on GPUI, with real installers
 
-Status: plan, nothing implemented. Branch: `GPUI`.
+Status: GPUI implementation on `main`; platform release validation remains.
 
 ## Why
 

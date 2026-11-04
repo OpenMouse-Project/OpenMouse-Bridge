@@ -42,6 +42,15 @@ jobs:
         run: cargo test --locked
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: native-hid/package-lock.json
+      - name: Test native HID helper
+        run: |
+          npm ci --prefix native-hid
+          npm test --prefix native-hid
       - name: Test installer script
         if: runner.os == 'Linux'
         run: |

@@ -35,6 +35,10 @@ jobs:
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo build --release --locked
+      - name: Test native HID helper
+        run: |
+          npm ci --prefix native-hid
+          npm test --prefix native-hid
       - name: Sign executable
         if: env.WINDOWS_CERTIFICATE_BASE64 != ''
         shell: pwsh
@@ -119,6 +123,10 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo build --release --locked --target aarch64-apple-darwin
       - run: cargo build --release --locked --target x86_64-apple-darwin
+      - name: Test native HID helper
+        run: |
+          npm ci --prefix native-hid
+          npm test --prefix native-hid
       - name: Prepare native-hid (deps + bundled Node.js runtime)
         run: |
           set -euo pipefail
@@ -229,6 +237,10 @@ jobs:
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo build --release --locked
+      - name: Test native HID helper
+        run: |
+          npm ci --prefix native-hid
+          npm test --prefix native-hid
       - name: Prepare native-hid (deps + bundled Node.js runtime)
         run: |
           set -euo pipefail

@@ -5,7 +5,7 @@ name: GPUI build
 on:
   workflow_dispatch:
   push:
-    branches: [GPUI, main]
+    branches: [main]
   pull_request:
 
 permissions:
@@ -13,7 +13,7 @@ permissions:
 
 concurrency:
   group: gpui-build-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/GPUI' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   # Keep in sync with ci.yml and release.yml.
