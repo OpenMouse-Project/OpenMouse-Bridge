@@ -210,6 +210,10 @@ jobs:
           Categories=Utility;
           Terminal=false
           DESKTOP
+          install -Dm644 "$appdir/io.openmouse.bridge.desktop" \
+            "$appdir/usr/share/applications/io.openmouse.bridge.desktop"
+          install -Dm644 assets/openmouse-app-icon.png \
+            "$appdir/usr/share/icons/hicolor/512x512/apps/io.openmouse.bridge.png"
           cat > "$appdir/AppRun" <<'APPRUN'
           #!/bin/sh
           HERE="$(dirname "$(readlink -f "$0")")"
@@ -235,6 +239,7 @@ jobs:
           test -f squashfs-root/usr/bin/native-hid/src/apply.mjs
           test -f squashfs-root/usr/bin/DM-Sans-OFL.txt
           test -f squashfs-root/usr/share/metainfo/io.openmouse.bridge.appdata.xml
+          test -f squashfs-root/usr/share/applications/io.openmouse.bridge.desktop
           # Every shared library the binary needs must resolve on this machine.
           ! ldd squashfs-root/usr/bin/openmouse-bridge | grep 'not found'
       - uses: actions/upload-artifact@v6

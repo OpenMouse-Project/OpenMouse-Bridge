@@ -11,6 +11,7 @@
   <launchable type="desktop-id">io.openmouse.bridge.desktop</launchable>
   <url type="homepage">https://openmouse.app/</url>
   <url type="bugtracker">https://github.com/OpenMouse-Project/OpenMouse-Bridge/issues</url>
+  <content_rating type="oars-1.0"/>
   <provides>
     <binary>openmouse-bridge</binary>
   </provides>
