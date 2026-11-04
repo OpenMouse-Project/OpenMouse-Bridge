@@ -48,6 +48,13 @@ fall through to the generic `AttackSharkHidClient` path, which drives the 0x04
 six-stage table for model `0x55` (mouse-protocol #174), preserving the stages
 the request does not touch.
 
+A brand entry can also narrow which interfaces are opened: `productIds` keeps
+only its own products on a shared vendor id, and `usagePage` opens only an
+interface's collections on that page. The Scyrox entry uses both: CompX's
+vendor id `0x3554` carries several brands, and the Scyrox V8's dongle stops
+answering on its `0xff02` config collection on Windows while its sibling
+vendor collections are open and read.
+
 ## Button listener
 
 `button-listener.mjs` is the one long-running helper. While a game's profile assigns
@@ -110,6 +117,11 @@ runtime first and falls back to `node` on `PATH`, so local development
   model `0x55`); the reporter in mouse-protocol #161 confirmed DPI and
   polling controls working after that fix, with a read-back write round-trip
   still to be captured.
+- Scyrox V8 reads were hardware-verified on Windows through its 8K dongle
+  (`0x3554:0xf5f7`): a `HidDeviceAdapter` on the `0xff02` collection alone
+  read 1,600 DPI and 2,000 Hz, while one on every interface-1 collection got
+  no answer. The full `apply.mjs` path still needs a run on that mouse, and
+  an `@openmouse/protocol` release with the V8 in its Scyrox catalog.
 - Other adapter and dispatch paths are structurally tested (module resolution,
   exit codes and control flow) and still require validation on their respective
   hardware.
