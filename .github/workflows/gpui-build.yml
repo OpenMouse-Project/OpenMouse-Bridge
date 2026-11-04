@@ -50,7 +50,7 @@ jobs:
         id: native-hid-cache
         with:
           path: native-hid/node_modules
-          key: native-hid-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('native-hid/package-lock.json') }}
+          key: native-hid-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('native-hid/package.json', 'native-hid/package-lock.json') }}
       - name: Install native HID helper dependencies
         if: steps.native-hid-cache.outputs.cache-hit != 'true'
         run: npm ci --prefix native-hid --omit=dev
@@ -173,7 +173,7 @@ jobs:
         id: native-hid-cache
         with:
           path: native-hid/node_modules
-          key: native-hid-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('native-hid/package-lock.json') }}
+          key: native-hid-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('native-hid/package.json', 'native-hid/package-lock.json') }}
       - name: Install native HID helper dependencies
         if: steps.native-hid-cache.outputs.cache-hit != 'true'
         run: npm ci --prefix native-hid --omit=dev
@@ -265,7 +265,7 @@ jobs:
         id: native-hid-cache
         with:
           path: native-hid/node_modules
-          key: native-hid-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('native-hid/package-lock.json') }}
+          key: native-hid-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('native-hid/package.json', 'native-hid/package-lock.json') }}
       - name: Install native HID helper dependencies
         if: steps.native-hid-cache.outputs.cache-hit != 'true'
         run: npm ci --prefix native-hid --omit=dev
