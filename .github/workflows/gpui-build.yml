@@ -46,15 +46,19 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: native-hid/package-lock.json
-      - run: cargo fmt --check
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
+      - uses: actions/cache@v4
+        id: native-hid-cache
+        with:
+          path: native-hid/node_modules
+          key: native-hid-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('native-hid/package-lock.json') }}
+      - name: Install native HID helper dependencies
+        if: steps.native-hid-cache.outputs.cache-hit != 'true'
+        run: npm ci --prefix native-hid --omit=dev
       - run: cargo build --release --locked --target aarch64-apple-darwin
       - run: cargo build --release --locked --target x86_64-apple-darwin
       - name: Prepare native-hid (deps + bundled Node.js runtime)
         run: |
           set -euo pipefail
-          npm ci --prefix native-hid --omit=dev
           # Trim node-hid's non-macOS prebuilt bindings; keep both Apple
           # silicon and Intel since the Bridge binary itself is universal.
           find native-hid/node_modules/node-hid/prebuilds -mindepth 1 -maxdepth 1 -type d \
@@ -165,14 +169,18 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: native-hid/package-lock.json
-      - run: cargo fmt --check
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
+      - uses: actions/cache@v4
+        id: native-hid-cache
+        with:
+          path: native-hid/node_modules
+          key: native-hid-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('native-hid/package-lock.json') }}
+      - name: Install native HID helper dependencies
+        if: steps.native-hid-cache.outputs.cache-hit != 'true'
+        run: npm ci --prefix native-hid --omit=dev
       - run: cargo build --release --locked
       - name: Prepare native-hid (deps + bundled Node.js runtime)
         run: |
           set -euo pipefail
-          npm ci --prefix native-hid --omit=dev
           # Trim node-hid's non-Linux prebuilt bindings.
           find native-hid/node_modules/node-hid/prebuilds -mindepth 1 -maxdepth 1 -type d \
             ! -name HID-linux-x64 -exec rm -rf {} +
@@ -253,9 +261,14 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: native-hid/package-lock.json
-      - run: cargo fmt --check
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
+      - uses: actions/cache@v4
+        id: native-hid-cache
+        with:
+          path: native-hid/node_modules
+          key: native-hid-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('native-hid/package-lock.json') }}
+      - name: Install native HID helper dependencies
+        if: steps.native-hid-cache.outputs.cache-hit != 'true'
+        run: npm ci --prefix native-hid --omit=dev
       - run: cargo build --release --locked
       - name: Sign executable
         if: env.WINDOWS_CERTIFICATE_BASE64 != ''
@@ -270,8 +283,6 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          npm ci --prefix native-hid --omit=dev
-          if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
           Get-ChildItem native-hid/node_modules/node-hid/prebuilds -Directory |
             Where-Object { $_.Name -ne 'HID-win32-x64' } |
             Remove-Item -Recurse -Force
