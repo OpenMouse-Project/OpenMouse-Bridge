@@ -1,6 +1,9 @@
 //! The tray panel's views: Home, Settings and the Bridge info page.
 
-use std::{sync::mpsc, time::Duration};
+use std::{
+    sync::mpsc,
+    time::{Duration, Instant},
+};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -29,6 +32,22 @@ const OPENMOUSE_URL: &str = "https://control.openmouse.app";
 /// The low-battery alert levels on offer.
 const BATTERY_THRESHOLDS: [u8; 7] = [10, 15, 20, 25, 30, 40, 50];
 const VOLUME_STEP: u8 = 10;
+/// How many times the notification chime can repeat.
+const MIN_REPEAT: u32 = 1;
+const MAX_REPEAT: u32 = 5;
+/// How long a just-chosen repeat count is kept over older snapshots, in case
+/// the save failed.
+const PENDING_REPEAT_FOR: Duration = Duration::from_secs(3);
+
+/// The repeat count one step up or down, kept within the offered range.
+fn step_repeat(current: u32, up: bool) -> u32 {
+    let current = current.clamp(MIN_REPEAT, MAX_REPEAT);
+    if up {
+        (current + 1).min(MAX_REPEAT)
+    } else {
+        (current - 1).max(MIN_REPEAT)
+    }
+}
 
 /// The alert level `steps` places from `current` in [`BATTERY_THRESHOLDS`],
 /// stopping at either end; a stored value that is not on the list counts as the
@@ -97,6 +116,10 @@ pub struct PanelView {
     battery_threshold: u8,
     notification_sound: bool,
     notification_volume: u8,
+    notification_repeat: u32,
+    /// A repeat count just chosen and not yet confirmed by a snapshot, so an
+    /// older snapshot does not undo it.
+    pending_repeat: Option<(u32, Instant)>,
     update: UpdateState,
     /// Bytes received of the archive being downloaded, while one is.
     progress: Option<DownloadProgress>,
@@ -296,6 +319,8 @@ impl PanelView {
             battery_threshold: 20,
             notification_sound: true,
             notification_volume: 60,
+            notification_repeat: 1,
+            pending_repeat: None,
             update: UpdateState::Idle,
             progress: None,
             quit_for_update: false,
@@ -327,6 +352,15 @@ impl PanelView {
             self.battery_threshold = snapshot.battery_threshold_percent;
             self.notification_sound = snapshot.notification_sound;
             self.notification_volume = snapshot.notification_volume;
+            match self.pending_repeat {
+                Some((wanted, since))
+                    if snapshot.notification_repeat != wanted
+                        && since.elapsed() < PENDING_REPEAT_FOR => {}
+                _ => {
+                    self.pending_repeat = None;
+                    self.notification_repeat = snapshot.notification_repeat;
+                }
+            }
             self.snapshot = Some(snapshot);
             changed = true;
         }
@@ -370,9 +404,17 @@ impl PanelView {
     /// notification when there is no overlay. Low-battery alerts and the
     /// profile switch for a detected game both arrive here.
     fn present(&mut self, notice: &Notice) {
-        let (sound, volume) = self.snapshot.as_ref().map_or((true, 60), |snapshot| {
-            (snapshot.notification_sound, snapshot.notification_volume)
-        });
+        let (sound, volume, repeat, sound_path) =
+            self.snapshot
+                .as_ref()
+                .map_or((true, 60, 1, String::new()), |snapshot| {
+                    (
+                        snapshot.notification_sound,
+                        snapshot.notification_volume,
+                        snapshot.notification_repeat,
+                        snapshot.notification_sound_path.clone(),
+                    )
+                });
         let Some(overlay) = self.overlay.as_mut() else {
             notify_natively(notice);
             return;
@@ -383,8 +425,17 @@ impl PanelView {
             return;
         }
         tracing::info!(title = %notice.title, sound, volume, "Showed a notice on the overlay");
-        if sound && let Err(error) = overlay.chime(volume) {
-            tracing::warn!(%error, "Could not play the notification sound");
+        if !sound {
+            return;
+        }
+        match overlay.chime(volume, repeat, &sound_path) {
+            Ok(None) => {}
+            // The custom sound could not be used; the built-in chime played.
+            Ok(Some(problem)) => {
+                tracing::warn!(%problem, "Used the built-in notification sound");
+                self.error = Some(problem);
+            }
+            Err(error) => tracing::warn!(%error, "Could not play the notification sound"),
         }
     }
 
@@ -489,6 +540,15 @@ impl PanelView {
         self.notification_volume = step_volume(self.notification_volume, up);
         let _ = self.commands.send(BridgeCommand::SetNotificationVolume(
             self.notification_volume,
+        ));
+        cx.notify();
+    }
+
+    fn step_notification_repeat(&mut self, up: bool, cx: &mut Context<Self>) {
+        self.notification_repeat = step_repeat(self.notification_repeat, up);
+        self.pending_repeat = Some((self.notification_repeat, Instant::now()));
+        let _ = self.commands.send(BridgeCommand::SetNotificationRepeat(
+            self.notification_repeat,
         ));
         cx.notify();
     }
@@ -1025,6 +1085,15 @@ impl PanelView {
                             cx.listener(|this, _, _, cx| this.step_notification_volume(false, cx)),
                             cx.listener(|this, _, _, cx| this.step_notification_volume(true, cx)),
                         ),
+                    ))
+                    .child(switch_row(
+                        "Notification repeat",
+                        stepper(
+                            "repeat",
+                            format!("{}×", self.notification_repeat),
+                            cx.listener(|this, _, _, cx| this.step_notification_repeat(false, cx)),
+                            cx.listener(|this, _, _, cx| this.step_notification_repeat(true, cx)),
+                        ),
                     )),
             );
 
@@ -1244,8 +1313,22 @@ impl Render for PanelView {
 mod tests {
     // Not `use super::*`: that pulls in GPUI's own `test` macro, which shadows
     // `#[test]`.
-    use super::{UpdateState, step_threshold, step_volume};
+    use super::{UpdateState, step_repeat, step_threshold, step_volume};
     use crate::runtime::UpdateEvent;
+
+    #[test]
+    fn the_repeat_count_stays_between_one_and_five() {
+        assert_eq!(step_repeat(1, true), 2);
+        assert_eq!(step_repeat(1, false), 1, "stops at one");
+        assert_eq!(step_repeat(5, true), 5, "stops at five");
+        assert_eq!(step_repeat(3, false), 2);
+        assert_eq!(
+            step_repeat(99, false),
+            4,
+            "a stored value past the range counts as five"
+        );
+        assert_eq!(step_repeat(0, true), 2, "zero counts as one");
+    }
 
     #[test]
     fn the_alert_level_steps_along_the_offered_list() {

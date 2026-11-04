@@ -541,6 +541,7 @@ async fn failed_config_writes_preserve_all_in_memory_preferences() {
     assert!(server.service.set_automatic_updates(true).await.is_err());
     assert!(server.service.set_notification_sound(false).await.is_err());
     assert!(server.service.set_notification_volume(15).await.is_err());
+    assert!(server.service.set_notification_repeat(3).await.is_err());
     assert!(server.service.acknowledge_tray_hint().await.is_err());
     assert_eq!(
         serde_json::to_value(server.service.config().await).unwrap(),
