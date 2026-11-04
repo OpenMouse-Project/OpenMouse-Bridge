@@ -2,7 +2,7 @@ name: Bridge CI
 
 on:
   push:
-    branches: [main, dev]
+    branches: [dev]
   pull_request:
   workflow_dispatch:
 
