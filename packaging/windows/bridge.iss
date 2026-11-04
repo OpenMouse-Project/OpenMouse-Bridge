@@ -14,6 +14,7 @@ AppPublisherURL=https://openmouse.app/
 DefaultDirName={localappdata}\Programs\OpenMouse Bridge
 DefaultGroupName=OpenMouse Bridge
 PrivilegesRequired=lowest
+MinVersion=10.0
 ArchitecturesAllowed=x64compatible
 OutputBaseFilename=OpenMouse-Bridge-windows-x64-setup
 SetupIconFile=..\..\assets\openmouse-windows.ico
