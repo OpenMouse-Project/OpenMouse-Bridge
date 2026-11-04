@@ -6,7 +6,6 @@ on:
   workflow_dispatch:
 
 permissions:
-  actions: write
   contents: write
   pull-requests: write
 
@@ -15,6 +14,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Check automation token
+        env:
+          PROTOCOL_UPDATE_TOKEN: ${{ secrets.PROTOCOL_UPDATE_TOKEN }}
+        run: |
+          if [ -z "$PROTOCOL_UPDATE_TOKEN" ]; then
+            echo 'Set the PROTOCOL_UPDATE_TOKEN repository secret to a scoped GitHub App or personal token.' >&2
+            exit 1
+          fi
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -53,16 +60,18 @@ jobs:
       - uses: peter-evans/create-pull-request@v7
         id: pr
         with:
+          token: ${{ secrets.PROTOCOL_UPDATE_TOKEN }}
           branch: automation/update-mouse-protocol
           delete-branch: true
           title: 'chore: update mouse protocol to ${{ steps.release.outputs.tag }}'
-          body: 'Updates the bundled mouse protocol. Review the native HID and platform CI checks before merging.'
+          body: 'Updates the bundled mouse protocol. This PR merges automatically after the required macOS, Windows, and Linux checks pass.'
           commit-message: 'chore: update mouse protocol to ${{ steps.release.outputs.tag }}'
           add-paths: |
             native-hid/package.json
             native-hid/package-lock.json
-      - name: Run platform CI for the update PR
-        if: steps.pr.outputs.pull-request-operation == 'created' || steps.pr.outputs.pull-request-operation == 'updated'
+      - name: Merge when required checks pass
+        if: steps.pr.outputs.pull-request-number != ''
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh workflow run ci.yml --ref automation/update-mouse-protocol
+          GH_TOKEN: ${{ secrets.PROTOCOL_UPDATE_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.pull-request-number }}
+        run: gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash --delete-branch
