@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.openmouse.bridge</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>OpenMouse Bridge</name>
+  <summary>Local mouse companion for the OpenMouse control panel</summary>
+  <description>
+    <p>OpenMouse Bridge connects the OpenMouse control panel to supported mice. It applies device settings, shows battery status, and displays profile notifications on your desktop.</p>
+  </description>
+  <launchable type="desktop-id">io.openmouse.bridge.desktop</launchable>
+  <url type="homepage">https://openmouse.app/</url>
+  <url type="bugtracker">https://github.com/OpenMouse-Project/OpenMouse-Bridge/issues</url>
+  <provides>
+    <binary>openmouse-bridge</binary>
+  </provides>
+</component>
