@@ -56,7 +56,7 @@ jobs:
           branch: automation/update-mouse-protocol
           delete-branch: true
           title: 'chore: update mouse protocol to ${{ steps.release.outputs.tag }}'
-          body: 'Updates the bundled mouse protocol. Review the native HID and platform CI checks before merging.'
+          body: 'Updates the bundled mouse protocol. This PR merges automatically after the required macOS, Windows, and Linux checks pass.'
           commit-message: 'chore: update mouse protocol to ${{ steps.release.outputs.tag }}'
           add-paths: |
             native-hid/package.json
@@ -66,3 +66,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run ci.yml --ref automation/update-mouse-protocol
+      - name: Merge when required checks pass
+        if: steps.pr.outputs.pull-request-number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.pull-request-number }}
+        run: gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash --delete-branch
