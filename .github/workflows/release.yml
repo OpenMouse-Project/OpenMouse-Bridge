@@ -83,6 +83,21 @@ jobs:
           Write-Host "openmouse-bridge-windows-x64.zip: $size bytes (limit 16252928)"
           if ($size -gt 16252928) { throw "bridge archive is over the older updaters' 16 MiB read budget" }
           (Get-FileHash openmouse-bridge-windows-x64.zip -Algorithm SHA256).Hash.ToLower() + "  openmouse-bridge-windows-x64.zip" | Set-Content openmouse-bridge-windows-x64.zip.sha256
+      - name: Build and smoke test Windows installer
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP 'bridge-windows-installer-package'
+          Expand-Archive openmouse-bridge-windows-x64-full.zip -DestinationPath $stage
+          ./packaging/windows/build-installer.ps1 -Stage $stage -OutputDirectory .
+      - name: Sign Windows installer
+        if: env.WINDOWS_CERTIFICATE_BASE64 != ''
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $certificate = Join-Path $env:RUNNER_TEMP 'openmouse-bridge.pfx'
+          & signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificate /p $env:WINDOWS_CERTIFICATE_PASSWORD OpenMouse-Bridge-windows-x64-setup.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Installer signing failed' }
+          (Get-FileHash OpenMouse-Bridge-windows-x64-setup.exe -Algorithm SHA256).Hash.ToLower() + '  OpenMouse-Bridge-windows-x64-setup.exe' | Set-Content OpenMouse-Bridge-windows-x64-setup.exe.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: bridge-windows
@@ -91,6 +106,8 @@ jobs:
             openmouse-bridge-windows-x64.zip.sha256
             openmouse-bridge-windows-x64-full.zip
             openmouse-bridge-windows-x64-full.zip.sha256
+            OpenMouse-Bridge-windows-x64-setup.exe
+            OpenMouse-Bridge-windows-x64-setup.exe.sha256
 
   macos:
     name: macOS universal

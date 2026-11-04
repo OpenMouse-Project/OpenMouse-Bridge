@@ -23,7 +23,8 @@ Windows desktop; Linux has no tray icon yet.
 - [x] First-run behaviour, Escape and the close button hide the panel, the tray
       icon is recreated after sleep, and Bridge relaunches after a crash
 - [x] Windows: build and test a portable x64 ZIP in CI
-- [ ] Windows: run the tray app on a desktop, then build an installer
+- [x] Windows: build and smoke test a per-user installer in CI
+- [ ] Windows: run the tray app on a desktop
 - [x] Linux: build and verify the AppImage in CI
 - [ ] Linux: add a tray icon
 - [ ] The in-app updater with `latest.json`, replacing the zip-swap one
@@ -301,6 +302,14 @@ bundle and DMG; the release workflow signs and notarizes them when the
 `MACOS_CERTIFICATE_BASE64`, `MACOS_CERTIFICATE_PASSWORD`, `MACOS_SIGN_IDENTITY`,
 `APPLE_ID`, `APPLE_TEAM_ID` and `APPLE_APP_PASSWORD` secrets are set.
 
+## Install on Windows
+
+Download `OpenMouse-Bridge-windows-x64-setup.exe` from a build artifact or a
+future stable release and run it. The installer puts Bridge and its bundled
+native HID helper in your user profile, adds a Start menu shortcut, and offers
+an optional desktop shortcut. It does not need administrator access. The
+portable `OpenMouse-Bridge-windows-x64.zip` remains available in build artifacts.
+
 ## Install on Linux
 
 One-line install from the latest stable release (detects missing system
@@ -322,8 +331,8 @@ to `/opt/openmouse-bridge` with a `/usr/local/bin` symlink), `--no-deps`
 Development builds remain available as workflow artifacts for individual runs.
 
 Pushing a stable version tag such as `v1.0.0` publishes it as the latest GitHub
-release with generated changelog notes, Windows x64, universal macOS, and Linux
-x64 archives, and SHA-256 checksums. Windows signing is automatic when the
-repository has `WINDOWS_CERTIFICATE_BASE64` and
+release with generated changelog notes, a Windows x64 installer and archives,
+universal macOS and Linux x64 archives, and SHA-256 checksums. Windows signing
+is automatic when the repository has `WINDOWS_CERTIFICATE_BASE64` and
 `WINDOWS_CERTIFICATE_PASSWORD` secrets; unsigned development builds continue
 to work without those secrets.
