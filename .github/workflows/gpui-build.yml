@@ -33,7 +33,7 @@ jobs:
       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
       APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -41,12 +41,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: gpui-macos
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 24
           cache: npm
           cache-dependency-path: native-hid/package-lock.json
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         id: native-hid-cache
         with:
           path: native-hid/node_modules
@@ -128,7 +128,7 @@ jobs:
           test -d "$RUNNER_TEMP/dmg/OpenMouse Bridge.app"
           codesign --verify --deep --strict "$RUNNER_TEMP/dmg/OpenMouse Bridge.app"
           hdiutil detach "$RUNNER_TEMP/dmg"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: bridge-macos-dmg
           path: |
@@ -144,7 +144,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install build dependencies
         # HID (udev), TLS, and what GPUI draws and takes input through
         # (Wayland, X11/XCB, xkbcommon, Vulkan, fontconfig). No GTK: Linux has
@@ -157,19 +157,19 @@ jobs:
             libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libvulkan-dev libgl1-mesa-dev libfontconfig-dev libfreetype-dev \
-            libasound2-dev
+            libasound2-dev appstream
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: gpui-linux
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 24
           cache: npm
           cache-dependency-path: native-hid/package-lock.json
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         id: native-hid-cache
         with:
           path: native-hid/node_modules
@@ -198,6 +198,8 @@ jobs:
           cp assets/fonts/DM-Sans-OFL.txt README.md "$appdir/usr/bin/"
           cp assets/openmouse-app-icon.png "$appdir/io.openmouse.bridge.png"
           cp assets/openmouse-app-icon.png "$appdir/.DirIcon"
+          install -Dm644 packaging/linux/io.openmouse.bridge.appdata.xml \
+            "$appdir/usr/share/metainfo/io.openmouse.bridge.appdata.xml"
           cat > "$appdir/io.openmouse.bridge.desktop" <<'DESKTOP'
           [Desktop Entry]
           Type=Application
@@ -208,12 +210,17 @@ jobs:
           Categories=Utility;
           Terminal=false
           DESKTOP
+          install -Dm644 "$appdir/io.openmouse.bridge.desktop" \
+            "$appdir/usr/share/applications/io.openmouse.bridge.desktop"
+          install -Dm644 assets/openmouse-app-icon.png \
+            "$appdir/usr/share/icons/hicolor/512x512/apps/io.openmouse.bridge.png"
           cat > "$appdir/AppRun" <<'APPRUN'
           #!/bin/sh
           HERE="$(dirname "$(readlink -f "$0")")"
           exec "$HERE/usr/bin/openmouse-bridge" "$@"
           APPRUN
           chmod +x "$appdir/AppRun"
+          appstreamcli validate "$appdir/usr/share/metainfo/io.openmouse.bridge.appdata.xml"
       - name: Build the AppImage
         run: |
           set -euo pipefail
@@ -231,9 +238,11 @@ jobs:
           test -x squashfs-root/usr/bin/native-hid/node/bin/node
           test -f squashfs-root/usr/bin/native-hid/src/apply.mjs
           test -f squashfs-root/usr/bin/DM-Sans-OFL.txt
+          test -f squashfs-root/usr/share/metainfo/io.openmouse.bridge.appdata.xml
+          test -f squashfs-root/usr/share/applications/io.openmouse.bridge.desktop
           # Every shared library the binary needs must resolve on this machine.
           ! ldd squashfs-root/usr/bin/openmouse-bridge | grep 'not found'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: bridge-linux-appimage
           path: |
@@ -249,19 +258,19 @@ jobs:
       WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
       WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: gpui-windows
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 24
           cache: npm
           cache-dependency-path: native-hid/package-lock.json
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         id: native-hid-cache
         with:
           path: native-hid/node_modules
@@ -319,7 +328,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Installer signing failed' }
           $checksum = (Get-FileHash OpenMouse-Bridge-windows-x64-setup.exe -Algorithm SHA256).Hash.ToLower() + '  OpenMouse-Bridge-windows-x64-setup.exe' + "`n"
           [IO.File]::WriteAllText('OpenMouse-Bridge-windows-x64-setup.exe.sha256', $checksum, [Text.UTF8Encoding]::new($false))
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: bridge-windows
           path: |
