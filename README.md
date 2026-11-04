@@ -319,9 +319,7 @@ to `/opt/openmouse-bridge` with a `/usr/local/bin` symlink), `--no-deps`
 `--no-launcher` (skip those steps), `--start` (launch after installing),
 `--uninstall` (remove), `--yes` (non-interactive package install).
 
-Every successful push to `main` updates the rolling `dev-build` prerelease with a
-Windows x64 zip and checksum. The same files remain available as workflow
-artifacts for individual runs.
+Development builds remain available as workflow artifacts for individual runs.
 
 Pushing a stable version tag such as `v1.0.0` publishes it as the latest GitHub
 release with generated changelog notes, Windows x64, universal macOS, and Linux
