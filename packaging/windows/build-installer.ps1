@@ -48,5 +48,5 @@ if (Test-Path -LiteralPath (Join-Path $installed 'openmouse-bridge.exe')) {
     throw 'Uninstaller left the Bridge executable behind'
 }
 
-(Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLower() + '  OpenMouse-Bridge-windows-x64-setup.exe' |
-    Set-Content -Path "$installer.sha256"
+$checksum = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLower() + '  OpenMouse-Bridge-windows-x64-setup.exe' + "`n"
+[IO.File]::WriteAllText("$installer.sha256", $checksum, [Text.UTF8Encoding]::new($false))

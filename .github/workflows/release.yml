@@ -97,7 +97,8 @@ jobs:
           $certificate = Join-Path $env:RUNNER_TEMP 'openmouse-bridge.pfx'
           & signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificate /p $env:WINDOWS_CERTIFICATE_PASSWORD OpenMouse-Bridge-windows-x64-setup.exe
           if ($LASTEXITCODE -ne 0) { throw 'Installer signing failed' }
-          (Get-FileHash OpenMouse-Bridge-windows-x64-setup.exe -Algorithm SHA256).Hash.ToLower() + '  OpenMouse-Bridge-windows-x64-setup.exe' | Set-Content OpenMouse-Bridge-windows-x64-setup.exe.sha256
+          $checksum = (Get-FileHash OpenMouse-Bridge-windows-x64-setup.exe -Algorithm SHA256).Hash.ToLower() + '  OpenMouse-Bridge-windows-x64-setup.exe' + "`n"
+          [IO.File]::WriteAllText('OpenMouse-Bridge-windows-x64-setup.exe.sha256', $checksum, [Text.UTF8Encoding]::new($false))
       - uses: actions/upload-artifact@v4
         with:
           name: bridge-windows
