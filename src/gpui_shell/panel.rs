@@ -21,8 +21,10 @@ use super::{ExitFlags, ascii};
 use crate::overlay::Overlay;
 use crate::runtime::{
     BridgeCommand, UpdateEvent, WINDOW_HEIGHT, WINDOW_WIDTH, notify_natively, open_logs,
-    open_openmouse, service_label,
+    service_label,
 };
+
+const OPENMOUSE_URL: &str = "https://control.openmouse.app";
 
 /// The low-battery alert levels on offer.
 const BATTERY_THRESHOLDS: [u8; 7] = [10, 15, 20, 25, 30, 40, 50];
@@ -908,8 +910,8 @@ impl PanelView {
                         .primary()
                         .compact()
                         .label("Open OpenMouse")
-                        .on_click(cx.listener(|_, _, _, _| {
-                            let _ = open_openmouse();
+                        .on_click(cx.listener(|_, _, _, cx| {
+                            cx.open_url(OPENMOUSE_URL);
                         })),
                 )
                 .child(
