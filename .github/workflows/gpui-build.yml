@@ -1,19 +1,18 @@
 name: GPUI build
 
 # Builds the GPUI Bridge for macOS, Linux, and Windows and uploads downloadable
-# workflow artifacts. Publishing a release from these artifacts is a later step.
+# workflow artifacts for main and manual runs.
 on:
   workflow_dispatch:
   push:
     branches: [main]
-  pull_request:
 
 permissions:
   contents: read
 
 concurrency:
   group: gpui-build-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: true
 
 env:
   # Keep in sync with ci.yml and release.yml.

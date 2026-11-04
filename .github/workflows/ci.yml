@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: bridge-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   # Keep in sync with release.yml's NATIVE_HID_NODE_VERSION.
   NATIVE_HID_NODE_VERSION: v24.18.1
@@ -24,80 +28,64 @@ jobs:
     # Builds and tests run dependency code with read-only repository access.
     permissions:
       contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - uses: actions/github-script@v7
+        id: changes
+        with:
+          script: |
+            if (context.eventName !== 'pull_request') return false;
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              per_page: 100,
+            });
+            const protocolFiles = new Set([
+              'native-hid/package.json',
+              'native-hid/package-lock.json',
+            ]);
+            return files.length > 0 && files.every(file => protocolFiles.has(file.filename));
       - name: Install Linux HID and GUI dependencies
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && steps.changes.outputs.result != 'true'
         run: sudo apt-get update && sudo apt-get install -y build-essential clang cmake pkg-config libudev-dev libssl-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libvulkan-dev libgl1-mesa-dev libfontconfig-dev libfreetype-dev libasound2-dev
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.changes.outputs.result != 'true'
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+        if: steps.changes.outputs.result != 'true'
       - name: Check formatting
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && steps.changes.outputs.result != 'true'
         run: cargo fmt --check
       - name: Test
+        if: steps.changes.outputs.result != 'true'
         run: cargo test --locked
       - name: Clippy
+        if: steps.changes.outputs.result != 'true'
         run: cargo clippy --locked --all-targets -- -D warnings
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
           cache-dependency-path: native-hid/package-lock.json
+      - uses: actions/cache@v4
+        id: native-hid-cache
+        with:
+          path: native-hid/node_modules
+          key: native-hid-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('native-hid/package-lock.json') }}
+      - name: Install native HID helper dependencies
+        if: steps.native-hid-cache.outputs.cache-hit != 'true'
+        run: npm ci --prefix native-hid
       - name: Test native HID helper
-        run: |
-          npm ci --prefix native-hid
-          npm test --prefix native-hid
+        run: npm test --prefix native-hid
       - name: Test installer script
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && steps.changes.outputs.result != 'true'
         run: |
           bash -n install-linux.sh
           bash tests/linux_startup.sh "${{ runner.temp }}"
           bash install-linux.sh --help
           bash -c 'export HOME=/root OPENMOUSE_INSTALL_SOURCED=1; source ./install-linux.sh; D=$(mktemp -d); write_udev_rule "$D/rule"; bodies=$(grep -c "SUBSYSTEM" "$D/rule"); vids=$(printf "%s" "$VENDOR_IDS" | wc -w); [ "$bodies" = "$vids" ] || exit 1; write_autostart "$D/a.desktop" "/opt/x/b"; grep -q "Exec=\"/opt/x/b\"" "$D/a.desktop"; write_launcher "$D/l.desktop" "/opt/x/b" "/opt/x/i.png"; grep -q "^Name=OpenMouse Bridge$" "$D/l.desktop"; grep -q "^Terminal=false$" "$D/l.desktop"; for pm in apt dnf pacman zypper apk; do pm_packages "$pm" | grep -q curl || exit 1; done; rm -rf "$D"'
-
-  windows-build:
-    name: Windows release artifact
-    needs: check
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: native-hid/package-lock.json
-      - name: Build
-        run: cargo build --release --locked
-      - name: Prepare native-hid (deps + bundled Node.js runtime)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          npm ci --prefix native-hid --omit=dev
-          # Trim node-hid's other-platform prebuilt bindings — this archive
-          # only ever runs on win32-x64.
-          Get-ChildItem native-hid/node_modules/node-hid/prebuilds -Directory |
-            Where-Object { $_.Name -ne "HID-win32-x64" } |
-            Remove-Item -Recurse -Force
-          Invoke-WebRequest -Uri "https://nodejs.org/dist/$env:NATIVE_HID_NODE_VERSION/node-$env:NATIVE_HID_NODE_VERSION-win-x64.zip" -OutFile node.zip
-          Expand-Archive node.zip -DestinationPath node-extracted
-          New-Item -ItemType Directory -Force -Path native-hid/node | Out-Null
-          Copy-Item "node-extracted/node-$env:NATIVE_HID_NODE_VERSION-win-x64/node.exe" native-hid/node/node.exe
-      - name: Package
-        shell: pwsh
-        run: |
-          Copy-Item assets/fonts/DM-Sans-OFL.txt DM-Sans-OFL.txt
-          Compress-Archive -Path target/release/openmouse-bridge.exe,README.md,DM-Sans-OFL.txt,native-hid -DestinationPath openmouse-bridge-windows-x64.zip
-          (Get-FileHash openmouse-bridge-windows-x64.zip -Algorithm SHA256).Hash.ToLower() + "  openmouse-bridge-windows-x64.zip" | Set-Content openmouse-bridge-windows-x64.zip.sha256
-      - uses: actions/upload-artifact@v4
-        with:
-          name: openmouse-bridge-windows-x64
-          path: |
-            openmouse-bridge-windows-x64.zip
-            openmouse-bridge-windows-x64.zip.sha256
-          if-no-files-found: error
