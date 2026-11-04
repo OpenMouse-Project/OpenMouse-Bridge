@@ -24,18 +24,12 @@ use openmouse_bridge::{
 };
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::io::Cursor;
-#[cfg(target_os = "windows")]
-use std::ptr::null_mut;
 use tokio::{
     net::TcpListener,
     sync::{mpsc as tokio_mpsc, oneshot},
 };
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use tray_icon::Icon;
-#[cfg(target_os = "windows")]
-use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
-
-const OPENMOUSE_URL: &str = "https://control.openmouse.app";
 
 /// Present when the user explicitly wants no tray panel (or when no display
 /// exists): Bridge serves its HTTP API, HID, and game profiles without a
@@ -612,59 +606,6 @@ pub(crate) fn open_logs() -> Result<()> {
         .spawn()
         .context("Could not open the Bridge log folder")?;
     Ok(())
-}
-
-pub(crate) fn open_openmouse() -> Result<()> {
-    open_url(OPENMOUSE_URL)
-}
-
-#[cfg(target_os = "windows")]
-fn open_url(url: &str) -> Result<()> {
-    let operation = wide("open");
-    let target = wide(url);
-    let result = unsafe {
-        ShellExecuteW(
-            null_mut(),
-            operation.as_ptr(),
-            target.as_ptr(),
-            null_mut(),
-            null_mut(),
-            SW_SHOWNORMAL,
-        )
-    } as isize;
-    if result <= 32 {
-        return Err(anyhow!("Windows could not open {url} (code {result})"));
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn open_url(url: &str) -> Result<()> {
-    let status = std::process::Command::new("open")
-        .arg(url)
-        .status()
-        .with_context(|| format!("macOS could not open {url}"))?;
-    if !status.success() {
-        return Err(anyhow!("macOS could not open {url}"));
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn open_url(url: &str) -> Result<()> {
-    let status = std::process::Command::new("xdg-open")
-        .arg(url)
-        .status()
-        .with_context(|| format!("Linux could not open {url}"))?;
-    if !status.success() {
-        return Err(anyhow!("Linux could not open {url}"));
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn wide(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(Some(0)).collect()
 }
 
 #[cfg(test)]
