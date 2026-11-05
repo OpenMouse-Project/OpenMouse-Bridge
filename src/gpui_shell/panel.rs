@@ -411,7 +411,7 @@ impl PanelView {
                     (
                         snapshot.notification_sound,
                         snapshot.notification_volume,
-                        snapshot.notification_repeat,
+                        self.notification_repeat,
                         snapshot.notification_sound_path.clone(),
                     )
                 });
