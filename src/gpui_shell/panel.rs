@@ -86,7 +86,8 @@ impl View {
     fn base_height(self) -> f32 {
         match self {
             View::Home => WINDOW_HEIGHT,
-            View::Settings => 600.0,
+            // Includes the Notification repeat row.
+            View::Settings => 640.0,
             View::Info => 380.0,
         }
     }
@@ -411,7 +412,7 @@ impl PanelView {
                     (
                         snapshot.notification_sound,
                         snapshot.notification_volume,
-                        self.notification_repeat,
+                        snapshot.notification_repeat,
                         snapshot.notification_sound_path.clone(),
                     )
                 });
@@ -769,6 +770,10 @@ impl PanelView {
                     .items_center()
                     .gap_2()
                     .py_1()
+                    // Windows moves a borderless window through its hit test
+                    // (the area acts as a caption); the other platforms start
+                    // the move themselves.
+                    .window_control_area(WindowControlArea::Drag)
                     .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
                     .child(div().size(px(8.)).flex_none().rounded_full().bg(accent))
                     .child(
@@ -1280,6 +1285,7 @@ impl Render for PanelView {
         let desired = self.desired_height();
         if (window.viewport_size().height.as_f32() - desired).abs() > 1.0 {
             window.resize(size(px(WINDOW_WIDTH), px(desired)));
+            super::tray::keep_on_screen(window, desired);
         }
         let field = self.field.element(window, cx);
         let content = match self.view {
