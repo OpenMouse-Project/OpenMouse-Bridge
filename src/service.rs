@@ -459,6 +459,18 @@ fn switch_message(
     Some(switch)
 }
 
+/// What one native automation pass did, as published to the status snapshot.
+enum NativePass {
+    /// The pass reached the hardware; `error` replaces the published outcome.
+    Ran {
+        error: Option<String>,
+        pending: usize,
+    },
+    /// The control panel held the HID session, so nothing was sent and the
+    /// previous outcome stays published.
+    Deferred { pending: usize },
+}
+
 type PanelListener = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Clone)]
@@ -1412,7 +1424,7 @@ impl BridgeService {
 
     async fn reconcile_native_with(
         &self,
-        operation: impl FnOnce(Option<ApplicationProfile>) -> (Option<String>, usize) + Send + 'static,
+        operation: impl FnOnce(Option<ApplicationProfile>) -> NativePass + Send + 'static,
     ) -> Option<ApplyOutcome> {
         let mut state = self.inner.clone().write_owned().await;
         let selected = resolve_profile_retaining(
@@ -1428,7 +1440,15 @@ impl BridgeService {
         let desired = selected;
         let result = tokio::task::spawn_blocking(move || {
             let has_profile = desired.is_some();
-            let (error, pending) = operation(desired);
+            let (error, pending) = match operation(desired) {
+                NativePass::Ran { error, pending } => (error, pending),
+                NativePass::Deferred { pending } => {
+                    // Nothing reached the mouse, so the last real outcome
+                    // still stands.
+                    state.pending_native_restores = pending;
+                    return None;
+                }
+            };
             let outcome = match &error {
                 Some(message) if message.contains("unsupported") => Some(ApplyOutcome::NoDriver),
                 Some(_) => Some(ApplyOutcome::Failed),
@@ -1456,10 +1476,18 @@ impl BridgeService {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let result = crate::drivers::reconcile_automatic(&mut automation, desired.as_ref());
-            (
-                result.err().map(|error| format!("{error:#}")),
-                automation.pending_restores_for(desired.as_ref()),
-            )
+            let pending = automation.pending_restores_for(desired.as_ref());
+            match result {
+                Ok(crate::drivers::Reconciled::Deferred) => NativePass::Deferred { pending },
+                Ok(crate::drivers::Reconciled::Done) => NativePass::Ran {
+                    error: None,
+                    pending,
+                },
+                Err(error) => NativePass::Ran {
+                    error: Some(format!("{error:#}")),
+                    pending,
+                },
+            }
         })
         .await
     }
@@ -1941,6 +1969,49 @@ mod tests {
         }
     }
 
+    /// The tray panel shows `native_automation_error` as "Native settings not
+    /// applied: …". The game monitor reconciles every few seconds, so while
+    /// the web panel holds the HID socket that must defer quietly rather than
+    /// publish the ownership guard as a failure.
+    #[test]
+    fn open_panel_session_defers_native_reconcile_without_an_error() {
+        // A plain test so the std lock is never held across an await.
+        let _serial = crate::drivers::TEST_NATIVE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let session = crate::hid::hold_client_session();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let snapshot = runtime.block_on(async {
+            let bridge = service(BridgeConfig::default());
+            assert_eq!(bridge.reconcile_native().await, None);
+            bridge.snapshot().await
+        });
+        drop(session);
+        assert_eq!(snapshot.native_automation_error, None);
+        assert_eq!(snapshot.pending_native_restores, 0);
+    }
+
+    #[tokio::test]
+    async fn deferred_native_pass_keeps_the_last_real_outcome() {
+        let bridge = service(BridgeConfig::default());
+        bridge.inner.write().await.native_automation_error = Some("mouse asleep".into());
+        assert_eq!(
+            bridge
+                .reconcile_native_with(|_| NativePass::Deferred { pending: 2 })
+                .await,
+            None
+        );
+        let state = bridge.inner.read().await;
+        assert_eq!(
+            state.native_automation_error.as_deref(),
+            Some("mouse asleep")
+        );
+        assert_eq!(state.pending_native_restores, 2);
+    }
+
     #[tokio::test]
     async fn failed_native_join_does_not_publish_unowned_stale_completion() {
         let bridge = service(BridgeConfig::default());
@@ -1968,7 +2039,10 @@ mod tests {
                 .reconcile_native_with(move |_| {
                     started_tx.send(()).unwrap();
                     release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                    (Some("retained completion".into()), 1)
+                    NativePass::Ran {
+                        error: Some("retained completion".into()),
+                        pending: 1,
+                    }
                 })
                 .await
         });
@@ -2022,7 +2096,10 @@ mod tests {
                     desired.is_none(),
                     "disabled profile must never reach the native writer"
                 );
-                (None, 0)
+                NativePass::Ran {
+                    error: None,
+                    pending: 0,
+                }
             })
             .await;
     }
@@ -2047,7 +2124,10 @@ mod tests {
                     checked.inner.try_write().is_err(),
                     "configuration must not change during the bounded HID operation"
                 );
-                (Some("unsupported acknowledged readback".into()), 1)
+                NativePass::Ran {
+                    error: Some("unsupported acknowledged readback".into()),
+                    pending: 1,
+                }
             })
             .await;
         let snapshot = bridge.snapshot().await;
