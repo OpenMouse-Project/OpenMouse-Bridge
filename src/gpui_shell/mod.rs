@@ -60,9 +60,17 @@ pub fn run() -> Result<()> {
                     cx,
                 ))),
                 titlebar: None,
-                kind: WindowKind::PopUp,
+                // X11 PopUp is override-redirect: the WM cannot minimize it
+                // or provide the taskbar recovery path used by the Linux tray.
+                kind: if cfg!(target_os = "linux") {
+                    WindowKind::Normal
+                } else {
+                    WindowKind::PopUp
+                },
+                #[cfg(target_os = "linux")]
+                app_id: Some("io.openmouse.bridge".into()),
                 is_resizable: false,
-                is_minimizable: false,
+                is_minimizable: cfg!(target_os = "linux"),
                 ..Default::default()
             };
             let view_exit = app_exit.clone();
@@ -92,6 +100,20 @@ pub fn run() -> Result<()> {
                 Some((commands, tray)) => (Some(commands), Some(tray)),
                 None => (None, None),
             };
+            #[cfg(target_os = "linux")]
+            {
+                let close_exit = app_exit.clone();
+                let _ = cx.update_window(handle, |_, window, cx| {
+                    window.on_window_should_close(cx, move |window, cx| {
+                        if tray::can_hide() {
+                            tray::hide(window);
+                        } else {
+                            close_exit.quit(cx);
+                        }
+                        false
+                    });
+                });
+            }
             if !show_panel && tray_commands.is_some() {
                 let _ = cx.update_window(handle, |_, window, _| tray::hide(window));
             } else {

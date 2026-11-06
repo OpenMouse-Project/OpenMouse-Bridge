@@ -1,8 +1,7 @@
 //! The tray icon for the GPUI shell: closing the panel hides it, a click on the
 //! icon brings it back, and the menu offers Open / Restart / Quit.
 //!
-//! macOS and Windows only for now. Linux has no tray icon yet; there the panel
-//! is a plain window and closing it quits.
+//! Linux uses StatusNotifierItem over D-Bus, without a GTK event loop.
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -31,6 +30,8 @@ pub struct Anchor {
 
 /// The tray icon, kept by the poll loop so it can show the battery on it.
 pub struct TrayHandle {
+    #[cfg(target_os = "linux")]
+    icon: linux::Handle,
     #[cfg(any(target_os = "macos", windows))]
     icon: tray_icon::TrayIcon,
     shown: Option<TrayBattery>,
@@ -40,7 +41,14 @@ impl TrayHandle {
     /// Shows `battery` on the icon, or the plain logo for `None`, when that
     /// differs from what is showing; calling this every poll is cheap.
     pub fn show_battery(&mut self, battery: Option<TrayBattery>) {
+        #[cfg(target_os = "linux")]
+        self.icon.check_health();
         if battery == self.shown {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if let Err(error) = self.icon.show_battery(battery.as_ref()) {
+            tracing::warn!(%error, "Could not update the tray icon");
             return;
         }
         #[cfg(any(target_os = "macos", windows))]
@@ -301,7 +309,30 @@ mod platform {
     }
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[path = "tray_linux.rs"]
+mod linux;
+
+#[cfg(target_os = "linux")]
+mod platform {
+    use super::Anchor;
+    use gpui_kit::Window;
+
+    // GPUI exposes minimization on both X11 and Wayland. Keeping the taskbar
+    // entry also provides recovery if the desktop loses its tray host.
+    pub fn hide_window(window: &Window) {
+        window.minimize_window();
+    }
+    pub fn show_window(window: &mut Window) {
+        window.activate_window();
+    }
+    // Wayland compositors control top-level placement; do not interpret the
+    // host's coordinate hints as portable window positions.
+    pub fn place_near_tray(_window: &Window, _anchor: Option<Anchor>) {}
+}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 mod platform {
     use gpui_kit::Window;
 
@@ -317,18 +348,24 @@ mod platform {
 static VISIBLE: AtomicBool = AtomicBool::new(true);
 
 pub fn is_visible() -> bool {
-    VISIBLE.load(Ordering::Relaxed)
+    // Linux's taskbar can restore a minimized window without a tray command.
+    cfg!(target_os = "linux") || VISIBLE.load(Ordering::Relaxed)
 }
 
 /// Whether closing the panel can hide it to a tray icon; where it cannot, the
 /// close button quits.
 pub fn can_hide() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux::available()
+    }
+    #[cfg(not(target_os = "linux"))]
     cfg!(any(target_os = "macos", windows))
 }
 
 pub fn hide(window: &Window) {
     platform::hide_window(window);
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
     VISIBLE.store(false, Ordering::Relaxed);
 }
 
@@ -461,7 +498,22 @@ pub fn install(
     ))
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(target_os = "linux")]
+pub fn install(
+    _cx: &mut App,
+    _window: AnyWindowHandle,
+) -> Option<(mpsc::Receiver<Command>, TrayHandle)> {
+    let (commands, icon) = match linux::install() {
+        Ok(tray) => tray,
+        Err(error) => {
+            tracing::warn!(%error, "Linux tray unavailable; keeping the panel as a normal window");
+            return None;
+        }
+    };
+    Some((commands, TrayHandle { icon, shown: None }))
+}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 pub fn install(
     _cx: &mut App,
     _window: AnyWindowHandle,

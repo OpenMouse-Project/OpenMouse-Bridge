@@ -129,7 +129,22 @@ GPUI is the only window: the egui panel, `native_ui.rs`, `eframe`, `gtk` and the
   Windows taskbar. macOS has no tray menu, because an attached menu swallows
   every click; a left or right click shows the panel, and Windows keeps a menu.
   Closing or Escape hides the panel. The icon is rebuilt after the PC sleeps.
-  Linux has no tray yet, so its window is an ordinary one and closing it quits.
+  Linux uses `ksni` for StatusNotifierItem and DBusMenu on the session bus,
+  with the shared battery glyph renderer and tooltip (the percentage style
+  remains Windows-only). Activation and Open restore the panel; Restart and
+  Quit are available in the menu. Close and Escape minimize it while a host
+  is available, keeping the taskbar entry as a recovery path. Linux continues
+  repainting because the taskbar can restore it without a tray command.
+  No bus/host means an ordinary visible window whose close button quits.
+  Losing the watcher restores the panel; the service re-registers when it
+  returns. GPUI/compositors handle placement and activation, so Linux does not
+  place the panel beside the icon. Wayland compositors may reject activation
+  requests from the tray; the taskbar entry remains available. Linux uses a
+  normal minimizable window with app ID `io.openmouse.bridge` (X11 popups use
+  override-redirect and cannot be managed by the window manager).
+  GNOME requires an SNI/AppIndicator extension.
+  The backend uses pure Rust D-Bus, with no GTK event loop or additional
+  AppIndicator libraries to bundle in the AppImage.
 - **Alerts:** low-battery and game-profile notices show on Bridge's overlay and
   chime.
 - **Remembered mice:** `devices.json` beside `config.json` keeps every mouse
@@ -166,8 +181,8 @@ written and type-checks against the Windows bindings, but it has never been
 built or run there); anything on Linux; and the GitHub workflows, which have
 not run yet.
 
-Next: Windows (build and run it, then the installer); the Linux tray and
-AppImage, including relaunching `$APPIMAGE` rather than the mounted binary for
+Next: Windows (build and run it, then the installer); Linux desktop tray testing
+and AppImage testing, including relaunching `$APPIMAGE` rather than the mounted binary for
 restart, update and login startup; the in-app updater with `latest.json`;
 moving installs of earlier versions across; `install-linux.sh`, whose package
 lists still name the GTK libraries; and replacing `release.yml`, which still

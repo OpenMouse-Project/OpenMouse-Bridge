@@ -22,7 +22,6 @@ use openmouse_bridge::{
     service::{BridgeService, BridgeSnapshot, Notice},
     updater::{self, UpdateInfo},
 };
-#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::io::Cursor;
 use tokio::{
     net::TcpListener,
@@ -563,8 +562,7 @@ pub(crate) fn notify_natively(notice: &Notice) {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-fn openmouse_icon_rgba() -> Result<(Vec<u8>, u32, u32)> {
+pub(crate) fn openmouse_icon_rgba() -> Result<(Vec<u8>, u32, u32)> {
     let mut decoder =
         png::Decoder::new(Cursor::new(include_bytes!("../assets/openmouse-logo.png")));
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
