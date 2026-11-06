@@ -1553,6 +1553,14 @@ impl Drop for ActiveSessionGuard {
     }
 }
 
+/// Counts as an open control-panel HID session until dropped. The counter is
+/// process-wide, so callers hold `drivers::TEST_NATIVE` alongside it to keep
+/// other native tests from observing the session.
+#[cfg(test)]
+pub(crate) fn hold_client_session() -> impl Sized {
+    ActiveSessionGuard::new()
+}
+
 pub async fn serve(mut socket: WebSocket) {
     let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
     let Ok(_active) = tokio::task::spawn_blocking(ActiveSessionGuard::new).await else {

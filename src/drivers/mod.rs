@@ -203,6 +203,10 @@ pub(crate) fn manual_report_access(
     Ok(access)
 }
 
+/// Serializes tests that drive native HID or the process-wide session count.
+#[cfg(test)]
+pub(crate) static TEST_NATIVE: Mutex<()> = Mutex::new(());
+
 fn ensure_native_ownership() -> Result<()> {
     if crate::hid::client_session_active() {
         return Err(std::io::Error::new(
@@ -259,17 +263,34 @@ pub fn apply_profile(profile: &ApplicationProfile) -> Result<bool> {
     }
 }
 
+/// Whether an automatic reconcile pass reached the hardware.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Reconciled {
+    Done,
+    /// The control panel holds the HID session, so nothing was sent. The
+    /// automation state is untouched, so a later pass after the panel
+    /// disconnects still applies or restores whatever is due.
+    Deferred,
+}
+
+/// Background counterpart of the manual entry points. A panel session is the
+/// expected owner of the mouse, not a failure, so this defers instead of
+/// returning the ownership error. The check runs under `device_access`, which
+/// a new session also takes, so no write can interleave with its traffic.
 pub(crate) fn reconcile_automatic(
     automation: &mut automation::NativeAutomation,
     desired: Option<&ApplicationProfile>,
-) -> Result<()> {
+) -> Result<Reconciled> {
     let access = device_access();
     automation.observe_manual_intent(&access);
-    ensure_native_ownership()?;
+    if crate::hid::client_session_active() {
+        return Ok(Reconciled::Deferred);
+    }
     automation.reconcile(
         desired,
         &mut automation::HelperIo(|request: &serde_json::Value| native_hid::run_helper(request)),
-    )
+    )?;
+    Ok(Reconciled::Done)
 }
 
 /// Reads the onboard-memory state of the mouse `device_id` names
@@ -334,8 +355,6 @@ mod tests {
         }
     }
 
-    static TEST_NATIVE: Mutex<()> = Mutex::new(());
-
     struct FakeNative {
         dpi: u32,
         hz: u32,
@@ -395,6 +414,88 @@ mod tests {
             assert!(apply_settings("Zaunkoenig", Some(3200), None).unwrap());
             reconcile_automatic(&mut automation, None).unwrap();
             assert_eq!(values.lock().unwrap().dpi, 3200);
+        });
+    }
+
+    #[test]
+    fn open_panel_session_defers_automatic_apply_until_it_closes() {
+        let _serial = TEST_NATIVE.lock().unwrap_or_else(|e| e.into_inner());
+        let (values, helper) = fake_native();
+        native_hid::with_test_helper(helper, || {
+            let mut automation = automation::NativeAutomation::default();
+            let mut game = profile("Zaunkoenig:M3K");
+            game.settings.dpi = Some(1600);
+            game.settings.polling_rate_hz = None;
+
+            let session = crate::hid::hold_client_session();
+            for _ in 0..3 {
+                assert_eq!(
+                    reconcile_automatic(&mut automation, Some(&game)).unwrap(),
+                    Reconciled::Deferred
+                );
+            }
+            assert!(values.lock().unwrap().calls.is_empty());
+            assert_eq!(values.lock().unwrap().dpi, 800);
+            drop(session);
+
+            assert_eq!(
+                reconcile_automatic(&mut automation, Some(&game)).unwrap(),
+                Reconciled::Done
+            );
+            assert_eq!(values.lock().unwrap().dpi, 1600);
+        });
+    }
+
+    #[test]
+    fn open_panel_session_defers_automatic_restore_until_it_closes() {
+        let _serial = TEST_NATIVE.lock().unwrap_or_else(|e| e.into_inner());
+        let (values, helper) = fake_native();
+        native_hid::with_test_helper(helper, || {
+            let mut automation = automation::NativeAutomation::default();
+            let mut game = profile("Zaunkoenig:M3K");
+            game.settings.dpi = Some(1600);
+            game.settings.polling_rate_hz = None;
+            reconcile_automatic(&mut automation, Some(&game)).unwrap();
+            assert_eq!(values.lock().unwrap().dpi, 1600);
+
+            let session = crate::hid::hold_client_session();
+            let calls = values.lock().unwrap().calls.len();
+            assert_eq!(
+                reconcile_automatic(&mut automation, None).unwrap(),
+                Reconciled::Deferred
+            );
+            assert_eq!(values.lock().unwrap().calls.len(), calls);
+            assert_eq!(automation.pending_restores_for(None), 1);
+            drop(session);
+
+            assert_eq!(
+                reconcile_automatic(&mut automation, None).unwrap(),
+                Reconciled::Done
+            );
+            assert_eq!(values.lock().unwrap().dpi, 800);
+            assert_eq!(automation.pending_restores_for(None), 0);
+        });
+    }
+
+    #[test]
+    fn open_panel_session_still_refuses_direct_native_writes() {
+        let _serial = TEST_NATIVE.lock().unwrap_or_else(|e| e.into_inner());
+        let (values, helper) = fake_native();
+        native_hid::with_test_helper(helper, || {
+            let _session = crate::hid::hold_client_session();
+            for error in [
+                apply_settings("Zaunkoenig", Some(3200), None).unwrap_err(),
+                apply_profile(&profile("Zaunkoenig:M3K")).unwrap_err(),
+                read_status("Zaunkoenig:M3K").unwrap_err(),
+            ] {
+                assert_eq!(
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .map(std::io::Error::kind),
+                    Some(std::io::ErrorKind::WouldBlock)
+                );
+            }
+            assert!(values.lock().unwrap().calls.is_empty());
         });
     }
 
