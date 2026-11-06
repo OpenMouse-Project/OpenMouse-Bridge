@@ -33,6 +33,8 @@ zip = { version = "9.0", default-features = false, features = ["deflate"] }
 [target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
 # The window is GPUI; see docs/gpui-migration.md.
 gpui-kit = "0.7"
+# Native handles for panel hide/restore operations on each desktop backend.
+raw-window-handle = "0.6"
 # The profile-switch overlay draws its banner on the CPU: skrifa outlines, the
 # vello_cpu rasterizer, and epaint_default_fonts for fallback glyphs.
 epaint_default_fonts = "0.36.1"
@@ -43,8 +45,6 @@ vello_cpu = { version = "0.1", default-features = false, features = ["std", "u8_
 # No default features: they link libxdo (via muda) for menu items Bridge never
 # uses. Linux uses the D-Bus StatusNotifierItem backend below instead.
 tray-icon = { version = "0.24.2", default-features = false }
-# The native window behind a GPUI window, to hide just the panel to the tray.
-raw-window-handle = "0.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Pure Rust StatusNotifierItem/DBusMenu; no GTK loop or AppIndicator shared libraries.
@@ -101,6 +101,8 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 # Exercise the D-Bus backend's pixels and command routing on every CI host.
 ksni = { version = "0.3.7", default-features = false, features = ["blocking", "async-io"] }
+# Type-check the Linux tray's X11 restore request on every CI host too.
+x11rb = "0.13"
 tower = { version = "0.5", features = ["util"] }
 
 [profile.release]

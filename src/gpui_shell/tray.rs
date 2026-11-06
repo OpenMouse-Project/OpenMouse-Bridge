@@ -318,6 +318,7 @@ mod linux;
 mod platform {
     use super::Anchor;
     use gpui_kit::Window;
+    use raw_window_handle::HasWindowHandle;
 
     // GPUI exposes minimization on both X11 and Wayland. Keeping the taskbar
     // entry also provides recovery if the desktop loses its tray host.
@@ -325,6 +326,12 @@ mod platform {
         window.minimize_window();
     }
     pub fn show_window(window: &mut Window) {
+        if let Err(error) = HasWindowHandle::window_handle(window)
+            .map_err(anyhow::Error::from)
+            .and_then(|handle| super::linux::restore_x11_window(handle.as_raw()))
+        {
+            tracing::warn!(%error, "Could not restore the X11 panel");
+        }
         window.activate_window();
     }
     // Wayland compositors control top-level placement; do not interpret the

@@ -19,6 +19,27 @@ pub(super) fn available() -> bool {
     AVAILABLE.load(Ordering::Relaxed)
 }
 
+/// ICCCM Iconic -> Normal requires mapping the client window. GPUI's X11
+/// activate only requests focus through _NET_ACTIVE_WINDOW, which the WM may
+/// reject. Map first so restoration does not depend on that focus request.
+pub(super) fn restore_x11_window(handle: raw_window_handle::RawWindowHandle) -> Result<()> {
+    use raw_window_handle::RawWindowHandle;
+    use x11rb::protocol::xproto::ConnectionExt as _;
+
+    // GPUI's X11 backend exposes Xcb handles. Native Wayland windows must not
+    // open an X connection, even when DISPLAY is also set for XWayland.
+    let RawWindowHandle::Xcb(handle) = handle else {
+        return Ok(());
+    };
+    let (connection, _) = x11rb::connect(None).context("could not open the X display")?;
+    connection
+        .map_window(handle.window.get())
+        .context("could not request X11 panel restoration")?
+        .check()
+        .context("could not map the X11 panel")?;
+    Ok(())
+}
+
 pub(super) struct Handle {
     service: ksni::blocking::Handle<LinuxTray>,
     sender: mpsc::Sender<Command>,
@@ -183,6 +204,13 @@ fn argb_icon(mut rgba: Vec<u8>, width: u32, height: u32) -> ksni::Icon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wayland_restore_does_not_require_an_x_connection() {
+        use raw_window_handle::{RawWindowHandle, WaylandWindowHandle};
+        let handle = WaylandWindowHandle::new(std::ptr::NonNull::dangling());
+        restore_x11_window(RawWindowHandle::Wayland(handle)).unwrap();
+    }
 
     #[test]
     fn watcher_loss_during_startup_is_not_overwritten() {

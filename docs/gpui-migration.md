@@ -140,7 +140,9 @@ GPUI is the only window: the egui panel, `native_ui.rs`, `eframe`, `gtk` and the
   returns. GPUI/compositors handle placement and activation, so Linux does not
   place the panel beside the icon. Wayland compositors may reject activation
   requests from the tray; the taskbar entry remains available. Linux uses a
-  normal minimizable window with app ID `io.openmouse.bridge` (X11 popups use
+  normal minimizable window with app ID `io.openmouse.bridge`. X11 activation
+  explicitly maps the panel before requesting focus, so a rejected focus
+  request does not leave it minimized (X11 popups use
   override-redirect and cannot be managed by the window manager).
   GNOME requires an SNI/AppIndicator extension.
   The backend uses pure Rust D-Bus, with no GTK event loop or additional
