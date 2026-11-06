@@ -62,6 +62,7 @@ const KNOWN_BRANDS: &[(&str, &[u16])] = &[
     ("Wooting", &[0x31e3]),
     ("Microsoft", &[0x045e]),
     ("WALLHACK", &[0x3879, 0x1caa]),
+    ("G-Wolves", &[0x33e4]),
 ];
 
 /// The brand a model name starts with ("Attack Shark R5 Ultra" is Attack

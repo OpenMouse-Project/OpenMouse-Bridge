@@ -37,7 +37,7 @@
 // imports in probe() below.
 globalThis.window ??= globalThis;
 
-import { BRAND_DRIVERS, brandKey } from "./brands.mjs";
+import { BRAND_DRIVERS, brandKey, classesFor } from "./brands.mjs";
 import { applyX11PollingRate, x11DeviceInfos } from "./attack-shark-x11.mjs";
 import { candidateDevices, probeVerifiedDevice } from "./hid-device-adapter.mjs";
 import { devices } from "node-hid";
@@ -120,7 +120,7 @@ async function main() {
   let status = null;
   outer: for (const vendorId of entry.vendorIds) {
     for (const device of candidateDevices(vendorId)) {
-      for (const candidate of entry.classes) {
+      for (const candidate of classesFor(entry, device.productId)) {
         try {
           ({ client, status } = await probe(device, candidate));
           break outer;

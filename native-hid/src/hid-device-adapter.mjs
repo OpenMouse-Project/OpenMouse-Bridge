@@ -55,6 +55,8 @@ export class HidDeviceAdapter {
     this._Handle = Handle;
     this._devices = [];
     this._listeners = new Set();
+    // Frame length last sent per feature report id (see receiveFeatureReport).
+    this._featureLengths = new Map();
     this._onData = this._onData.bind(this);
     this._onError = this._onError.bind(this);
   }
@@ -108,6 +110,7 @@ export class HidDeviceAdapter {
       device.close();
     }
     this._devices = [];
+    this._featureLengths.clear();
     this.opened = false;
   }
 
@@ -150,6 +153,7 @@ export class HidDeviceAdapter {
       }
     }
     if (!sent) throw lastError ?? new Error("No HID interface accepted the feature report.");
+    this._featureLengths.set(reportId, frame.length);
   }
 
   /**
@@ -158,7 +162,11 @@ export class HidDeviceAdapter {
    * from the parsed report descriptor. Drivers here call this with the
    * length they themselves expect back baked into their own retry/parsing
    * logic, so a generous fixed buffer (the largest report any known driver
-   * here uses) is safe — short replies are simply the leading bytes of it.
+   * here uses) is safe on most firmware — short replies are simply the
+   * leading bytes of it. Some firmware stalls a request longer than its
+   * report instead (the wired G-Wolves HTS Ultra, 0x33e4:0x5308, fails 91
+   * bytes and answers 65), so a report id the driver sent on this handle is
+   * asked again at the length it was sent at when the generous read fails.
    *
    * Classic Razer's control protocol is the largest: 90-byte feature reports
    * on report id 0 (mouse-protocol/src/razer/codec.ts, RAZER_PACKET_LENGTH =
@@ -178,19 +186,24 @@ export class HidDeviceAdapter {
    */
   async receiveFeatureReport(reportId) {
     this._requireOpen();
-    // Largest driver payload (Razer's 90-byte feature report) + the id byte.
-    const requestedLen = 91;
+    // Largest driver payload (Razer's 90-byte feature report) + the id byte,
+    // then the length this id was sent at.
+    const generousLen = 91;
+    const sentLen = this._featureLengths.get(reportId);
+    const lengths = sentLen && sentLen < generousLen ? [generousLen, sentLen] : [generousLen];
     let lastError;
-    for (const device of this._devices) {
-      try {
-        // node-hid's sync HID.getFeatureReport returns a number[] (its
-        // HIDAsync variant returns a Buffer), so normalize to Uint8Array
-        // before slicing.
-        const raw = Uint8Array.from(device.getFeatureReport(reportId, requestedLen));
-        const payload = raw.length > 1 && raw[0] === reportId ? raw.subarray(1) : raw;
-        return new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
-      } catch (error) {
-        lastError = error;
+    for (const requestedLen of lengths) {
+      for (const device of this._devices) {
+        try {
+          // node-hid's sync HID.getFeatureReport returns a number[] (its
+          // HIDAsync variant returns a Buffer), so normalize to Uint8Array
+          // before slicing.
+          const raw = Uint8Array.from(device.getFeatureReport(reportId, requestedLen));
+          const payload = raw.length > 1 && raw[0] === reportId ? raw.subarray(1) : raw;
+          return new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+        } catch (error) {
+          lastError = error;
+        }
       }
     }
     throw lastError ?? new Error("No HID interface answered the feature report request.");

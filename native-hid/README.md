@@ -113,6 +113,7 @@ runtime first and falls back to `node` on `PATH`, so local development
 - Other adapter and dispatch paths are structurally tested (module resolution,
   exit codes and control flow) and still require validation on their respective
   hardware.
-- G-Wolves is deliberately left out of `brands.mjs`: it isn't a finished,
-  exported driver in `mouse-protocol` yet (untracked source, no
-  `package.json` export, no `registry.ts` entry as of this writing).
+- G-Wolves DPI and polling were hardware-verified on Windows with the HTS
+  Ultra 8K wireless receiver (PID `0x5317`, XVI protocol): each value was
+  written, then read back from the mouse. The wired PIDs and the `xvi-new`
+  and `gwolves` protocol classes have not been tried on hardware.
