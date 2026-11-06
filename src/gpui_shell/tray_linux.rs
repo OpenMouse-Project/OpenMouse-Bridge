@@ -121,13 +121,14 @@ pub(super) fn install() -> Result<(mpsc::Receiver<Command>, Handle)> {
     let (icon, tooltip) = presentation(None)?;
     // With no session bus or SNI host, spawn fails and the panel stays visible.
     // Do not assume_sni_available: GNOME without an extension has no tray.
-    let handle = LinuxTray {
-        sender: sender.clone(),
-        icon,
-        tooltip,
-    }
-    .spawn()?;
-    AVAILABLE.store(true, Ordering::Relaxed);
+    let handle = start_with_availability(&AVAILABLE, || {
+        Ok(LinuxTray {
+            sender: sender.clone(),
+            icon,
+            tooltip,
+        }
+        .spawn()?)
+    })?;
     Ok((
         receiver,
         Handle {
@@ -135,6 +136,20 @@ pub(super) fn install() -> Result<(mpsc::Receiver<Command>, Handle)> {
             sender,
         },
     ))
+}
+
+fn start_with_availability<T>(
+    availability: &AtomicBool,
+    start: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    // spawn can deliver watcher callbacks before returning. Initialize first
+    // so a startup loss notification cannot be overwritten by a later store.
+    availability.store(true, Ordering::Relaxed);
+    let result = start();
+    if result.is_err() {
+        availability.store(false, Ordering::Relaxed);
+    }
+    result
 }
 
 fn presentation(battery: Option<&TrayBattery>) -> Result<(ksni::Icon, String)> {
@@ -168,6 +183,30 @@ fn argb_icon(mut rgba: Vec<u8>, width: u32, height: u32) -> ksni::Icon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watcher_loss_during_startup_is_not_overwritten() {
+        let availability = AtomicBool::new(false);
+        start_with_availability(&availability, || {
+            assert!(availability.load(Ordering::Relaxed));
+            // Model watcher_offline running before spawn returns its handle.
+            availability.store(false, Ordering::Relaxed);
+            Ok(())
+        })
+        .unwrap();
+        assert!(!availability.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn startup_success_and_failure_set_availability() {
+        let availability = AtomicBool::new(false);
+        start_with_availability(&availability, || Ok(())).unwrap();
+        assert!(availability.load(Ordering::Relaxed));
+        let result: Result<()> =
+            start_with_availability(&availability, || anyhow::bail!("tray registration failed"));
+        assert!(result.is_err());
+        assert!(!availability.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn icon_uses_network_order_argb_with_alpha_preserved() {
