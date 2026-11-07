@@ -14,8 +14,28 @@ env:
   NATIVE_HID_NODE_VERSION: v24.18.1
 
 jobs:
+  preflight:
+    name: Check the version and changelog
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      # Fails in a minute, before an hour of builds, when the tag, Cargo.toml
+      # and CHANGELOG.md disagree.
+      - name: Verify tag matches Cargo version
+        run: test "v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" = "${{ github.ref_name }}"
+      - name: Verify CHANGELOG.md has an entry for this version
+        run: |
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            import { changelogEntry, versionFromTag } from "./.github/scripts/make-release-files.mjs";
+            changelogEntry(readFileSync("CHANGELOG.md", "utf8"), versionFromTag(process.argv[1]));
+          ' "${{ github.ref_name }}"
   windows:
     name: Windows x64
+    needs: preflight
     runs-on: windows-latest
     env:
       WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
@@ -112,6 +132,7 @@ jobs:
 
   macos:
     name: macOS universal
+    needs: preflight
     runs-on: macos-14
     # Signing and notarization are automatic when these secrets exist;
     # without them the app is ad-hoc signed.
@@ -237,11 +258,14 @@ jobs:
             OpenMouse-Bridge-macos-universal.dmg
   linux:
     name: Linux x64
-    runs-on: ubuntu-24.04
+    needs: preflight
+    # The oldest runner image on offer, so the AppImage runs on any distro
+    # whose glibc is at least that old (as in gpui-build.yml).
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
       - name: Install Linux HID and GUI dependencies
-        run: sudo apt-get update && sudo apt-get install -y build-essential clang cmake pkg-config libudev-dev libssl-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libvulkan-dev libgl1-mesa-dev libfontconfig-dev libfreetype-dev libasound2-dev
+        run: sudo apt-get update && sudo apt-get install -y build-essential clang cmake pkg-config libudev-dev libssl-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libvulkan-dev libgl1-mesa-dev libfontconfig-dev libfreetype-dev libasound2-dev appstream
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -283,6 +307,62 @@ jobs:
           packaging/bridge/build-bridge-package.sh openmouse-bridge openmouse-bridge-linux-x64.zip openmouse-app-icon.png
           rm openmouse-bridge openmouse-app-icon.png
           sha256sum openmouse-bridge-linux-x64.zip > openmouse-bridge-linux-x64.zip.sha256
+      # The AppImage is the Linux install the in-app updater updates. Same
+      # steps as gpui-build.yml; keep them in sync.
+      - name: Assemble the AppDir
+        run: |
+          set -euo pipefail
+          appdir=AppDir
+          # Bridge finds native-hid next to its executable, so they sit together.
+          install -Dm755 target/release/openmouse-bridge "$appdir/usr/bin/openmouse-bridge"
+          cp -R native-hid "$appdir/usr/bin/native-hid"
+          cp assets/fonts/DM-Sans-OFL.txt README.md "$appdir/usr/bin/"
+          cp assets/openmouse-app-icon.png "$appdir/io.openmouse.bridge.png"
+          cp assets/openmouse-app-icon.png "$appdir/.DirIcon"
+          install -Dm644 packaging/linux/io.openmouse.bridge.appdata.xml \
+            "$appdir/usr/share/metainfo/io.openmouse.bridge.appdata.xml"
+          cat > "$appdir/io.openmouse.bridge.desktop" <<'DESKTOP'
+          [Desktop Entry]
+          Type=Application
+          Name=OpenMouse Bridge
+          Comment=Local companion for the OpenMouse control panel
+          Exec=openmouse-bridge
+          Icon=io.openmouse.bridge
+          Categories=Utility;
+          Terminal=false
+          DESKTOP
+          install -Dm644 "$appdir/io.openmouse.bridge.desktop" \
+            "$appdir/usr/share/applications/io.openmouse.bridge.desktop"
+          install -Dm644 assets/openmouse-app-icon.png \
+            "$appdir/usr/share/icons/hicolor/512x512/apps/io.openmouse.bridge.png"
+          cat > "$appdir/AppRun" <<'APPRUN'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/openmouse-bridge" "$@"
+          APPRUN
+          chmod +x "$appdir/AppRun"
+          appstreamcli validate "$appdir/usr/share/metainfo/io.openmouse.bridge.appdata.xml"
+      - name: Build the AppImage
+        run: |
+          set -euo pipefail
+          curl -fsSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          # Runners have no FUSE, so the tool unpacks itself and runs from there.
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run AppDir OpenMouse-Bridge-linux-x86_64.AppImage
+          sha256sum OpenMouse-Bridge-linux-x86_64.AppImage > OpenMouse-Bridge-linux-x86_64.AppImage.sha256
+      - name: Check the AppImage contents
+        run: |
+          set -euo pipefail
+          chmod +x OpenMouse-Bridge-linux-x86_64.AppImage
+          ./OpenMouse-Bridge-linux-x86_64.AppImage --appimage-extract > /dev/null
+          test -x squashfs-root/usr/bin/openmouse-bridge
+          test -x squashfs-root/usr/bin/native-hid/node/bin/node
+          test -f squashfs-root/usr/bin/native-hid/src/apply.mjs
+          test -f squashfs-root/usr/bin/DM-Sans-OFL.txt
+          test -f squashfs-root/usr/share/metainfo/io.openmouse.bridge.appdata.xml
+          test -f squashfs-root/usr/share/applications/io.openmouse.bridge.desktop
+          # Every shared library the binary needs must resolve on this machine.
+          ! ldd squashfs-root/usr/bin/openmouse-bridge | grep 'not found'
       - uses: actions/upload-artifact@v6
         with:
           name: bridge-linux
@@ -291,32 +371,46 @@ jobs:
             openmouse-bridge-linux-x64.zip.sha256
             openmouse-bridge-linux-x64-full.zip
             openmouse-bridge-linux-x64-full.zip.sha256
+            OpenMouse-Bridge-linux-x86_64.AppImage
+            OpenMouse-Bridge-linux-x86_64.AppImage.sha256
+          if-no-files-found: error
   release:
     name: Publish stable release
     needs: [windows, macos, linux]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Verify tag matches Cargo version
-        run: test "v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" = "${{ github.ref_name }}"
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
       - uses: actions/download-artifact@v7
         with:
           path: artifacts
           merge-multiple: true
-      - name: Publish changelog and artifacts
+      - name: Write latest.json and the release notes
+        # latest.json is what the in-app updater reads
+        # (releases/latest/download/latest.json): the version, its
+        # CHANGELOG.md entry, and each platform's asset with its SHA-256.
+        run: |
+          set -euo pipefail
+          mkdir release
+          node .github/scripts/make-release-files.mjs "${{ github.ref_name }}" "${{ github.repository }}" artifacts release
+          cat release/latest.json
+      - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Re-cutting a tag replaces the assets of the existing release
-          # instead of deleting it, so the release is never missing.
+          # Re-cutting a tag replaces the assets and notes of the existing
+          # release instead of deleting it, so the release is never missing.
           if gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release upload "${{ github.ref_name }}" --repo "${{ github.repository }}" --clobber artifacts/*
+            gh release upload "${{ github.ref_name }}" --repo "${{ github.repository }}" --clobber artifacts/* release/latest.json
+            gh release edit "${{ github.ref_name }}" --repo "${{ github.repository }}" --notes-file release/notes.md
           else
             gh release create "${{ github.ref_name }}" \
               --repo "${{ github.repository }}" \
               --verify-tag \
-              --generate-notes \
+              --notes-file release/notes.md \
               --latest \
-              artifacts/*
+              artifacts/* release/latest.json
           fi

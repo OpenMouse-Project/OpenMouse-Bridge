@@ -223,5 +223,7 @@ X11, GNOME and other desktops (KDE Plasma on Wayland has been run) and AppImage
 testing, including relaunching `$APPIMAGE` rather than the mounted binary for
 restart, update and login startup; the in-app updater with `latest.json`;
 moving installs of earlier versions across; `install-linux.sh`, whose package
-lists still name the GTK libraries; and replacing `release.yml`, which still
-builds the older zip packages.
+lists still name the GTK libraries; and, once the installs have moved across,
+dropping the older zip packages `release.yml` still builds for them. (The
+release now also builds the AppImage and publishes `latest.json` from
+`CHANGELOG.md`.)

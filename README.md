@@ -357,8 +357,11 @@ blocked nodes are also listed in `/v1/status` as `blockedHidDevices`.
 Development builds remain available as workflow artifacts for individual runs.
 
 Pushing a stable version tag such as `v1.0.0` publishes it as the latest GitHub
-release with generated changelog notes, a Windows x64 installer and archives,
-universal macOS and Linux x64 archives, and SHA-256 checksums. Windows signing
+release with its `CHANGELOG.md` entry as the notes, a Windows x64 installer and
+archives, a macOS DMG and archives, a Linux AppImage and archives, SHA-256
+checksums, and `latest.json`, which the in-app updater reads. The tag must
+match `Cargo.toml`'s version and `CHANGELOG.md` must have an entry for it, or
+the release stops before building. Windows signing
 is automatic when the repository has `WINDOWS_CERTIFICATE_BASE64` and
 `WINDOWS_CERTIFICATE_PASSWORD` secrets; unsigned development builds continue
 to work without those secrets.
