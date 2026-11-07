@@ -21,7 +21,8 @@ pub struct BridgeConfig {
     pub battery_threshold_percent: u8,
     #[serde(default = "default_alert_cooldown")]
     pub alert_cooldown_minutes: u64,
-    #[serde(default)]
+    /// On unless turned off: new installs keep themselves up to date.
+    #[serde(default = "enabled_by_default")]
     pub automatic_updates: bool,
     /// Whether the on-screen banner plays a chime, and how loud (0–100).
     #[serde(default = "enabled_by_default")]
@@ -192,7 +193,7 @@ impl Default for BridgeConfig {
         Self {
             battery_threshold_percent: DEFAULT_BATTERY_THRESHOLD,
             alert_cooldown_minutes: DEFAULT_ALERT_COOLDOWN_MINUTES,
-            automatic_updates: false,
+            automatic_updates: true,
             notification_sound: true,
             notification_volume: DEFAULT_NOTIFICATION_VOLUME,
             tray_battery_style: default_tray_battery_style(),
@@ -596,6 +597,15 @@ mod tests {
             serde_json::to_value(legacy).unwrap()["localApplications"],
             serde_json::json!([])
         );
+    }
+
+    #[test]
+    fn automatic_updates_are_on_unless_turned_off() {
+        assert!(BridgeConfig::default().automatic_updates);
+        let missing: BridgeConfig = serde_json::from_str("{}").unwrap();
+        assert!(missing.automatic_updates);
+        let off: BridgeConfig = serde_json::from_str(r#"{"automaticUpdates": false}"#).unwrap();
+        assert!(!off.automatic_updates);
     }
 
     #[test]

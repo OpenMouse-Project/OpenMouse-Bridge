@@ -151,7 +151,10 @@ pub(crate) enum BridgeCommand {
     SetHybridMode(bool),
     SetTrayBatteryStyle(platform::TrayBatteryStyle),
     CheckForUpdates,
+    /// Download and stage an update; it applies on "Restart to update".
     InstallUpdate(UpdateInfo),
+    /// Restart into the staged update.
+    ApplyUpdate,
     AcknowledgeTrayHint,
     ForgetBattery(String),
 }
@@ -166,9 +169,15 @@ pub(crate) enum UpdateEvent {
     UpToDate,
     Available(UpdateInfo),
     Downloading(String),
+    /// Downloaded and verified; waiting for "Restart to update".
+    Ready(String),
     Restarting(String),
     Failed(String),
 }
+
+/// How often Bridge looks for an update while automatic updates are on, on
+/// top of the check at launch.
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 pub(crate) struct BackgroundServer {
     shutdown: Option<oneshot::Sender<()>>,
@@ -382,8 +391,27 @@ fn run_server(
             }
         });
 
+        let timer_service = service.clone();
+        let timer_events = update_events.clone();
+        let update_timer = tokio::spawn(async move {
+            if updater::is_stub_install() {
+                return;
+            }
+            loop {
+                tokio::time::sleep(UPDATE_CHECK_INTERVAL).await;
+                if timer_service.snapshot().await.automatic_updates {
+                    check_for_updates(true, &timer_events).await;
+                }
+            }
+        });
+
         let command_service = service.clone();
         let command_handler = tokio::spawn(async move {
+            // An update helper that failed left a note for this launch.
+            if let Some(error) = updater::take_last_failure() {
+                tracing::warn!(%error, "the last Bridge update did not install");
+                let _ = update_events.try_send(UpdateEvent::Failed(error));
+            }
             // A stub install can't run its HID helper yet; finishing it comes
             // before any ordinary update check.
             if updater::is_stub_install() {
@@ -436,6 +464,17 @@ fn run_server(
                     BridgeCommand::InstallUpdate(update) => {
                         install_update(update, &update_events).await;
                     }
+                    BridgeCommand::ApplyUpdate => match updater::apply_prepared() {
+                        Ok(version) => {
+                            tracing::info!(%version, "restarting into the staged update");
+                            let _ = update_events.try_send(UpdateEvent::Restarting(version));
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "could not start the Bridge update");
+                            let _ =
+                                update_events.try_send(UpdateEvent::Failed(format!("{error:#}")));
+                        }
+                    },
                     BridgeCommand::ForgetBattery(device_id) => {
                         command_service.forget_battery(&device_id).await;
                     }
@@ -465,6 +504,9 @@ fn run_server(
             }
         };
         tracing::info!(%address, config = %path.display(), "OpenMouse Bridge is ready");
+        // Only now is this the one Bridge running, so nothing else can be
+        // about to apply a download this removes.
+        tokio::task::spawn_blocking(updater::remove_stale_downloads);
         let _ = ready.send(Ok(Startup::Serving { show_panel }));
         let outcome = axum::serve(listener, api::router(service, &origins))
             .with_graceful_shutdown(async {
@@ -472,16 +514,22 @@ fn run_server(
             })
             .await;
         snapshot_publisher.abort();
+        update_timer.abort();
         command_handler.abort();
         outcome?;
         Ok(())
     })
 }
 
+/// Checks `latest.json`. With `install_automatically`, an update this install
+/// can apply is downloaded and staged straight away; otherwise (or for one it
+/// cannot apply) the panel offers it.
 async fn check_for_updates(install_automatically: bool, events: &SyncSender<UpdateEvent>) {
     let _ = events.try_send(UpdateEvent::Checking);
     match updater::check_for_update().await {
-        Ok(Some(update)) if install_automatically => install_update(update, events).await,
+        Ok(Some(update)) if install_automatically && update.manual_download_url().is_none() => {
+            install_update(update, events).await
+        }
         Ok(Some(update)) => {
             let _ = events.try_send(UpdateEvent::Available(update));
         }
@@ -505,7 +553,12 @@ async fn finish_stub_install(events: SyncSender<UpdateEvent>) {
             Ok(update) => {
                 let version = update.version.clone();
                 let _ = events.try_send(UpdateEvent::Downloading(version.clone()));
-                updater::download_and_stage(&update).await.map(|()| version)
+                // The install is unusable until it has its payload, so it
+                // restarts into it at once rather than waiting for the user.
+                match updater::prepare(&update).await {
+                    Ok(()) => updater::apply_prepared(),
+                    Err(error) => Err(error),
+                }
             }
             Err(error) => Err(error),
         };
@@ -524,12 +577,15 @@ async fn finish_stub_install(events: SyncSender<UpdateEvent>) {
     }
 }
 
+/// Downloads and stages `update`; it applies when the user restarts into it.
 async fn install_update(update: UpdateInfo, events: &SyncSender<UpdateEvent>) {
     let version = update.version.clone();
-    let _ = events.try_send(UpdateEvent::Downloading(version.clone()));
-    match updater::download_and_stage(&update).await {
+    if updater::prepared_version().as_deref() != Some(version.as_str()) {
+        let _ = events.try_send(UpdateEvent::Downloading(version.clone()));
+    }
+    match updater::prepare(&update).await {
         Ok(()) => {
-            let _ = events.try_send(UpdateEvent::Restarting(version));
+            let _ = events.try_send(UpdateEvent::Ready(version));
         }
         Err(error) => {
             tracing::error!(%error, "Bridge update failed");

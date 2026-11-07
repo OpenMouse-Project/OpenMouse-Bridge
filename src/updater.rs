@@ -28,11 +28,39 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 #[cfg(any(target_os = "macos", test))]
 const MACOS_APP_NAME: &str = "OpenMouse Bridge.app";
 
+mod feed;
+
 #[derive(Clone, Debug)]
 pub struct UpdateInfo {
     pub version: String,
-    archive_url: String,
-    checksum_url: String,
+    /// The release notes from `latest.json`; empty for a stub completion.
+    pub notes: String,
+    source: UpdateSource,
+}
+
+#[derive(Clone, Debug)]
+enum UpdateSource {
+    /// A `-full` zip from the GitHub release listing, which a stub install
+    /// (see [`is_stub_install`]) fetches to finish itself.
+    Legacy {
+        archive_url: String,
+        checksum_url: String,
+    },
+    /// This install's asset in `latest.json`.
+    Feed {
+        kind: feed::InstallKind,
+        asset: feed::FeedAsset,
+    },
+    /// A newer release this install cannot apply by itself.
+    Manual,
+}
+
+impl UpdateInfo {
+    /// Where to download the update by hand, for an install that cannot
+    /// replace itself (a bare binary, or a release missing this platform).
+    pub fn manual_download_url(&self) -> Option<&'static str> {
+        matches!(self.source, UpdateSource::Manual).then_some(feed::RELEASES_PAGE)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,9 +75,44 @@ struct ReleaseAsset {
     browser_download_url: String,
 }
 
+/// Reads `latest.json` and returns the update it offers this install, if the
+/// release is newer than the running Bridge.
 pub async fn check_for_update() -> Result<Option<UpdateInfo>> {
-    let release = fetch_latest_release().await?;
-    select_update(release, crate::BRIDGE_VERSION)
+    let url = env::var(feed::FEED_URL_ENV).unwrap_or_else(|_| feed::LATEST_JSON_URL.to_owned());
+    let client = reqwest::Client::builder()
+        .timeout(CHECK_TIMEOUT)
+        .build()
+        .context("could not create the update client")?;
+    let response = client
+        .get(&url)
+        .header(reqwest::header::USER_AGENT, USER_AGENT)
+        .send()
+        .await
+        .with_context(|| format!("could not check {url}"))?
+        .error_for_status()
+        .with_context(|| format!("update check failed for {url}"))?;
+    let bytes = read_bounded_response(response, MAX_RELEASE_BYTES).await?;
+    let latest: feed::Feed =
+        serde_json::from_slice(&bytes).context("could not parse latest.json")?;
+    let kind = feed::current_install_kind();
+    Ok(
+        match feed::offer(&latest, crate::BRIDGE_VERSION, kind.as_ref())? {
+            feed::Offer::None => None,
+            feed::Offer::Install { version, asset } => Some(UpdateInfo {
+                version: version.to_string(),
+                notes: latest.notes,
+                source: UpdateSource::Feed {
+                    kind: kind.context("an install offer needs an install kind")?,
+                    asset,
+                },
+            }),
+            feed::Offer::Manual { version } => Some(UpdateInfo {
+                version: version.to_string(),
+                notes: latest.notes,
+                source: UpdateSource::Manual,
+            }),
+        },
+    )
 }
 
 /// The release to finish a stub install with: the latest one, even when it is
@@ -129,32 +192,178 @@ pub fn download_progress() -> DownloadProgress {
     }
 }
 
-pub async fn download_and_stage(update: &UpdateInfo) -> Result<()> {
-    claim_install()?;
-    let result = download_and_stage_claimed(update).await;
-    if result.is_err() {
-        release_install_claim();
-    }
-    result
+/// An update that has been downloaded, verified and staged, waiting for
+/// Bridge to restart into it.
+struct Prepared {
+    version: String,
+    plan: ApplyPlan,
 }
 
-async fn download_and_stage_claimed(update: &UpdateInfo) -> Result<()> {
+/// How a prepared update is applied once Bridge has exited.
+enum ApplyPlan {
+    /// The shell or PowerShell helpers swap files in: a `-full` zip for a
+    /// stub install, or a macOS bundle from the app zip.
+    Package {
+        staging: StagingDirectory,
+        target: PackageTarget,
+    },
+    /// The new installer runs silently over this install (Windows).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Installer {
+        staging: StagingDirectory,
+        installer: std::path::PathBuf,
+        destination: std::path::PathBuf,
+        executable: std::path::PathBuf,
+    },
+    /// The new AppImage replaces the file this one runs from (Linux).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    AppImage {
+        staged: StagedFile,
+        target: std::path::PathBuf,
+    },
+}
+
+enum PackageTarget {
+    /// The executable and its files, flat in `install_directory`.
+    Flat {
+        install_directory: std::path::PathBuf,
+        executable: std::path::PathBuf,
+    },
+    /// A `.app` replaced as a whole, so its code signature stays intact.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Bundle {
+        install_directory: std::path::PathBuf,
+        bundle_name: std::ffi::OsString,
+    },
+}
+
+/// A staged file next to its target, removed again unless a helper took it.
+struct StagedFile {
+    path: std::path::PathBuf,
+    handed_off: bool,
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        if !self.handed_off {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// The update waiting for a restart, if any. Holding one keeps the install
+/// claim, so a second download cannot race it.
+static PREPARED: std::sync::Mutex<Option<Prepared>> = std::sync::Mutex::new(None);
+
+fn prepared() -> std::sync::MutexGuard<'static, Option<Prepared>> {
+    PREPARED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The version staged and waiting for "Restart to update", if any.
+pub fn prepared_version() -> Option<String> {
+    prepared().as_ref().map(|prepared| prepared.version.clone())
+}
+
+/// Downloads `update`, verifies it and stages it, without applying it: that
+/// waits for [`apply_prepared`]. Preparing the version already staged does
+/// nothing; a different one replaces it.
+pub async fn prepare(update: &UpdateInfo) -> Result<()> {
+    {
+        let mut staged = prepared();
+        if staged
+            .as_ref()
+            .is_some_and(|prepared| prepared.version == update.version)
+        {
+            return Ok(());
+        }
+        if staged.take().is_some() {
+            release_install_claim();
+        }
+    }
+    claim_install()?;
+    match prepare_claimed(update).await {
+        Ok(plan) => {
+            *prepared() = Some(Prepared {
+                version: update.version.clone(),
+                plan,
+            });
+            Ok(())
+        }
+        Err(error) => {
+            release_install_claim();
+            Err(error)
+        }
+    }
+}
+
+/// Hands the staged update to its helper, which waits for this process to
+/// exit, applies it and starts Bridge again. Returns the version; the caller
+/// must then exit.
+pub fn apply_prepared() -> Result<String> {
+    let Prepared { version, plan } = prepared().take().context("no update is ready to install")?;
+    if let Err(error) = plan.apply() {
+        release_install_claim();
+        return Err(error);
+    }
+    Ok(version)
+}
+
+async fn prepare_claimed(update: &UpdateInfo) -> Result<ApplyPlan> {
     let client = reqwest::Client::builder()
         .timeout(DOWNLOAD_TIMEOUT)
         .build()
         .context("could not create the update download client")?;
     DOWNLOADED.store(0, Ordering::Relaxed);
     DOWNLOAD_TOTAL.store(0, Ordering::Relaxed);
-    let (archive, checksum) = tokio::try_join!(
-        download(&client, &update.archive_url, MAX_ARCHIVE_BYTES, true),
-        download(&client, &update.checksum_url, MAX_CHECKSUM_BYTES, false),
-    )?;
-    verify_checksum(&archive, &checksum)?;
     let version = update.version.clone();
-    tokio::task::spawn_blocking(move || stage_archive(&archive, &version))
+    match &update.source {
+        UpdateSource::Legacy {
+            archive_url,
+            checksum_url,
+        } => {
+            let (archive, checksum) = tokio::try_join!(
+                download(&client, archive_url, MAX_ARCHIVE_BYTES, true),
+                download(&client, checksum_url, MAX_CHECKSUM_BYTES, false),
+            )?;
+            verify_checksum(&archive, &checksum)?;
+            spawn_staging(move || prepare_archive(&archive, &version)).await
+        }
+        UpdateSource::Feed { kind, asset } => {
+            let limit = usize::try_from(asset.size).context("update is too large")?;
+            let bytes = download(&client, &asset.url, limit, true).await?;
+            ensure!(
+                bytes.len() as u64 == asset.size,
+                "update download is {} bytes, latest.json says {}",
+                bytes.len(),
+                asset.size
+            );
+            verify_digest(&bytes, &asset.sha256)?;
+            match kind.clone() {
+                feed::InstallKind::MacBundle => {
+                    spawn_staging(move || prepare_archive(&bytes, &version)).await
+                }
+                feed::InstallKind::WindowsInstaller => {
+                    spawn_staging(move || prepare_installer(&bytes)).await
+                }
+                feed::InstallKind::LinuxAppImage { path } => {
+                    spawn_staging(move || prepare_appimage(&bytes, &path)).await
+                }
+            }
+        }
+        UpdateSource::Manual => {
+            anyhow::bail!("this install cannot update itself; download the new version instead")
+        }
+    }
+}
+
+async fn spawn_staging(
+    stage: impl FnOnce() -> Result<ApplyPlan> + Send + 'static,
+) -> Result<ApplyPlan> {
+    tokio::task::spawn_blocking(stage)
         .await
-        .context("update staging task stopped unexpectedly")??;
-    Ok(())
+        .context("update staging task stopped unexpectedly")?
 }
 
 async fn download(
@@ -229,15 +438,6 @@ fn release_version(release: &Release) -> Result<Version> {
         .with_context(|| format!("release {} has an invalid version", release.tag_name))
 }
 
-fn select_update(release: Release, current: &str) -> Result<Option<UpdateInfo>> {
-    let current = Version::parse(current).context("Bridge has an invalid current version")?;
-    let available = release_version(&release)?;
-    if available <= current {
-        return Ok(None);
-    }
-    package_update(&release, available).map(Some)
-}
-
 fn select_completion(release: Release, current: &str) -> Result<UpdateInfo> {
     let current = Version::parse(current).context("Bridge has an invalid current version")?;
     let available = release_version(&release)?;
@@ -255,8 +455,11 @@ fn package_update(release: &Release, available: Version) -> Result<UpdateInfo> {
     let checksum_url = asset_url(&release.assets, &checksum_name)?;
     Ok(UpdateInfo {
         version: available.to_string(),
-        archive_url,
-        checksum_url,
+        notes: String::new(),
+        source: UpdateSource::Legacy {
+            archive_url,
+            checksum_url,
+        },
     })
 }
 
@@ -335,6 +538,15 @@ fn verify_checksum(archive: &[u8], checksum_file: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Checks `bytes` against the SHA-256 `latest.json` gave for them.
+fn verify_digest(bytes: &[u8], expected: &str) -> Result<()> {
+    ensure!(
+        format!("{:x}", Sha256::digest(bytes)).eq_ignore_ascii_case(expected),
+        "update checksum does not match"
+    );
+    Ok(())
+}
+
 struct StagingDirectory {
     path: std::path::PathBuf,
     handed_off: bool,
@@ -371,8 +583,9 @@ impl Drop for StagingDirectory {
     }
 }
 
-fn stage_archive(archive: &[u8], version: &str) -> Result<()> {
-    Version::parse(version).context("invalid update version")?;
+/// Where update staging directories go: the private user cache on Windows,
+/// the temporary directory elsewhere.
+fn staging_parent() -> Result<std::path::PathBuf> {
     #[cfg(windows)]
     let parent = directories::BaseDirs::new()
         .context("could not locate private user cache")?
@@ -381,8 +594,13 @@ fn stage_archive(archive: &[u8], version: &str) -> Result<()> {
     #[cfg(not(windows))]
     let parent = env::temp_dir();
     let parent = fs::canonicalize(parent).context("could not resolve update staging parent")?;
-    let parent = without_verbatim_prefix(parent);
-    let mut staging = StagingDirectory::new_in(&parent)?;
+    Ok(without_verbatim_prefix(parent))
+}
+
+/// Unpacks and checks an update archive and works out where it installs.
+fn prepare_archive(archive: &[u8], version: &str) -> Result<ApplyPlan> {
+    Version::parse(version).context("invalid update version")?;
+    let staging = StagingDirectory::new_in(&staging_parent()?)?;
     extract_archive(archive, &staging.path)?;
     verify_package(&staging.path)?;
     let current_executable =
@@ -402,17 +620,249 @@ fn stage_archive(archive: &[u8], version: &str) -> Result<()> {
             .file_name()
             .context("Bridge bundle has no file name")?;
         verify_install_targets(install_directory, &[bundle_name])?;
-        spawn_bundle_install_helper(&staging.path, install_directory, bundle_name)?;
-        staging.handed_off = true;
-        return Ok(());
+        return Ok(ApplyPlan::Package {
+            target: PackageTarget::Bundle {
+                install_directory: install_directory.to_path_buf(),
+                bundle_name: bundle_name.to_owned(),
+            },
+            staging,
+        });
     }
     let install_directory = current_executable
         .parent()
         .context("Bridge executable has no parent directory")?;
     verify_install_directory(install_directory)?;
-    spawn_install_helper(&staging.path, install_directory, &current_executable)?;
-    staging.handed_off = true;
-    Ok(())
+    Ok(ApplyPlan::Package {
+        target: PackageTarget::Flat {
+            install_directory: install_directory.to_path_buf(),
+            executable: current_executable.clone(),
+        },
+        staging,
+    })
+}
+
+/// Stages the Windows installer in a private directory. It installs over the
+/// directory this Bridge runs from, so a portable copy is updated in place.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn prepare_installer(installer: &[u8]) -> Result<ApplyPlan> {
+    let staging = StagingDirectory::new_in(&staging_parent()?)?;
+    let path = staging.path.join("OpenMouse-Bridge-setup.exe");
+    write_new_file(&path, installer, false)?;
+    let executable = env::current_exe().context("could not locate the Bridge executable")?;
+    let executable = without_verbatim_prefix(executable);
+    let destination = executable
+        .parent()
+        .context("Bridge executable has no parent directory")?
+        .to_path_buf();
+    Ok(ApplyPlan::Installer {
+        staging,
+        installer: path,
+        destination,
+        executable,
+    })
+}
+
+/// Stages the new AppImage beside `target`, so the helper's rename stays on
+/// one filesystem and is atomic. Fails early when that directory is not
+/// writable, rather than after Bridge has exited.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn prepare_appimage(image: &[u8], target: &Path) -> Result<ApplyPlan> {
+    use std::hash::BuildHasher;
+    let directory = target
+        .parent()
+        .context("the AppImage has no parent directory")?;
+    verify_directory_chain(directory)?;
+    let nonce = std::collections::hash_map::RandomState::new()
+        .hash_one((std::process::id(), std::time::SystemTime::now()));
+    let staged = StagedFile {
+        path: directory.join(format!("{APPIMAGE_STAGING_PREFIX}{nonce:016x}.AppImage")),
+        handed_off: false,
+    };
+    write_new_file(&staged.path, image, true).with_context(|| {
+        format!(
+            "could not save the update next to {}; is that folder writable?",
+            target.display()
+        )
+    })?;
+    Ok(ApplyPlan::AppImage {
+        staged,
+        target: target.to_path_buf(),
+    })
+}
+
+/// Writes a file that must not exist yet, executable when asked (Unix).
+fn write_new_file(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
+    use std::io::Write;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(if executable { 0o755 } else { 0o600 });
+    }
+    #[cfg(not(unix))]
+    let _ = executable;
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("could not create {}", path.display()))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("could not write {}", path.display()))
+}
+
+impl ApplyPlan {
+    /// Starts the helper that applies this plan once Bridge has exited.
+    fn apply(self) -> Result<()> {
+        let log = UpdateLog::new()?;
+        match self {
+            Self::Package {
+                mut staging,
+                target,
+            } => {
+                match target {
+                    PackageTarget::Flat {
+                        install_directory,
+                        executable,
+                    } => {
+                        spawn_install_helper(&staging.path, &install_directory, &executable, &log)?
+                    }
+                    #[cfg(target_os = "macos")]
+                    PackageTarget::Bundle {
+                        install_directory,
+                        bundle_name,
+                    } => spawn_bundle_install_helper(
+                        &staging.path,
+                        &install_directory,
+                        &bundle_name,
+                        &log,
+                    )?,
+                    #[cfg(not(target_os = "macos"))]
+                    PackageTarget::Bundle { .. } => {
+                        anyhow::bail!("app bundles are updated only on macOS")
+                    }
+                }
+                staging.handed_off = true;
+            }
+            #[cfg(windows)]
+            Self::Installer {
+                mut staging,
+                installer,
+                destination,
+                executable,
+            } => {
+                spawn_installer_helper(&staging.path, &installer, &destination, &executable, &log)?;
+                staging.handed_off = true;
+            }
+            #[cfg(target_os = "linux")]
+            Self::AppImage { mut staged, target } => {
+                spawn_appimage_helper(&staged.path, &target, &log)?;
+                staged.handed_off = true;
+            }
+            #[allow(unreachable_patterns)]
+            _ => anyhow::bail!("this kind of update cannot be applied on this platform"),
+        }
+        Ok(())
+    }
+}
+
+/// Where the helpers write: an append-only log in Bridge's log directory, and
+/// a marker the next launch reads to say the update failed.
+struct UpdateLog {
+    log: std::path::PathBuf,
+    failure: std::path::PathBuf,
+}
+
+/// The helpers' log, `update.log` in the Bridge log directory.
+const UPDATE_LOG_NAME: &str = "update.log";
+/// Written by a helper whose update failed; read (and removed) on next launch.
+const UPDATE_FAILURE_NAME: &str = "update-failed.txt";
+
+impl UpdateLog {
+    fn new() -> Result<Self> {
+        let directory = crate::config::log_dir()?;
+        fs::create_dir_all(&directory)
+            .with_context(|| format!("could not create {}", directory.display()))?;
+        Ok(Self {
+            log: directory.join(UPDATE_LOG_NAME),
+            failure: directory.join(UPDATE_FAILURE_NAME),
+        })
+    }
+}
+
+/// Prefix of the AppImage staged beside the installed one.
+const APPIMAGE_STAGING_PREFIX: &str = ".openmouse-bridge-update-";
+/// Staging directories older than this are left over from an update that was
+/// never applied; younger ones may still belong to a helper finishing up.
+const STALE_STAGING_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// Removes downloads a previous run staged but never applied (Bridge quit
+/// instead of restarting into them). Call only once this process is known to
+/// be the only Bridge running.
+pub fn remove_stale_downloads() {
+    if let Some(feed::InstallKind::LinuxAppImage { path }) = feed::current_install_kind()
+        && let Some(directory) = path.parent()
+    {
+        remove_matching(directory, |name, _| {
+            name.starts_with(APPIMAGE_STAGING_PREFIX) && name.ends_with(".AppImage")
+        });
+    }
+    if let Ok(parent) = staging_parent() {
+        remove_matching(&parent, |name, metadata| {
+            name.starts_with("openmouse-update-")
+                && metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age > STALE_STAGING_AGE)
+        });
+    }
+}
+
+/// Deletes the entries of `directory` that `stale` picks, never following
+/// links.
+fn remove_matching(directory: &Path, stale: impl Fn(&str, &fs::Metadata) -> bool) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let (Some(name), Ok(metadata)) = (
+            entry.file_name().to_str().map(str::to_owned),
+            entry.metadata(),
+        ) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !stale(&name, &metadata) {
+            continue;
+        }
+        let path = entry.path();
+        let removed = if metadata.is_dir() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        match removed {
+            Ok(()) => tracing::info!(path = %path.display(), "removed a stale update download"),
+            Err(error) => {
+                tracing::debug!(%error, path = %path.display(), "could not remove a stale update download");
+            }
+        }
+    }
+}
+
+/// Why the last update did not install, as its helper recorded it, if it
+/// failed. Reading it clears it, so it is reported once.
+pub fn take_last_failure() -> Option<String> {
+    let path = crate::config::log_dir().ok()?.join(UPDATE_FAILURE_NAME);
+    let text = fs::read(&path).ok()?;
+    let _ = fs::remove_file(&path);
+    let text = String::from_utf8_lossy(&text[..text.len().min(1024)])
+        .trim()
+        .to_owned();
+    Some(if text.is_empty() {
+        "the last update could not be installed".to_owned()
+    } else {
+        text
+    })
 }
 
 /// `fs::canonicalize` returns `\\?\C:\...` on Windows. Windows PowerShell 5.1
@@ -974,11 +1424,25 @@ const UNIX_COMPLETION: &str = r#"complete_update() {
 }
 "#;
 
+/// Shell lines every Unix helper starts with: its output goes to the update
+/// log, `note` timestamps a line, `fail` also leaves the failure marker for
+/// the next launch. Expects `$log` and `$failure`.
+#[cfg(any(target_os = "macos", target_os = "linux", all(unix, test)))]
+const UNIX_LOGGING: &str = r#"exec >>"$log" 2>&1
+note() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+fail() { note "$1"; printf '%s\n' "$1" > "$failure"; }
+"#;
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn spawn_install_helper(staging: &Path, destination: &Path, executable: &Path) -> Result<()> {
+fn spawn_install_helper(
+    staging: &Path,
+    destination: &Path,
+    executable: &Path,
+    log: &UpdateLog,
+) -> Result<()> {
     let script = staging.join("install-update.sh");
     let contents = format!(
-        "#!/bin/sh\n{UNIX_TRANSACTION}\n{UNIX_COMPLETION}\npid=\"$1\"\nstage=\"$2\"\ndestination=\"$3\"\nbinary=\"$4\"\ntrap 'rm -rf \"$stage\"' 0\nwhile kill -0 \"$pid\" 2>/dev/null; do sleep 1; done\nlaunch_bridge() {{ cd \"$1\" || return 1; nohup \"$1/$2\" >/dev/null 2>&1 & }}\ncomplete_update \"$stage\" \"$destination\" \"$binary\" launch_bridge\n"
+        "#!/bin/sh\n{UNIX_TRANSACTION}\n{UNIX_COMPLETION}\npid=\"$1\"\nstage=\"$2\"\ndestination=\"$3\"\nbinary=\"$4\"\nlog=\"$5\"\nfailure=\"$6\"\n{UNIX_LOGGING}trap 'rm -rf \"$stage\"' 0\nwhile kill -0 \"$pid\" 2>/dev/null; do sleep 1; done\nnote \"Installing the update into $destination\"\nlaunch_bridge() {{ cd \"$1\" || return 1; nohup \"$1/$2\" >/dev/null 2>&1 & }}\ncomplete_update \"$stage\" \"$destination\" \"$binary\" launch_bridge && note 'Done' || fail 'The update could not be installed; Bridge kept the current version'\n"
     );
     write_helper(&script, &contents)?;
     Command::new("/bin/sh")
@@ -991,9 +1455,82 @@ fn spawn_install_helper(staging: &Path, destination: &Path, executable: &Path) -
                 .file_name()
                 .context("Bridge executable has no file name")?,
         )
+        .arg(&log.log)
+        .arg(&log.failure)
         .spawn()
         .context("could not launch the update helper")?;
     Ok(())
+}
+
+/// Replaces the AppImage at `$target` with the staged one: the old image is
+/// moved aside first and put back if the new one cannot be moved in, and
+/// whichever is in place is started again either way.
+#[cfg(any(target_os = "linux", all(unix, test)))]
+const APPIMAGE_SWAP: &str = r#"swap_appimage() {
+  staged="$1"
+  target="$2"
+  previous="$target.previous"
+  if [ ! -f "$staged" ]; then
+    fail 'The downloaded update was missing; Bridge kept the current version'
+    return 1
+  fi
+  if ! mv -f "$target" "$previous"; then
+    rm -f "$staged"
+    fail "Could not move $target aside; Bridge kept the current version"
+    return 1
+  fi
+  if ! mv -f "$staged" "$target"; then
+    mv -f "$previous" "$target"
+    rm -f "$staged"
+    fail 'Could not install the new AppImage; Bridge kept the current version'
+    return 1
+  fi
+  rm -f "$previous"
+  note "Installed the new AppImage at $target"
+}
+"#;
+
+#[cfg(target_os = "linux")]
+fn spawn_appimage_helper(staged: &Path, target: &Path, log: &UpdateLog) -> Result<()> {
+    // The helper outlives Bridge and the AppImage mount it runs from, so its
+    // script lives in the temporary directory, not inside the image.
+    let script = tempfile_path("openmouse-update", "sh")?;
+    let contents = format!(
+        "#!/bin/sh\npid=\"$1\"\nstaged=\"$2\"\ntarget=\"$3\"\nlog=\"$4\"\nfailure=\"$5\"\n{UNIX_LOGGING}{APPIMAGE_SWAP}trap 'rm -f \"$0\"' 0\nwhile kill -0 \"$pid\" 2>/dev/null; do sleep 1; done\nnote \"Updating $target\"\nswap_appimage \"$staged\" \"$target\"\n(cd \"$(dirname \"$target\")\" && exec nohup \"$target\" </dev/null >/dev/null 2>&1) &\n"
+    );
+    write_helper(&script, &contents)?;
+    Command::new("/bin/sh")
+        .arg(&script)
+        .arg(std::process::id().to_string())
+        .arg(staged)
+        .arg(target)
+        .arg(&log.log)
+        .arg(&log.failure)
+        // The AppImage runtime sets these for this image; the new image must
+        // set its own when it starts.
+        .env_remove("APPIMAGE")
+        .env_remove("APPDIR")
+        .env_remove("ARGV0")
+        .env_remove("OWD")
+        .spawn()
+        .context("could not launch the update helper")?;
+    Ok(())
+}
+
+/// A fresh, unused path in the temporary directory.
+#[cfg(target_os = "linux")]
+fn tempfile_path(prefix: &str, extension: &str) -> Result<std::path::PathBuf> {
+    use std::hash::BuildHasher;
+    let directory = staging_parent()?;
+    for _ in 0..32 {
+        let nonce = std::collections::hash_map::RandomState::new()
+            .hash_one((std::process::id(), std::time::SystemTime::now()));
+        let path = directory.join(format!("{prefix}-{nonce:016x}.{extension}"));
+        if !path.exists() {
+            return Ok(path);
+        }
+    }
+    anyhow::bail!("could not allocate a temporary helper path")
 }
 
 /// Replaces one directory (a macOS `.app`) as a unit. Same lock, backup and
@@ -1072,10 +1609,11 @@ fn spawn_bundle_install_helper(
     staging: &Path,
     destination: &Path,
     installed: &std::ffi::OsStr,
+    log: &UpdateLog,
 ) -> Result<()> {
     let script = staging.join("install-update.sh");
     let contents = format!(
-        "#!/bin/sh\n{BUNDLE_TRANSACTION}\n{BUNDLE_COMPLETION}\npid=\"$1\"\nstage=\"$2\"\ndestination=\"$3\"\nstaged=\"$4\"\ninstalled=\"$5\"\ntrap 'rm -rf \"$stage\"' 0\nwhile kill -0 \"$pid\" 2>/dev/null; do sleep 1; done\nlaunch_bundle() {{ open \"$1/$2\"; }}\ncomplete_bundle_update \"$stage\" \"$destination\" \"$staged\" \"$installed\" launch_bundle\n"
+        "#!/bin/sh\n{BUNDLE_TRANSACTION}\n{BUNDLE_COMPLETION}\npid=\"$1\"\nstage=\"$2\"\ndestination=\"$3\"\nstaged=\"$4\"\ninstalled=\"$5\"\nlog=\"$6\"\nfailure=\"$7\"\n{UNIX_LOGGING}trap 'rm -rf \"$stage\"' 0\nwhile kill -0 \"$pid\" 2>/dev/null; do sleep 1; done\nnote \"Installing the update into $destination/$installed\"\nlaunch_bundle() {{ open \"$1/$2\"; }}\ncomplete_bundle_update \"$stage\" \"$destination\" \"$staged\" \"$installed\" launch_bundle && note 'Done' || fail 'The update could not be installed; Bridge kept the current version'\n"
     );
     write_helper(&script, &contents)?;
     Command::new("/bin/sh")
@@ -1085,6 +1623,8 @@ fn spawn_bundle_install_helper(
         .arg(destination)
         .arg(MACOS_APP_NAME)
         .arg(installed)
+        .arg(&log.log)
+        .arg(&log.failure)
         .spawn()
         .context("could not launch the update helper")?;
     Ok(())
@@ -1186,7 +1726,12 @@ const WINDOWS_COMPLETION: &str = r#"function Complete-BridgeUpdate([string]$Stag
 "#;
 
 #[cfg(target_os = "windows")]
-fn spawn_install_helper(staging: &Path, destination: &Path, executable: &Path) -> Result<()> {
+fn spawn_install_helper(
+    staging: &Path,
+    destination: &Path,
+    executable: &Path,
+    _log: &UpdateLog,
+) -> Result<()> {
     let script = staging.join("install-update.ps1");
     let contents = format!(
         "param([int]$BridgePid, [string]$Stage, [string]$Destination, [string]$Binary)\n$ErrorActionPreference = 'Stop'\n{WINDOWS_TRANSACTION}\n{WINDOWS_COMPLETION}\ntry {{\nwhile (Get-Process -Id $BridgePid -ErrorAction SilentlyContinue) {{ Start-Sleep -Seconds 1 }}\nComplete-BridgeUpdate $Stage $Destination $Binary {{ param($Directory, $Name) Start-Process -FilePath (Join-Path $Directory $Name) -WorkingDirectory $Directory }}\n}} finally {{ Remove-Item -LiteralPath $Stage -Recurse -Force -ErrorAction SilentlyContinue }}\n"
@@ -1223,8 +1768,89 @@ fn spawn_install_helper(staging: &Path, destination: &Path, executable: &Path) -
     Ok(())
 }
 
+/// Runs the new installer silently over this install once Bridge has exited,
+/// then starts Bridge again. Inno Setup rolls its own changes back when it
+/// fails, so a non-zero exit leaves the current version in place.
+#[cfg(windows)]
+const WINDOWS_INSTALLER_HELPER: &str = r#"param([int]$BridgePid, [string]$Stage, [string]$Installer, [string]$Destination, [string]$Executable, [string]$Log, [string]$Failure)
+$ErrorActionPreference = 'Stop'
+function Note([string]$Text) {
+  $Stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  Add-Content -LiteralPath $Log -Value "$Stamp $Text" -ErrorAction SilentlyContinue
+}
+function Fail([string]$Text) {
+  Note $Text
+  Set-Content -LiteralPath $Failure -Value $Text -ErrorAction SilentlyContinue
+}
+try {
+  while (Get-Process -Id $BridgePid -ErrorAction SilentlyContinue) { Start-Sleep -Seconds 1 }
+  Note "Running the installer into $Destination"
+  $InstallerLog = Join-Path (Split-Path -Parent $Log) 'update-installer.log'
+  $Arguments = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CLOSEAPPLICATIONS', "/DIR=`"$Destination`"", "/LOG=`"$InstallerLog`"")
+  $Process = Start-Process -FilePath $Installer -ArgumentList $Arguments -Wait -PassThru
+  if ($Process.ExitCode -eq 0) {
+    Note 'Done'
+  } else {
+    Fail "The installer stopped with code $($Process.ExitCode); Bridge kept the current version"
+  }
+} catch {
+  Fail "The update could not be installed: $($_.Exception.Message)"
+} finally {
+  Start-Process -FilePath $Executable -WorkingDirectory $Destination -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $Stage -Recurse -Force -ErrorAction SilentlyContinue
+}
+"#;
+
+#[cfg(windows)]
+fn spawn_installer_helper(
+    staging: &Path,
+    installer: &Path,
+    destination: &Path,
+    executable: &Path,
+    log: &UpdateLog,
+) -> Result<()> {
+    let script = staging.join("install-update.ps1");
+    write_helper(&script, WINDOWS_INSTALLER_HELPER)?;
+    let mut command = Command::new("powershell.exe");
+    command
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(&script)
+        .arg("-BridgePid")
+        .arg(std::process::id().to_string())
+        .arg("-Stage")
+        .arg(staging)
+        .arg("-Installer")
+        .arg(installer)
+        .arg("-Destination")
+        .arg(destination)
+        .arg("-Executable")
+        .arg(executable)
+        .arg("-Log")
+        .arg(&log.log)
+        .arg("-Failure")
+        .arg(&log.failure);
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+        .spawn()
+        .context("could not launch the update helper")?;
+    Ok(())
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-fn spawn_install_helper(_staging: &Path, _destination: &Path, _executable: &Path) -> Result<()> {
+fn spawn_install_helper(
+    _staging: &Path,
+    _destination: &Path,
+    _executable: &Path,
+    _log: &UpdateLog,
+) -> Result<()> {
     anyhow::bail!("automatic Bridge updates are available only on macOS, Windows, and Linux")
 }
 
