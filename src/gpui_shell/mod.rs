@@ -33,6 +33,11 @@ use crate::runtime::{
 /// most this long.
 const POLL: Duration = Duration::from_millis(200);
 
+/// How long a newly opened layer-shell panel gets to be mapped before it is
+/// activated with the tray click's token.
+#[cfg(target_os = "linux")]
+const LAYER_MAP_DELAY: Duration = Duration::from_millis(150);
+
 pub fn run() -> Result<()> {
     tracing::info!("starting the GPUI shell");
     let (notice_tx, notices) = mpsc::channel();
@@ -232,6 +237,11 @@ pub fn run() -> Result<()> {
                             });
                             if let Some(opened) = opened {
                                 handle = opened;
+                                // KWin ignores an activation for a surface it has
+                                // not mapped yet, which left the new panel without
+                                // keyboard focus (Escape did nothing). Let the first
+                                // configure and frame land before using the token.
+                                cx.background_executor().timer(LAYER_MAP_DELAY).await;
                             }
                         }
                         let _ = cx.update_window(handle, |_, window, _| tray::show(window, anchor));

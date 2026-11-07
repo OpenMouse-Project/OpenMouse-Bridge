@@ -352,7 +352,10 @@ mod platform {
             return false;
         }
         match super::linux::activate_wayland_window(handle, display, token) {
-            Ok(()) => true,
+            Ok(()) => {
+                tracing::debug!("activated the panel with the tray host's token");
+                true
+            }
             Err(error) => {
                 tracing::warn!(%error, "Could not activate the Wayland panel");
                 false
