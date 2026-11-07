@@ -198,7 +198,8 @@ GPUI is the only window: the egui panel, `native_ui.rs`, `eframe`, `gtk` and the
   `-full` zip straight away. Checked on Linux: an end-to-end AppImage update
   against a local fake `latest.json` (check, download, "Restart to update",
   the file replaced, Bridge started again, the log written). The Windows and
-  macOS paths build in CI but have not been run.
+  macOS paths build in CI but have not been run; `docs/update-testing.md` is
+  the checklist for testing them against a fake release.
 - **Relaunch:** if the window ends for any reason other than quit, restart or an
   update, Bridge starts again, with the same crash-loop limits as before.
 
