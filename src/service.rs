@@ -685,6 +685,9 @@ pub struct BridgeSnapshot {
     /// `batteries` this survives restarts and includes mice with no battery
     /// reader.
     pub known_devices: Vec<KnownDeviceStatus>,
+    /// Linux: `/dev/hidraw*` nodes of supported USB mice this user cannot
+    /// open, because the udev rule is missing. Empty elsewhere.
+    pub blocked_hid_devices: Vec<String>,
 }
 
 /// A remembered mouse as the status view shows it.
@@ -952,6 +955,7 @@ impl BridgeService {
             active_devices,
             batteries,
             known_devices,
+            blocked_hid_devices: crate::hid_access::blocked_devices(),
         }
     }
 
