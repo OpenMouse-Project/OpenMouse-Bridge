@@ -10,7 +10,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::*;
 use openmouse_bridge::{
-    BRIDGE_PORT, config,
+    BRIDGE_PORT, config, hid_access,
     platform::{self, TrayBatteryStyle},
     service::{BridgeSnapshot, KnownDeviceStatus, Notice},
     updater::{DownloadProgress, UpdateInfo, download_progress},
@@ -54,6 +54,25 @@ fn step_volume(current: u8, up: bool) -> u8 {
 
 /// How many remembered mice Home lists before summarising the rest.
 const HOME_DEVICE_ROWS: usize = 3;
+
+/// Installing the udev rule that lets Bridge open supported mice (Linux).
+enum UdevFix {
+    Idle,
+    /// `pkexec` is showing the password prompt; its result arrives here.
+    Running(mpsc::Receiver<Result<(), String>>),
+    /// It failed or was cancelled: why, and a terminal command to do it by
+    /// hand when the rule copy could be saved.
+    Failed {
+        error: String,
+        command: Option<String>,
+    },
+}
+
+/// Whether Home needs the permissions card: supported mice are plugged in
+/// that Bridge may not open.
+fn hid_blocked(snapshot: Option<&BridgeSnapshot>) -> bool {
+    snapshot.is_some_and(|snapshot| !snapshot.blocked_hid_devices.is_empty())
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
@@ -115,6 +134,7 @@ pub struct PanelView {
     /// it (no display for the native window), notices fall back to system
     /// notifications.
     overlay: Option<Overlay>,
+    udev_fix: UdevFix,
 }
 
 pub struct Drained {
@@ -297,6 +317,7 @@ impl PanelView {
             notification_sound: true,
             notification_volume: 60,
             update: UpdateState::Idle,
+            udev_fix: UdevFix::Idle,
             progress: None,
             quit_for_update: false,
             first_run_hint: first_run,
@@ -328,6 +349,28 @@ impl PanelView {
             self.notification_sound = snapshot.notification_sound;
             self.notification_volume = snapshot.notification_volume;
             self.snapshot = Some(snapshot);
+            changed = true;
+        }
+        if let UdevFix::Running(result) = &self.udev_fix
+            && let Ok(result) = result.try_recv()
+        {
+            self.udev_fix = match result {
+                Ok(()) => UdevFix::Idle,
+                Err(error) => {
+                    tracing::warn!(%error, "Could not install the udev rule");
+                    UdevFix::Failed {
+                        error,
+                        command: hid_access::save_rule_copy()
+                            .ok()
+                            .map(|copy| hid_access::manual_command(&copy)),
+                    }
+                }
+            };
+            changed = true;
+        }
+        // Fixed another way (the terminal command, a replug): drop the failure.
+        if matches!(self.udev_fix, UdevFix::Failed { .. }) && !hid_blocked(self.snapshot.as_ref()) {
+            self.udev_fix = UdevFix::Idle;
             changed = true;
         }
         while let Ok(event) = self.updates.try_recv() {
@@ -420,6 +463,12 @@ impl PanelView {
                 if native_problem(self.snapshot.as_ref()).is_some() {
                     height += NOTE_HEIGHT * 2.0;
                 }
+                if hid_blocked(self.snapshot.as_ref()) {
+                    height += NOTICE_HEIGHT + NOTE_HEIGHT * 2.0;
+                    if matches!(self.udev_fix, UdevFix::Failed { .. }) {
+                        height += NOTE_HEIGHT * 2.0;
+                    }
+                }
                 if self.first_run_hint {
                     height += NOTE_HEIGHT * 2.0;
                 }
@@ -428,6 +477,17 @@ impl PanelView {
             View::Info => {}
         }
         height
+    }
+
+    /// Installs the udev rule through `pkexec` on a thread of its own: the
+    /// password prompt blocks until the user answers it.
+    fn fix_hid_permissions(&mut self, cx: &mut Context<Self>) {
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(hid_access::install_rule().map_err(|error| error.to_string()));
+        });
+        self.udev_fix = UdevFix::Running(receiver);
+        cx.notify();
     }
 
     fn set_autostart(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -835,6 +895,9 @@ impl PanelView {
         if let Some(problem) = native_problem(snapshot) {
             content = content.child(div().text_xs().text_color(cx.theme().danger).child(problem));
         }
+        if hid_blocked(snapshot) {
+            content = content.child(self.hid_permissions_card(muted, line, fill, cx));
+        }
         if let Some(headline) = self.update.headline(self.progress) {
             let action = match &self.update {
                 UpdateState::Available(update) => {
@@ -928,6 +991,73 @@ impl PanelView {
                         .on_click(cx.listener(|this, _, _, cx| this.exit.quit(cx))),
                 ),
         )
+    }
+
+    /// Home's card for mice Bridge may not open: what is wrong, a button that
+    /// installs the udev rule, and when that fails, the terminal command.
+    fn hid_permissions_card(
+        &self,
+        muted: Hsla,
+        line: Hsla,
+        fill: Hsla,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let running = matches!(self.udev_fix, UdevFix::Running(_));
+        let mut card = card(line, fill)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .items_center()
+                    .gap_3()
+                    .text_sm()
+                    .child(div().truncate().child("Mouse access is blocked"))
+                    .child(
+                        Button::new("fix-hid-permissions")
+                            .primary()
+                            .compact()
+                            .label(if running { "Waiting…" } else { "Fix permissions" })
+                            .disabled(running)
+                            .on_click(cx.listener(|this, _, _, cx| this.fix_hid_permissions(cx))),
+                    ),
+            )
+            .child(div().text_xs().text_color(muted).child(
+                "Linux needs a udev rule to let Bridge open supported mice. Fixing it asks for your password once.",
+            ));
+        if let UdevFix::Failed { error, command } = &self.udev_fix {
+            card = card.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .child(error.clone()),
+            );
+            if let Some(command) = command.clone() {
+                card = card.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(div().flex_1().truncate().child("Or run it in a terminal"))
+                        .child(
+                            Button::new("copy-udev-command")
+                                .ghost()
+                                .compact()
+                                .icon(IconName::Copy)
+                                .label("Copy command")
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        command.clone(),
+                                    ));
+                                }),
+                        ),
+                );
+            }
+        }
+        card
     }
 
     fn settings(

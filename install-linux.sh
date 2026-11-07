@@ -45,7 +45,8 @@ ASSUME_YES=false
 # Every HID vendor id Bridge drivers can talk to: native Rust drivers
 # (Pulsar 0x3710 in src/drivers/pulsar.rs, Delux 0x1d57/0x248a/0x373e in
 # src/drivers/delux.rs) plus each brand in native-hid/src/brands.mjs.
-# Keep in sync when a brand is added there.
+# Keep in sync when a brand is added there, and with VENDOR_IDS in
+# src/hid_access.rs (the panel's Fix permissions button; a test compares them).
 VENDOR_IDS="045e 046d 0483 093a 1532 1915 1caa 1d57 248a 25a7 2fe3 31e3 3151 3367 3434 3554 361d 36a7 3710 373b 373e 3879"
 
 log() { printf '==> %s\n' "$*"; }

@@ -6,6 +6,7 @@ pub mod devices;
 pub mod drivers;
 pub mod games;
 mod hid;
+pub mod hid_access;
 pub mod local_targets;
 pub mod platform;
 pub mod remote_image;
