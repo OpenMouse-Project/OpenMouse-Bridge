@@ -10,7 +10,8 @@
 
 GPUI is the only window: there is no other shell. CI builds macOS, Linux, and
 Windows artifacts. Windows tray and panel behavior still need testing on a
-Windows desktop; Linux has no tray icon yet.
+Windows desktop. The Linux tray has been run on KDE Plasma (Wayland); X11,
+GNOME and other desktops still need testing.
 
 - [x] A panel in Desktop's dark look with its ASCII background: Home, Settings
       and a Bridge info page, opening beside the tray icon
@@ -26,7 +27,7 @@ Windows desktop; Linux has no tray icon yet.
 - [x] Windows: build and smoke test a per-user installer in CI
 - [ ] Windows: run the tray app on a desktop
 - [x] Linux: build and verify the AppImage in CI
-- [ ] Linux: add a tray icon
+- [x] Linux: add a tray icon
 - [ ] The in-app updater with `latest.json`, replacing the zip-swap one
 - [ ] Moving installs of earlier versions across
 
@@ -103,8 +104,22 @@ On Linux, install the system libraries for the window first (Ubuntu 22.04 or
 sudo apt-get update && sudo apt-get install -y build-essential clang cmake pkg-config libudev-dev libssl-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libvulkan-dev libgl1-mesa-dev libfontconfig-dev libfreetype-dev libasound2-dev
 ```
 
-Linux notes: there is no tray icon yet, so the panel is an ordinary window and
-its close button quits; the overlay banner and foreground detection need X11
+Linux notes: the tray uses StatusNotifierItem/DBusMenu on the session bus
+(KDE Plasma and other compatible hosts; GNOME needs an AppIndicator/SNI
+extension). It shows the battery glyph, charge colour and the same battery
+tooltip as the other platforms. A click or the menu's Open action restores the
+panel, raised with the activation token the tray host sends with the click;
+the menu also offers Restart and Quit. The panel draws its own header and close
+button, without a window-manager title bar. On Wayland compositors with
+layer-shell (KDE Plasma, wlroots-based desktops) the panel opens in the screen
+corner nearest the tray icon, clear of the desktop's panel bar, and closing or
+Escape removes it until the tray brings it back. Elsewhere (X11, GNOME) it is
+a normal window that closing or Escape minimizes while a tray host is
+available, keeping its taskbar entry for recovery. Without a session bus or
+compatible tray host, the panel stays visible and closing it quits. If the
+host disappears, Bridge restores the panel and re-registers the icon when the
+host returns. No GTK or AppIndicator shared libraries are needed in the
+AppImage. The overlay banner and foreground detection need X11
 (on Wayland the banner falls back to a system notification and `foreground` is
 always false), and the chime needs `paplay` or `aplay`. With no
 `WAYLAND_DISPLAY` or `DISPLAY` (servers, SSH sessions), or with
@@ -274,8 +289,10 @@ buttons are settings and close):
 
 Clicking the tray icon (a left click, a double-click, or on macOS a right click)
 opens the panel beside it: centred under the icon below the menu bar on macOS,
-above a bottom taskbar on Windows. Closing it, or pressing Escape, hides it to
-the tray and Bridge keeps running; Quit stops the process. The first launch
+above a bottom taskbar on Windows; Linux lets the compositor place it.
+Closing it, or pressing Escape, hides it to the tray on macOS/Windows and
+minimizes it on Linux while a tray host is available. Bridge keeps running;
+Quit stops the process. The first launch
 opens the panel and later launches start hidden (`OPENMOUSE_BRIDGE_SHOW_WINDOW=1`
 opens it anyway, and `OPENMOUSE_BRIDGE_START_VIEW=settings|info` opens straight
 onto a view, for development).

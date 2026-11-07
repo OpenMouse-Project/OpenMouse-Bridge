@@ -33,6 +33,11 @@ use crate::runtime::{
 /// most this long.
 const POLL: Duration = Duration::from_millis(200);
 
+/// How long a newly opened layer-shell panel gets to be mapped before it is
+/// activated with the tray click's token.
+#[cfg(target_os = "linux")]
+const LAYER_MAP_DELAY: Duration = Duration::from_millis(150);
+
 pub fn run() -> Result<()> {
     tracing::info!("starting the GPUI shell");
     let (notice_tx, notices) = mpsc::channel();
@@ -60,9 +65,21 @@ pub fn run() -> Result<()> {
                     cx,
                 ))),
                 titlebar: None,
-                kind: WindowKind::PopUp,
+                // X11 PopUp is override-redirect: the WM cannot minimize it
+                // or provide the taskbar recovery path used by the Linux tray.
+                kind: if cfg!(target_os = "linux") {
+                    WindowKind::Normal
+                } else {
+                    WindowKind::PopUp
+                },
+                #[cfg(target_os = "linux")]
+                app_id: Some("io.openmouse.bridge".into()),
+                // The panel draws its own header, close button and drag area,
+                // as on macOS and Windows; without this the window manager
+                // adds a second title bar with its own controls above it.
+                window_decorations: cfg!(target_os = "linux").then_some(WindowDecorations::Client),
                 is_resizable: false,
-                is_minimizable: false,
+                is_minimizable: cfg!(target_os = "linux"),
                 ..Default::default()
             };
             let view_exit = app_exit.clone();
@@ -92,6 +109,46 @@ pub fn run() -> Result<()> {
                 Some((commands, tray)) => (Some(commands), Some(tray)),
                 None => (None, None),
             };
+            #[cfg(target_os = "linux")]
+            let handle = {
+                close_hides_or_quits(cx, handle, app_exit.clone());
+                // On Wayland a normal window can neither place itself by the
+                // tray nor be hidden, so with a tray (and a compositor that has
+                // layer-shell) the panel is a surface pinned to the tray's
+                // corner instead, opened when shown and closed when hidden.
+                let layer = tray_commands.is_some()
+                    && cx
+                        .update_window(handle, |_, window, _| {
+                            raw_window_handle::HasDisplayHandle::display_handle(window).is_ok_and(
+                                |display| tray::wayland_layer_shell_available(display.as_raw()),
+                            )
+                        })
+                        .unwrap_or(false);
+                if layer {
+                    tray::set_layer_panel(true);
+                    // Closing the panel must not end the app.
+                    cx.set_quit_mode(QuitMode::Explicit);
+                    let _ = cx.update_window(handle, |_, window, _| window.remove_window());
+                    if show_panel {
+                        open_layer_panel(cx, &view, None, app_exit.clone()).unwrap_or(handle)
+                    } else {
+                        handle
+                    }
+                } else {
+                    handle
+                }
+            };
+            #[cfg(target_os = "linux")]
+            if tray::layer_panel() {
+                if show_panel {
+                    cx.activate(true);
+                }
+            } else if !show_panel && tray_commands.is_some() {
+                let _ = cx.update_window(handle, |_, window, _| tray::hide(window));
+            } else {
+                cx.activate(true);
+            }
+            #[cfg(not(target_os = "linux"))]
             if !show_panel && tray_commands.is_some() {
                 let _ = cx.update_window(handle, |_, window, _| tray::hide(window));
             } else {
@@ -102,6 +159,14 @@ pub fn run() -> Result<()> {
                 cx.activate(true);
             }
 
+            // Kept strong: a closed layer-shell panel drops its window, and the
+            // next show reopens one around this same view.
+            #[cfg(target_os = "linux")]
+            let panel_view = view.clone();
+            #[cfg(target_os = "linux")]
+            let layer_exit = app_exit.clone();
+            #[cfg(target_os = "linux")]
+            let mut handle = handle;
             let view = view.downgrade();
             cx.spawn(async move |cx| {
                 let mut wait = POLL;
@@ -165,6 +230,20 @@ pub fn run() -> Result<()> {
                     if show {
                         tracing::debug!(panel_wanted, "showing the panel");
                         let anchor = last_anchor;
+                        #[cfg(target_os = "linux")]
+                        if tray::layer_panel() && cx.update_window(handle, |_, _, _| ()).is_err() {
+                            let opened = cx.update(|cx| {
+                                open_layer_panel(cx, &panel_view, anchor, layer_exit.clone())
+                            });
+                            if let Some(opened) = opened {
+                                handle = opened;
+                                // KWin ignores an activation for a surface it has
+                                // not mapped yet, which left the new panel without
+                                // keyboard focus (Escape did nothing). Let the first
+                                // configure and frame land before using the token.
+                                cx.background_executor().timer(LAYER_MAP_DELAY).await;
+                            }
+                        }
                         let _ = cx.update_window(handle, |_, window, _| tray::show(window, anchor));
                     }
                     for command in tray_requests {
@@ -211,6 +290,72 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
     stopped
+}
+
+/// Makes the window's close button hide the panel to the tray, or quit when
+/// there is no tray to bring it back from.
+#[cfg(target_os = "linux")]
+fn close_hides_or_quits(cx: &mut App, handle: AnyWindowHandle, exit: ExitFlags) {
+    let _ = cx.update_window(handle, |_, window, cx| {
+        window.on_window_should_close(cx, move |window, cx| {
+            if tray::can_hide() {
+                tray::hide(window);
+            } else {
+                exit.quit(cx);
+            }
+            false
+        });
+    });
+}
+
+/// Opens the panel as a layer-shell surface in the screen corner nearest the
+/// tray click (see [`tray::layer_corner`]).
+#[cfg(target_os = "linux")]
+fn open_layer_panel(
+    cx: &mut App,
+    view: &Entity<PanelView>,
+    anchor: Option<tray::Anchor>,
+    exit: ExitFlags,
+) -> Option<AnyWindowHandle> {
+    let screens: Vec<_> = cx
+        .displays()
+        .iter()
+        .map(|display| display.bounds())
+        .collect();
+    let screen = tray::layer_screen(anchor, &screens);
+    let corner = tray::layer_corner(anchor, screen);
+    let work_area = tray::x11_work_area();
+    let margins = tray::layer_margins(screen, work_area);
+    tracing::debug!(
+        ?anchor,
+        ?screen,
+        ?work_area,
+        ?corner,
+        ?margins,
+        "opening the layer-shell panel"
+    );
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+            point(px(0.), px(0.)),
+            size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)),
+        ))),
+        titlebar: None,
+        kind: WindowKind::LayerShell(tray::layer_options(corner, margins)),
+        app_id: Some("io.openmouse.bridge".into()),
+        is_resizable: false,
+        ..Default::default()
+    };
+    let view = view.clone();
+    match open_window(options, cx, move |_, _| view) {
+        Ok((handle, _)) => {
+            close_hides_or_quits(cx, handle, exit);
+            Some(handle)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Could not open the layer-shell panel");
+            None
+        }
+    }
 }
 
 /// Why the app is ending. A window that ends without `deliberate` set ended
