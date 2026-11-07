@@ -402,6 +402,7 @@ pub fn layer_panel() -> bool {
     LAYER_PANEL.load(Ordering::Relaxed)
 }
 
+#[cfg(target_os = "linux")]
 pub fn set_layer_panel(enabled: bool) {
     LAYER_PANEL.store(enabled, Ordering::Relaxed);
 }
