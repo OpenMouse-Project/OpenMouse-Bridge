@@ -36,6 +36,7 @@ pub fn rule() -> String {
 
 /// The root shell script that installs [`rule`] (passed as `$1`) and applies
 /// it to devices already plugged in, so no replug or reboot is needed.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const INSTALL_SCRIPT: &str = r#"set -eu
 printf '%s' "$1" > /etc/udev/rules.d/69-openmouse-bridge.rules
 chmod 0644 /etc/udev/rules.d/69-openmouse-bridge.rules
@@ -68,6 +69,7 @@ pub fn save_rule_copy() -> anyhow::Result<std::path::PathBuf> {
 /// The vendor id from a hidraw device's `uevent` when it sits on the USB bus
 /// (`HID_ID=0003:0000046D:0000C54D`). Bluetooth and other buses are ignored:
 /// the rule matches the USB `idVendor` attribute, so it cannot help them.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn usb_vendor(uevent: &str) -> Option<u16> {
     let id = uevent
         .lines()
