@@ -580,7 +580,7 @@ impl HidSession {
 
         let mut by_device = HashMap::<Vec<u8>, Vec<hidapi::DeviceInfo>>::new();
         for info in self.api.device_list() {
-            if vendors.contains(&info.vendor_id()) {
+            if vendors.contains(&info.vendor_id()) && !is_receiver_child(info.path()) {
                 by_device
                     .entry(device_group_key(info))
                     .or_default()
@@ -1194,6 +1194,53 @@ pub(crate) fn feature_interfaces(
     })
 }
 
+/// Whether `path` is a hidraw node the Linux kernel made for a device paired
+/// through a Logitech receiver (`hid-logitech-dj`), rather than the receiver
+/// itself. Windows and macOS have no such node, so the control panel never
+/// expects one: it reported the receiver's name ("USB Receiver"), was tried
+/// first, and its HID++ probes went unanswered for 10-20 s before the panel
+/// fell back to the real receiver. The panel reaches paired mice through the
+/// receiver, as on the other platforms, so these nodes are left out.
+#[cfg(target_os = "linux")]
+fn is_receiver_child(path: &std::ffi::CStr) -> bool {
+    let Some(node) = path
+        .to_str()
+        .ok()
+        .and_then(|path| path.strip_prefix("/dev/"))
+    else {
+        return false;
+    };
+    std::fs::read_to_string(format!("/sys/class/hidraw/{node}/device/uevent"))
+        .is_ok_and(|uevent| is_receiver_child_uevent(&uevent))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_receiver_child(_path: &std::ffi::CStr) -> bool {
+    false
+}
+
+/// The `uevent` side of [`is_receiver_child`]: the per-device HID++ driver,
+/// on a physical path with the receiver's device index appended
+/// (`usb-0000:00:14.0-9/input2:1`). Wired and Bluetooth mice on the same
+/// driver have no such suffix.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn is_receiver_child_uevent(uevent: &str) -> bool {
+    let field = |name: &str| {
+        uevent
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
+    };
+    field("DRIVER") == Some("logitech-hidpp-device")
+        && field("HID_PHYS")
+            .and_then(|phys| phys.rsplit_once('/'))
+            .and_then(|(_, interface)| interface.split_once(':'))
+            .is_some_and(|(input, index)| {
+                input.starts_with("input")
+                    && !index.is_empty()
+                    && index.bytes().all(|byte| byte.is_ascii_digit())
+            })
+}
+
 fn grouped_device_key(
     vendor_id: u16,
     product_id: u16,
@@ -1671,6 +1718,30 @@ async fn send_json(socket: &mut impl HidSocket, value: &impl Serialize) -> Resul
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_the_kernels_receiver_children_are_left_out() {
+        use super::is_receiver_child_uevent as child;
+        // A mouse paired through a Logitech receiver, split out by hid-logitech-dj.
+        assert!(child(
+            "DRIVER=logitech-hidpp-device\nHID_ID=0003:0000046D:000040B7\n\
+             HID_NAME=Logitech PRO X 2c\nHID_PHYS=usb-0000:00:14.0-9/input2:1\n"
+        ));
+        // The receiver itself.
+        assert!(!child(
+            "DRIVER=logitech-djreceiver\nHID_ID=0003:0000046D:0000C54D\n\
+             HID_PHYS=usb-0000:00:14.0-9/input2\n"
+        ));
+        // A wired Logitech mouse on the same driver.
+        assert!(!child(
+            "DRIVER=logitech-hidpp-device\nHID_PHYS=usb-0000:00:14.0-3/input1\n"
+        ));
+        // A Bluetooth one: the physical path is an address.
+        assert!(!child(
+            "DRIVER=logitech-hidpp-device\nHID_ID=0005:0000046D:0000B023\n\
+             HID_PHYS=aa:bb:cc:dd:ee:ff\n"
+        ));
+    }
+
     /// macOS seizes devices opened in exclusive mode, which stops a mouse's
     /// pointer collection from moving the cursor while Bridge holds it.
     #[cfg(target_os = "macos")]
