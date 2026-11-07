@@ -691,23 +691,6 @@ fn release(version: &str) -> Release {
 }
 
 #[test]
-fn newer_stable_release_is_selected() {
-    if platform_archive_name().is_err() {
-        return;
-    }
-    let update = select_update(release("2.0.0"), "1.9.0")
-        .expect("release should parse")
-        .expect("new release should be selected");
-    assert_eq!(update.version, "2.0.0");
-}
-
-#[test]
-fn current_or_older_release_is_ignored() {
-    assert!(select_update(release("1.3.2"), "1.3.2").unwrap().is_none());
-    assert!(select_update(release("1.2.9"), "1.3.2").unwrap().is_none());
-}
-
-#[test]
 fn stub_completion_accepts_the_running_version_but_not_an_older_release() {
     if platform_archive_name().is_err() {
         return;
@@ -747,8 +730,60 @@ fn updates_use_the_full_package_not_the_legacy_bridge_archive() {
         ],
     };
     if name != legacy {
-        assert!(select_update(release, "1.9.0").is_err());
+        assert!(select_completion(release, "1.9.0").is_err());
     }
+}
+
+/// Runs the AppImage helper's swap against throwaway files: the new image
+/// replaces the old, and every failure keeps the old one and leaves a note.
+#[cfg(unix)]
+#[test]
+fn appimage_swap_installs_or_keeps_the_current_image() {
+    let root = fixture();
+    let run = |staged: &str, target: &str| {
+        let script = format!(
+            "log=\"$1/update.log\"\nfailure=\"$1/failed.txt\"\n{UNIX_LOGGING}{APPIMAGE_SWAP}swap_appimage \"$2\" \"$3\"\n"
+        );
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .arg("sh")
+            .arg(&root)
+            .arg(staged)
+            .arg(target)
+            .status()
+            .unwrap()
+    };
+    let target = root.join("Bridge.AppImage");
+    let staged = root.join(".update.AppImage");
+
+    fs::write(&target, b"old").unwrap();
+    fs::write(&staged, b"new").unwrap();
+    assert!(run(staged.to_str().unwrap(), target.to_str().unwrap()).success());
+    assert_eq!(fs::read(&target).unwrap(), b"new");
+    assert!(!staged.exists());
+    assert!(!root.join("Bridge.AppImage.previous").exists());
+    assert!(!root.join("failed.txt").exists());
+
+    // The download vanished: the current image stays and the failure is noted.
+    assert!(!run(staged.to_str().unwrap(), target.to_str().unwrap()).success());
+    assert_eq!(fs::read(&target).unwrap(), b"new");
+    let failure = fs::read_to_string(root.join("failed.txt")).unwrap();
+    assert!(failure.contains("kept the current version"), "{failure}");
+    fs::remove_file(root.join("failed.txt")).unwrap();
+
+    // The target cannot be moved aside: nothing changes, the download goes.
+    fs::write(&staged, b"newer").unwrap();
+    let missing = root.join("gone/Bridge.AppImage");
+    assert!(!run(staged.to_str().unwrap(), missing.to_str().unwrap()).success());
+    assert!(!staged.exists());
+    assert!(root.join("failed.txt").exists());
+    assert!(
+        fs::read_to_string(root.join("update.log"))
+            .unwrap()
+            .contains("Installed the new AppImage")
+    );
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1115,4 +1150,29 @@ async fn only_a_tracked_download_moves_the_progress() {
     server.join().unwrap();
     assert_eq!(bytes, b"abcd");
     assert_eq!(download_progress(), progress);
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_download_cleanup_removes_only_matching_entries() {
+    let root = fixture();
+    let keep = root.join("OpenMouse-Bridge.AppImage");
+    let stale = root.join(format!("{APPIMAGE_STAGING_PREFIX}0123.AppImage"));
+    let elsewhere = root.join("elsewhere");
+    fs::write(&keep, b"installed").unwrap();
+    fs::write(&stale, b"staged").unwrap();
+    fs::create_dir(&elsewhere).unwrap();
+    fs::write(elsewhere.join("precious"), b"x").unwrap();
+    // A link with a staging name is never followed or removed.
+    let link = root.join(format!("{APPIMAGE_STAGING_PREFIX}link.AppImage"));
+    std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+
+    remove_matching(&root, |name, _| {
+        name.starts_with(APPIMAGE_STAGING_PREFIX) && name.ends_with(".AppImage")
+    });
+    assert!(keep.exists());
+    assert!(!stale.exists());
+    assert!(fs::symlink_metadata(&link).is_ok());
+    assert!(elsewhere.join("precious").exists());
+    fs::remove_dir_all(root).unwrap();
 }

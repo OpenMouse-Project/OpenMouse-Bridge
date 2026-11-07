@@ -155,6 +155,8 @@ enum UpdateState {
     UpToDate,
     Available(UpdateInfo),
     Downloading(String),
+    /// Downloaded and verified; "Restart to update" applies it.
+    Ready(String),
     Restarting(String),
     Failed(String),
 }
@@ -166,6 +168,7 @@ impl UpdateState {
             UpdateEvent::UpToDate => Self::UpToDate,
             UpdateEvent::Available(update) => Self::Available(update),
             UpdateEvent::Downloading(version) => Self::Downloading(version),
+            UpdateEvent::Ready(version) => Self::Ready(version),
             UpdateEvent::Restarting(version) => Self::Restarting(version),
             UpdateEvent::Failed(error) => Self::Failed(error),
         }
@@ -183,7 +186,11 @@ impl UpdateState {
     fn is_notice(&self) -> bool {
         matches!(
             self,
-            Self::Available(_) | Self::Downloading(_) | Self::Restarting(_) | Self::Failed(_)
+            Self::Available(_)
+                | Self::Downloading(_)
+                | Self::Ready(_)
+                | Self::Restarting(_)
+                | Self::Failed(_)
         )
     }
 
@@ -200,6 +207,7 @@ impl UpdateState {
             Self::UpToDate => "Bridge is up to date".into(),
             Self::Available(update) => format!("Version {} is available", update.version),
             Self::Downloading(version) => downloading_text(version, progress),
+            Self::Ready(version) => format!("Version {version} is ready to install"),
             Self::Restarting(version) => format!("Restarting into {version}…"),
             Self::Failed(error) => format!("Update failed: {error}"),
         })
@@ -209,11 +217,21 @@ impl UpdateState {
     fn headline(&self, progress: Option<DownloadProgress>) -> Option<String> {
         Some(match self {
             Self::Failed(_) => "Update failed".into(),
+            Self::Ready(version) => format!("Update {version} is ready"),
             Self::Available(_) | Self::Downloading(_) | Self::Restarting(_) => {
                 self.text(progress)?
             }
             Self::Idle | Self::Checking | Self::UpToDate => return None,
         })
+    }
+}
+
+/// "Install", or "Download" for an install that cannot replace itself.
+fn install_label(update: &UpdateInfo) -> &'static str {
+    if update.manual_download_url().is_some() {
+        "Download"
+    } else {
+        "Install"
     }
 }
 
@@ -559,9 +577,22 @@ impl PanelView {
         cx.notify();
     }
 
+    /// Downloads and stages `update`, or for an install that cannot replace
+    /// itself, opens the page to download it from.
     fn install_update(&mut self, update: UpdateInfo, cx: &mut Context<Self>) {
+        if let Some(url) = update.manual_download_url() {
+            cx.open_url(url);
+            return;
+        }
         self.update = UpdateState::Downloading(update.version.clone());
         let _ = self.commands.send(BridgeCommand::InstallUpdate(update));
+        cx.notify();
+    }
+
+    /// Restarts into the staged update.
+    fn apply_update(&mut self, version: String, cx: &mut Context<Self>) {
+        self.update = UpdateState::Restarting(version);
+        let _ = self.commands.send(BridgeCommand::ApplyUpdate);
         cx.notify();
     }
 
@@ -906,9 +937,21 @@ impl PanelView {
                         Button::new("home-install-update")
                             .primary()
                             .compact()
-                            .label("Install")
+                            .label(install_label(&update))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.install_update(update.clone(), cx);
+                            })),
+                    )
+                }
+                UpdateState::Ready(version) => {
+                    let version = version.clone();
+                    Some(
+                        Button::new("home-apply-update")
+                            .primary()
+                            .compact()
+                            .label("Restart to update")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.apply_update(version.clone(), cx);
                             })),
                     )
                 }
@@ -1190,9 +1233,20 @@ impl PanelView {
                 Button::new("install-update")
                     .primary()
                     .compact()
-                    .label(format!("Install {}", update.version))
+                    .label(format!("{} {}", install_label(&update), update.version))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.install_update(update.clone(), cx);
+                    })),
+            );
+        }
+        if let UpdateState::Ready(version) = self.update.clone() {
+            updates = updates.child(
+                Button::new("apply-update")
+                    .primary()
+                    .compact()
+                    .label("Restart to update")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.apply_update(version.clone(), cx);
                     })),
             );
         }
@@ -1425,6 +1479,12 @@ mod tests {
         assert!(state(UpdateEvent::Downloading("2.0.0".into())).is_notice());
         assert!(state(UpdateEvent::Restarting("2.0.0".into())).is_notice());
         assert!(state(UpdateEvent::Failed("no network".into())).is_notice());
+        let ready = state(UpdateEvent::Ready("2.0.0".into()));
+        assert!(ready.is_notice() && !ready.busy() && !ready.shows_bar());
+        assert_eq!(
+            ready.headline(None).as_deref(),
+            Some("Update 2.0.0 is ready")
+        );
     }
 
     #[test]

@@ -33,7 +33,7 @@ Replaced:
 | --- | --- |
 | `src/desktop.rs` (egui/eframe panel, `tray-icon`, about 2.6k lines) | **Done.** `src/gpui_shell/` (the window) and `src/runtime.rs` (the background server, commands, update events and relaunch logic the window sits on); the egui code, `native_ui.rs` and the `eframe` and `gtk` dependencies are gone |
 | `src/overlay/*` (its own native window, drawn on the CPU) | Kept, and driven by the GPUI shell. Restyling it to match Desktop is optional |
-| `src/updater.rs` zip download and per-OS swap scripts | In-app updater below (not started) |
+| `src/updater.rs` zip download and per-OS swap scripts | In-app updater below: the app side is done (`latest.json`, staging, "Restart to update", helpers); releases do not publish `latest.json` yet |
 | zip packages and `install-linux.sh` | Installers below (not started) |
 
 Reference in `../Desktop/gpui`: `tray.rs`, `autostart.rs`, `overlay.rs`,
@@ -176,11 +176,29 @@ GPUI is the only window: the egui panel, `native_ui.rs`, `eframe`, `gtk` and the
   cannot read it. HID enumeration runs behind one lock and hidapi is
   initialised on a thread that never exits, which fixed an intermittent
   SIGTRAP on macOS.
-- **Updates:** wired to the existing updater until the in-app one replaces it.
-  The updater reports how far the download has got; the panel draws a progress
-  bar and percentage (a sweeping bar while the download is checked and
-  unpacked), and the app exits when the updater says it is restarting, since the
-  helper waits for the process to end before it installs and relaunches.
+- **Updates:** Bridge reads `latest.json` (`releases/latest/download/latest.json`;
+  `OPENMOUSE_BRIDGE_UPDATE_FEED_URL` points it at a local fake release) and
+  picks this install's asset: `windows-x86_64` (the setup exe),
+  `darwin-universal` (the app zip, for a `.app` bundle) or `linux-x86_64` (the
+  AppImage, when `$APPIMAGE` is set). Other installs (a bare macOS binary, an
+  extracted Linux tarball) are offered a Download button that opens the
+  release page. With automatic updates on it checks at launch and every 6
+  hours and downloads in the background; the download is checked against the
+  SHA-256 and size in `latest.json` and staged, and the panel shows
+  "Restart to update". Nothing applies until then. The helper waits for Bridge
+  to exit, applies the update and starts Bridge again: the installer runs with
+  `/VERYSILENT /DIR=<this install>` on Windows (Inno Setup undoes its own
+  changes if it fails), the bundle is swapped on macOS, and on Linux the new
+  AppImage is staged beside the old one and renamed over it, with the old one
+  put back if that fails. Helpers append to `update.log` in the log directory
+  and leave `update-failed.txt` when an update did not install, which the next
+  launch shows on the panel. A download that was staged but never applied
+  (Bridge quit instead) is removed at the next launch. A stub install still
+  finishes itself from the
+  `-full` zip straight away. Checked on Linux: an end-to-end AppImage update
+  against a local fake `latest.json` (check, download, "Restart to update",
+  the file replaced, Bridge started again, the log written). The Windows and
+  macOS paths build in CI but have not been run.
 - **Relaunch:** if the window ends for any reason other than quit, restart or an
   update, Bridge starts again, with the same crash-loop limits as before.
 
