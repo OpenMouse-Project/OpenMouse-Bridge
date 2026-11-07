@@ -131,10 +131,11 @@ mod platform {
         }
     }
 
-    pub fn show_window(window: &mut Window) {
+    pub fn show_window(window: &mut Window) -> bool {
         if let Some(window) = ns_window(window) {
             window.makeKeyAndOrderFront(None);
         }
+        false
     }
 
     /// The anchor for a click on the icon: the cursor, which is on it. Read
@@ -224,13 +225,14 @@ mod platform {
         }
     }
 
-    pub fn show_window(window: &mut Window) {
+    pub fn show_window(window: &mut Window) -> bool {
         if let Some(hwnd) = hwnd_of(window) {
             unsafe {
                 ShowWindow(hwnd, SW_RESTORE);
                 SetForegroundWindow(hwnd);
             }
         }
+        false
     }
 
     pub fn anchor_of_icon(rect: &tray_icon::Rect) -> Anchor {
@@ -318,21 +320,44 @@ mod linux;
 mod platform {
     use super::Anchor;
     use gpui_kit::Window;
-    use raw_window_handle::HasWindowHandle;
+    use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
     // GPUI exposes minimization on both X11 and Wayland. Keeping the taskbar
     // entry also provides recovery if the desktop loses its tray host.
-    pub fn hide_window(window: &Window) {
-        window.minimize_window();
+    pub fn hide_window(window: &mut Window) {
+        if super::layer_panel() {
+            // A layer surface cannot be minimized; showing opens a new one.
+            window.remove_window();
+        } else {
+            window.minimize_window();
+        }
     }
-    pub fn show_window(window: &mut Window) {
-        if let Err(error) = HasWindowHandle::window_handle(window)
-            .map_err(anyhow::Error::from)
-            .and_then(|handle| super::linux::restore_x11_window(handle.as_raw()))
-        {
+    /// Returns whether the panel was activated with the tray host's token, so
+    /// the caller skips GPUI's own (rejected on Wayland) activation request.
+    pub fn show_window(window: &mut Window) -> bool {
+        let Ok(handle) = HasWindowHandle::window_handle(window).map(|handle| handle.as_raw())
+        else {
+            return false;
+        };
+        if let Err(error) = super::linux::restore_x11_window(handle) {
             tracing::warn!(%error, "Could not restore the X11 panel");
         }
-        window.activate_window();
+        let (Some(token), Ok(display)) = (
+            super::linux::take_activation_token(),
+            HasDisplayHandle::display_handle(window).map(|display| display.as_raw()),
+        ) else {
+            return false;
+        };
+        if !matches!(handle, raw_window_handle::RawWindowHandle::Wayland(_)) {
+            return false;
+        }
+        match super::linux::activate_wayland_window(handle, display, token) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, "Could not activate the Wayland panel");
+                false
+            }
+        }
     }
     // Wayland compositors control top-level placement; do not interpret the
     // host's coordinate hints as portable window positions.
@@ -346,7 +371,9 @@ mod platform {
     use super::Anchor;
 
     pub fn hide_window(_window: &Window) {}
-    pub fn show_window(_window: &mut Window) {}
+    pub fn show_window(_window: &mut Window) -> bool {
+        false
+    }
     pub fn place_near_tray(_window: &Window, _anchor: Option<Anchor>) {}
 }
 
@@ -355,8 +382,126 @@ mod platform {
 static VISIBLE: AtomicBool = AtomicBool::new(true);
 
 pub fn is_visible() -> bool {
-    // Linux's taskbar can restore a minimized window without a tray command.
-    cfg!(target_os = "linux") || VISIBLE.load(Ordering::Relaxed)
+    // Linux's taskbar can restore a minimized window without a tray command;
+    // a closed layer-shell panel cannot be restored that way.
+    (cfg!(target_os = "linux") && !layer_panel()) || VISIBLE.load(Ordering::Relaxed)
+}
+
+/// Set on Wayland with a tray when the panel is a layer-shell surface pinned
+/// to the tray's corner: hiding closes it and showing opens a new one, since
+/// an ordinary Wayland window can neither pick its position nor be hidden.
+static LAYER_PANEL: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "linux")]
+pub(crate) use linux::{wayland_layer_shell_available, x11_work_area};
+
+pub fn layer_panel() -> bool {
+    LAYER_PANEL.load(Ordering::Relaxed)
+}
+
+pub fn set_layer_panel(enabled: bool) {
+    LAYER_PANEL.store(enabled, Ordering::Relaxed);
+}
+
+/// Gap between the layer-shell panel and the screen edges. The compositor
+/// already keeps it clear of the desktop panel's exclusive zone.
+#[cfg(target_os = "linux")]
+const LAYER_MARGIN: f32 = 8.0;
+
+/// The screen holding the tray click, else the first one.
+#[cfg(target_os = "linux")]
+pub fn layer_screen(
+    anchor: Option<Anchor>,
+    screens: &[gpui_kit::Bounds<gpui_kit::Pixels>],
+) -> Option<gpui_kit::Bounds<gpui_kit::Pixels>> {
+    use gpui_kit::{point, px};
+    anchor
+        .and_then(|anchor| {
+            let click = point(px(anchor.left as f32), px(anchor.top as f32));
+            screens.iter().find(|screen| screen.contains(&click))
+        })
+        .or_else(|| screens.first())
+        .copied()
+}
+
+/// The screen corner nearest the tray click, as layer-shell edges. Without a
+/// click position (the menu, the API, a first run) the bottom-right corner
+/// most desktops keep their tray in.
+#[cfg(target_os = "linux")]
+pub fn layer_corner(
+    anchor: Option<Anchor>,
+    screen: Option<gpui_kit::Bounds<gpui_kit::Pixels>>,
+) -> gpui_kit::layer_shell::Anchor {
+    use gpui_kit::{layer_shell::Anchor as Edge, px};
+
+    let (Some(anchor), Some(screen)) = (anchor, screen) else {
+        return Edge::BOTTOM | Edge::RIGHT;
+    };
+    let (x, y) = (anchor.left as f32, anchor.top as f32);
+    let center = screen.center();
+    let horizontal = if px(x) < center.x {
+        Edge::LEFT
+    } else {
+        Edge::RIGHT
+    };
+    let vertical = if px(y) < center.y {
+        Edge::TOP
+    } else {
+        Edge::BOTTOM
+    };
+    horizontal | vertical
+}
+
+/// Margins (top, right, bottom, left) that keep the panel clear of the
+/// desktop's own panels: the gap between the screen and its work area on each
+/// side, plus [`LAYER_MARGIN`]. KWin does not count Plasma's panels (which are
+/// not layer surfaces) when placing layer surfaces, so this is done here.
+#[cfg(target_os = "linux")]
+pub fn layer_margins(
+    screen: Option<gpui_kit::Bounds<gpui_kit::Pixels>>,
+    work_area: Option<gpui_kit::Bounds<gpui_kit::Pixels>>,
+) -> (
+    gpui_kit::Pixels,
+    gpui_kit::Pixels,
+    gpui_kit::Pixels,
+    gpui_kit::Pixels,
+) {
+    use gpui_kit::px;
+    let gap = px(LAYER_MARGIN);
+    let (Some(screen), Some(work)) = (screen, work_area) else {
+        return (gap, gap, gap, gap);
+    };
+    // The work area may span several screens; clip it to this one.
+    let work = work.intersect(&screen);
+    let reserved = |outer: gpui_kit::Pixels, inner: gpui_kit::Pixels| (outer - inner).max(px(0.));
+    (
+        reserved(work.top(), screen.top()) + gap,
+        reserved(screen.right(), work.right()) + gap,
+        reserved(screen.bottom(), work.bottom()) + gap,
+        reserved(work.left(), screen.left()) + gap,
+    )
+}
+
+/// Layer-shell options for the panel pinned to `corner`.
+#[cfg(target_os = "linux")]
+pub fn layer_options(
+    corner: gpui_kit::layer_shell::Anchor,
+    margin: (
+        gpui_kit::Pixels,
+        gpui_kit::Pixels,
+        gpui_kit::Pixels,
+        gpui_kit::Pixels,
+    ),
+) -> gpui_kit::layer_shell::LayerShellOptions {
+    use gpui_kit::layer_shell;
+    layer_shell::LayerShellOptions {
+        namespace: "openmouse-bridge-panel".into(),
+        layer: layer_shell::Layer::Top,
+        anchor: corner,
+        margin: Some(margin),
+        keyboard_interactivity: layer_shell::KeyboardInteractivity::OnDemand,
+        ..Default::default()
+    }
 }
 
 /// Whether closing the panel can hide it to a tray icon; where it cannot, the
@@ -370,7 +515,7 @@ pub fn can_hide() -> bool {
     cfg!(any(target_os = "macos", windows))
 }
 
-pub fn hide(window: &Window) {
+pub fn hide(window: &mut Window) {
     platform::hide_window(window);
     #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
     VISIBLE.store(false, Ordering::Relaxed);
@@ -378,14 +523,16 @@ pub fn hide(window: &Window) {
 
 /// Moves the panel beside the tray icon (see [`Anchor`]); without an anchor,
 /// to the tray's usual corner of the main screen.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub fn place(window: &Window, anchor: Option<Anchor>) {
     platform::place_near_tray(window, anchor);
 }
 
 pub fn show(window: &mut Window, anchor: Option<Anchor>) {
     platform::place_near_tray(window, anchor);
-    platform::show_window(window);
-    window.activate_window();
+    if !platform::show_window(window) {
+        window.activate_window();
+    }
     VISIBLE.store(true, Ordering::Relaxed);
 }
 
@@ -526,4 +673,59 @@ pub fn install(
     _window: AnyWindowHandle,
 ) -> Option<(mpsc::Receiver<Command>, TrayHandle)> {
     None
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use gpui_kit::{Bounds, layer_shell::Anchor as Edge, point, px, size};
+
+    use super::*;
+
+    fn screen() -> Bounds<gpui_kit::Pixels> {
+        Bounds::new(point(px(0.), px(0.)), size(px(1920.), px(1200.)))
+    }
+
+    fn click(x: f64, y: f64) -> Option<Anchor> {
+        Some(Anchor {
+            left: x,
+            top: y,
+            right: x,
+            bottom: y,
+        })
+    }
+
+    #[test]
+    fn the_panel_opens_in_the_corner_nearest_the_tray_click() {
+        let screens = [screen()];
+        let corner = |x, y| layer_corner(click(x, y), layer_screen(click(x, y), &screens));
+        assert_eq!(corner(1800., 1185.), Edge::BOTTOM | Edge::RIGHT);
+        assert_eq!(corner(1800., 15.), Edge::TOP | Edge::RIGHT);
+        assert_eq!(corner(20., 1100.), Edge::BOTTOM | Edge::LEFT);
+        // No click position: the usual bottom-right tray corner.
+        assert_eq!(
+            layer_corner(None, Some(screen())),
+            Edge::BOTTOM | Edge::RIGHT
+        );
+    }
+
+    #[test]
+    fn margins_clear_the_desktop_panel_reserved_from_the_work_area() {
+        // A 30 px bottom panel, as KWin reports it in _NET_WORKAREA.
+        let work = Bounds::new(point(px(0.), px(0.)), size(px(1920.), px(1170.)));
+        assert_eq!(
+            layer_margins(Some(screen()), Some(work)),
+            (px(8.), px(8.), px(38.), px(8.))
+        );
+        // A 48 px left panel.
+        let work = Bounds::new(point(px(48.), px(0.)), size(px(1872.), px(1200.)));
+        assert_eq!(
+            layer_margins(Some(screen()), Some(work)),
+            (px(8.), px(8.), px(8.), px(56.))
+        );
+        // No work area: just the gap.
+        assert_eq!(
+            layer_margins(Some(screen()), None),
+            (px(8.), px(8.), px(8.), px(8.))
+        );
+    }
 }

@@ -1,9 +1,13 @@
 //! StatusNotifierItem and DBusMenu on the session bus. ksni owns its worker
 //! thread; callbacks only queue commands for GPUI's existing poll loop.
 
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    mpsc,
+use std::{
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -37,6 +41,190 @@ pub(super) fn restore_x11_window(handle: raw_window_handle::RawWindowHandle) -> 
         .context("could not request X11 panel restoration")?
         .check()
         .context("could not map the X11 panel")?;
+    Ok(())
+}
+
+/// The XDG activation token the tray host sent with the last click, kept until
+/// the panel is shown. On Wayland only a token from the user's click lets the
+/// compositor raise (and un-minimize) the panel.
+static ACTIVATION_TOKEN: Mutex<Option<String>> = Mutex::new(None);
+
+/// Keeps the host's token for the click being handled. KDE can deliver it just
+/// after the click event, so wait briefly (ksni's own grace is 20 ms).
+fn capture_activation_token() {
+    let deadline = Instant::now() + Duration::from_millis(25);
+    let token = loop {
+        if let Some(token) = ksni::current_xdg_activation_token() {
+            break Some(token);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    *ACTIVATION_TOKEN.lock().unwrap_or_else(|e| e.into_inner()) = token;
+}
+
+pub(super) fn take_activation_token() -> Option<String> {
+    ACTIVATION_TOKEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
+
+/// Raises GPUI's Wayland surface with the tray host's activation token.
+///
+/// GPUI's `activate_window` requests its own token with a stale serial, which
+/// KWin and Mutter reject, so the minimized panel would only flash its taskbar
+/// entry. This opens a second queue on GPUI's libwayland display and activates
+/// the surface with the token the host issued for the click. X11 handles are
+/// ignored; `restore_x11_window` covers them.
+#[cfg(target_os = "linux")]
+pub(super) fn activate_wayland_window(
+    window: raw_window_handle::RawWindowHandle,
+    display: raw_window_handle::RawDisplayHandle,
+    token: String,
+) -> Result<()> {
+    use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
+    use wayland_client::{
+        Connection, Dispatch, Proxy, QueueHandle,
+        backend::{Backend, ObjectId},
+        globals::{GlobalListContents, registry_queue_init},
+        protocol::{wl_registry, wl_surface::WlSurface},
+    };
+    use wayland_protocols::xdg::activation::v1::client::xdg_activation_v1::XdgActivationV1;
+
+    struct State;
+    impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
+        fn event(
+            _: &mut Self,
+            _: &wl_registry::WlRegistry,
+            _: wl_registry::Event,
+            _: &GlobalListContents,
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+    impl Dispatch<XdgActivationV1, ()> for State {
+        fn event(
+            _: &mut Self,
+            _: &XdgActivationV1,
+            _: <XdgActivationV1 as Proxy>::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    let (RawWindowHandle::Wayland(window), RawDisplayHandle::Wayland(display)) = (window, display)
+    else {
+        return Ok(());
+    };
+    // SAFETY: both pointers come from GPUI's live window, which outlives this
+    // call, and GPUI's Wayland client uses libwayland (client_system).
+    let backend = unsafe { Backend::from_foreign_display(display.display.as_ptr().cast()) };
+    let connection = Connection::from_backend(backend);
+    let surface_id =
+        unsafe { ObjectId::from_ptr(WlSurface::interface(), window.surface.as_ptr().cast()) }
+            .context("could not wrap the panel's Wayland surface")?;
+    let surface = WlSurface::from_id(&connection, surface_id)
+        .context("could not use the panel's Wayland surface")?;
+    let (globals, mut queue) =
+        registry_queue_init::<State>(&connection).context("could not read Wayland globals")?;
+    let activation: XdgActivationV1 = globals
+        .bind(&queue.handle(), 1..=1, ())
+        .context("the compositor has no xdg_activation_v1")?;
+    activation.activate(token, &surface);
+    activation.destroy();
+    queue
+        .roundtrip(&mut State)
+        .context("could not send the panel activation")?;
+    Ok(())
+}
+
+/// The desktop's work area (the screen minus its panels) from the X root's
+/// `_NET_WORKAREA`, which KWin and most window managers publish, through
+/// XWayland under Wayland. GPUI's displays report the whole screen.
+pub(crate) fn x11_work_area() -> Option<gpui_kit::Bounds<gpui_kit::Pixels>> {
+    use x11rb::{
+        connection::Connection as _,
+        protocol::xproto::{AtomEnum, ConnectionExt as _},
+    };
+    let (connection, screen) = x11rb::connect(None).ok()?;
+    let root = connection.setup().roots.get(screen)?.root;
+    let atom = connection
+        .intern_atom(true, b"_NET_WORKAREA")
+        .ok()?
+        .reply()
+        .ok()?
+        .atom;
+    let reply = connection
+        .get_property(false, root, atom, AtomEnum::CARDINAL, 0, 4)
+        .ok()?
+        .reply()
+        .ok()?;
+    let [x, y, width, height] = reply.value32()?.collect::<Vec<_>>()[..] else {
+        return None;
+    };
+    use gpui_kit::{point, px, size};
+    Some(gpui_kit::Bounds::new(
+        point(px(x as f32), px(y as f32)),
+        size(px(width as f32), px(height as f32)),
+    ))
+}
+
+/// Whether GPUI's Wayland display offers wlr-layer-shell (KWin, wlroots and
+/// most others do; GNOME's Mutter does not). Not Wayland: false.
+#[cfg(target_os = "linux")]
+pub(crate) fn wayland_layer_shell_available(display: raw_window_handle::RawDisplayHandle) -> bool {
+    use raw_window_handle::RawDisplayHandle;
+    use wayland_client::{
+        Connection, Dispatch, QueueHandle,
+        backend::Backend,
+        globals::{GlobalListContents, registry_queue_init},
+        protocol::wl_registry,
+    };
+
+    struct State;
+    impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
+        fn event(
+            _: &mut Self,
+            _: &wl_registry::WlRegistry,
+            _: wl_registry::Event,
+            _: &GlobalListContents,
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    let RawDisplayHandle::Wayland(display) = display else {
+        return false;
+    };
+    // SAFETY: the pointer is GPUI's live libwayland display (client_system).
+    let backend = unsafe { Backend::from_foreign_display(display.display.as_ptr().cast()) };
+    let connection = Connection::from_backend(backend);
+    registry_queue_init::<State>(&connection).is_ok_and(|(globals, _)| {
+        globals.contents().with_list(|list| {
+            list.iter()
+                .any(|global| global.interface == "zwlr_layer_shell_v1")
+        })
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn wayland_layer_shell_available(_display: raw_window_handle::RawDisplayHandle) -> bool {
+    false
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn activate_wayland_window(
+    _window: raw_window_handle::RawWindowHandle,
+    _display: raw_window_handle::RawDisplayHandle,
+    _token: String,
+) -> Result<()> {
     Ok(())
 }
 
@@ -93,8 +281,16 @@ impl Tray for LinuxTray {
             ..Default::default()
         }
     }
-    fn activate(&mut self, _x: i32, _y: i32) {
-        let _ = self.sender.send(Command::Show(None));
+    fn activate(&mut self, x: i32, y: i32) {
+        capture_activation_token();
+        // The host passes the click's global position; (0, 0) means unknown.
+        let anchor = (x != 0 || y != 0).then(|| super::Anchor {
+            left: f64::from(x),
+            top: f64::from(y),
+            right: f64::from(x),
+            bottom: f64::from(y),
+        });
+        let _ = self.sender.send(Command::Show(anchor));
     }
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         use ksni::menu::StandardItem;
@@ -102,6 +298,7 @@ impl Tray for LinuxTray {
             StandardItem {
                 label: "Open OpenMouse Bridge".into(),
                 activate: Box::new(|tray: &mut Self| {
+                    capture_activation_token();
                     let _ = tray.sender.send(Command::Show(None));
                 }),
                 ..Default::default()
@@ -187,7 +384,25 @@ fn presentation(battery: Option<&TrayBattery>) -> Result<(ksni::Icon, String)> {
     let tooltip = battery
         .map(tray_battery::tooltip)
         .unwrap_or_else(|| "OpenMouse Bridge".into());
-    Ok((argb_icon(rgba, width, height), tooltip))
+    let (rgba, side) = pad_square(rgba, width, height);
+    Ok((argb_icon(rgba, side, side), tooltip))
+}
+
+/// Centres the image on a transparent square. Tray hosts scale the pixmap
+/// into a square slot, so the tall logo would otherwise be stretched wide.
+fn pad_square(rgba: Vec<u8>, width: u32, height: u32) -> (Vec<u8>, u32) {
+    if width == height {
+        return (rgba, width);
+    }
+    let side = width.max(height);
+    let (left, top) = ((side - width) / 2, (side - height) / 2);
+    let mut square = vec![0; (side * side * 4) as usize];
+    let row = (width * 4) as usize;
+    for (y, source) in rgba.chunks_exact(row).enumerate() {
+        let start = (((top + y as u32) * side + left) * 4) as usize;
+        square[start..start + row].copy_from_slice(source);
+    }
+    (square, side)
 }
 
 fn argb_icon(mut rgba: Vec<u8>, width: u32, height: u32) -> ksni::Icon {
@@ -253,6 +468,15 @@ mod tests {
             tooltip,
         };
         tray.activate(100, 200);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Command::Show(Some(super::super::Anchor {
+                left: 100.0,
+                top: 200.0,
+                ..
+            })))
+        ));
+        tray.activate(0, 0);
         assert!(matches!(receiver.try_recv(), Ok(Command::Show(None))));
         for item in tray.menu() {
             if let ksni::MenuItem::Standard(item) = item {
@@ -262,6 +486,17 @@ mod tests {
         assert!(matches!(receiver.try_recv(), Ok(Command::Show(None))));
         assert!(matches!(receiver.try_recv(), Ok(Command::Restart)));
         assert!(matches!(receiver.try_recv(), Ok(Command::Quit)));
+    }
+
+    #[test]
+    fn tall_icons_are_centred_on_a_square() {
+        // A 1x2 image gains one transparent column; integer centring puts it
+        // on the right.
+        let (square, side) = pad_square(vec![1, 2, 3, 4, 5, 6, 7, 8], 1, 2);
+        assert_eq!(side, 2);
+        assert_eq!(square, vec![1, 2, 3, 4, 0, 0, 0, 0, 5, 6, 7, 8, 0, 0, 0, 0]);
+        let (icon, _) = presentation(None).unwrap();
+        assert_eq!(icon.width, icon.height);
     }
 
     #[test]

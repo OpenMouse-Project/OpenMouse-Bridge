@@ -132,15 +132,31 @@ GPUI is the only window: the egui panel, `native_ui.rs`, `eframe`, `gtk` and the
   Linux uses `ksni` for StatusNotifierItem and DBusMenu on the session bus,
   with the shared battery glyph renderer and tooltip (the percentage style
   remains Windows-only). Activation and Open restore the panel; Restart and
-  Quit are available in the menu. Close and Escape minimize it while a host
-  is available, keeping the taskbar entry as a recovery path. Linux continues
+  Quit are available in the menu. The panel uses client-side decorations, so
+  no window-manager title bar duplicates its own controls.
+  On Wayland, GPUI's own activation requests a token with a stale serial that
+  KWin and Mutter reject, so the tray callbacks keep the XDG activation token
+  the host sends with the click (`ksni::current_xdg_activation_token`) and
+  Bridge activates GPUI's surface with it over a second queue on the same
+  libwayland display.
+  An ordinary Wayland window can neither choose its position nor be hidden, so
+  where the compositor offers wlr-layer-shell the panel is a layer surface
+  pinned to the corner nearest the click position the host passes to
+  `Activate(x, y)` (bottom-right without one). KWin does not keep layer
+  surfaces clear of Plasma's panels, so the margins come from `_NET_WORKAREA`
+  on the XWayland root. Hiding removes the surface and showing opens a new one
+  around the same view (`QuitMode::Explicit` keeps the app alive meanwhile).
+  `vendor/gpui-pre-linux` patches GPUI to report server decorations for layer
+  surfaces: otherwise gpui-component's window border adds a 20 px shadow inset
+  that GPUI turns into a smaller `set_size`, and the compositor places a
+  surface smaller than the buffer drawn into it.
+  Without layer-shell (X11, GNOME) Close and Escape minimize the panel while a
+  host is available, keeping the taskbar entry as a recovery path, and it keeps
   repainting because the taskbar can restore it without a tray command.
   No bus/host means an ordinary visible window whose close button quits.
   Losing the watcher restores the panel; the service re-registers when it
-  returns. GPUI/compositors handle placement and activation, so Linux does not
-  place the panel beside the icon. Wayland compositors may reject activation
-  requests from the tray; the taskbar entry remains available. Linux uses a
-  normal minimizable window with app ID `io.openmouse.bridge`. X11 activation
+  returns. The tray pads the tall logo to a square, since hosts scale icons
+  into square slots. Linux windows use app ID `io.openmouse.bridge`. X11 activation
   explicitly maps the panel before requesting focus, so a rejected focus
   request does not leave it minimized (X11 popups use
   override-redirect and cannot be managed by the window manager).
@@ -183,8 +199,9 @@ written and type-checks against the Windows bindings, but it has never been
 built or run there); anything on Linux; and the GitHub workflows, which have
 not run yet.
 
-Next: Windows (build and run it, then the installer); Linux desktop tray testing
-and AppImage testing, including relaunching `$APPIMAGE` rather than the mounted binary for
+Next: Windows (build and run it, then the installer); Linux tray testing on
+X11, GNOME and other desktops (KDE Plasma on Wayland has been run) and AppImage
+testing, including relaunching `$APPIMAGE` rather than the mounted binary for
 restart, update and login startup; the in-app updater with `latest.json`;
 moving installs of earlier versions across; `install-linux.sh`, whose package
 lists still name the GTK libraries; and replacing `release.yml`, which still

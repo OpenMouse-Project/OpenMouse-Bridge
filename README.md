@@ -10,7 +10,8 @@
 
 GPUI is the only window: there is no other shell. CI builds macOS, Linux, and
 Windows artifacts. Windows tray and panel behavior still need testing on a
-Windows desktop; Linux tray behavior still needs testing on a real desktop.
+Windows desktop. The Linux tray has been run on KDE Plasma (Wayland); X11,
+GNOME and other desktops still need testing.
 
 - [x] A panel in Desktop's dark look with its ASCII background: Home, Settings
       and a Bridge info page, opening beside the tray icon
@@ -107,13 +108,17 @@ Linux notes: the tray uses StatusNotifierItem/DBusMenu on the session bus
 (KDE Plasma and other compatible hosts; GNOME needs an AppIndicator/SNI
 extension). It shows the battery glyph, charge colour and the same battery
 tooltip as the other platforms. A click or the menu's Open action restores the
-panel; the menu also offers Restart and Quit. Closing or Escape minimizes the
-panel while a tray host is available, retaining its taskbar entry for recovery.
-Without a session bus or compatible tray host, the panel stays visible and
-closing it quits. If the host disappears, Bridge restores the panel and
-re-registers the icon when the host returns. The compositor controls panel
-placement on Linux; Wayland compositors may reject focus/restore requests
-from the tray, in which case use the taskbar entry. No GTK or AppIndicator shared libraries are needed in the
+panel, raised with the activation token the tray host sends with the click;
+the menu also offers Restart and Quit. The panel draws its own header and close
+button, without a window-manager title bar. On Wayland compositors with
+layer-shell (KDE Plasma, wlroots-based desktops) the panel opens in the screen
+corner nearest the tray icon, clear of the desktop's panel bar, and closing or
+Escape removes it until the tray brings it back. Elsewhere (X11, GNOME) it is
+a normal window that closing or Escape minimizes while a tray host is
+available, keeping its taskbar entry for recovery. Without a session bus or
+compatible tray host, the panel stays visible and closing it quits. If the
+host disappears, Bridge restores the panel and re-registers the icon when the
+host returns. No GTK or AppIndicator shared libraries are needed in the
 AppImage. The overlay banner and foreground detection need X11
 (on Wayland the banner falls back to a system notification and `foreground` is
 always false), and the chime needs `paplay` or `aplay`. With no
