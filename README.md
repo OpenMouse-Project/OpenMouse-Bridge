@@ -159,6 +159,35 @@ explicit configuration file, `OPENMOUSE_BRIDGE_GAMES_URL` can override the
 catalog endpoint, and `OPENMOUSE_BRIDGE_UPDATE_API_URL` can override the stable
 release API endpoint.
 
+## Notification sound
+
+Notifications play a built-in two-note chime once. Two optional settings in
+`config.json` change that (quit Bridge before editing the file, then start it
+again). The repeat count can also be chosen in the tray panel under
+Settings > Notification repeat (1 to 5).
+
+- `notificationRepeat` is how many times in a row the sound plays, from 1 to 10
+  (default 1; other values are clamped into that range).
+- `notificationSoundPath` is a `.wav` file to play instead of the chime. An
+  absolute path is used as written; any relative path, such as `"ding.wav"` or
+  `"sounds/ding.wav"`, is looked up from the folder that holds `config.json`.
+  Use `/` or `\\` in the path, never a single `\`, which is not valid JSON.
+  An empty value keeps the chime.
+
+```json
+{
+  "notificationSoundPath": "ding.wav",
+  "notificationRepeat": 3
+}
+```
+
+Only `.wav` files are supported, not MP3: PCM at 8, 16, 24 or 32 bit, or
+32-bit float, mono or stereo (including the WAVE_FORMAT_EXTENSIBLE variants of
+these). At most the first ten seconds of the file play per repeat,
+with a short fade at the cut. If the file cannot be used, the built-in chime
+plays instead and the tray panel names the reason. The volume setting and the
+Notification sound switch apply to custom sounds too.
+
 ## Local games and apps
 
 OpenMouse presets remain the centrally maintained catalog. Personal targets live

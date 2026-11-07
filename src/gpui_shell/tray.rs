@@ -187,6 +187,10 @@ mod platform {
         let top = visible.origin.y + visible.size.height - MARGIN;
         panel.setFrameTopLeftPoint(NSPoint::new(x.clamp(left, right), top));
     }
+
+    /// AppKit keeps the panel's top edge under the menu bar when it resizes, so
+    /// nothing needs moving.
+    pub fn keep_on_screen(_window: &Window, _height: f32) {}
 }
 
 #[cfg(windows)]
@@ -198,11 +202,11 @@ mod platform {
         Foundation::{POINT, RECT},
         Graphics::Gdi::{
             GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
-            MonitorFromPoint, MonitorFromRect,
+            MonitorFromPoint, MonitorFromRect, MonitorFromWindow,
         },
         UI::WindowsAndMessaging::{
-            SW_HIDE, SW_RESTORE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow,
-            SetWindowPos, ShowWindow,
+            GetWindowRect, SW_HIDE, SW_RESTORE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+            SetForegroundWindow, SetWindowPos, ShowWindow,
         },
     };
 
@@ -309,6 +313,61 @@ mod platform {
             );
         }
     }
+
+    /// Moves the panel up (or sideways) so a window of `height` logical points
+    /// stays inside its screen's work area. The panel grows downward from its
+    /// top edge when it changes size, so one opened just above a bottom
+    /// taskbar would otherwise end up partly under it.
+    pub fn keep_on_screen(window: &Window, height: f32) {
+        let Some(hwnd) = hwnd_of(window) else {
+            return;
+        };
+        let scale = f64::from(window.scale_factor());
+        let width = f64::from(window.bounds().size.width.as_f32()) * scale;
+        let height = f64::from(height) * scale;
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+            return;
+        }
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+        if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
+            return;
+        }
+        let work = info.rcWork;
+        let clamp = |value: f64, low: f64, high: f64| value.clamp(low, high.max(low));
+        let x = clamp(
+            f64::from(rect.left),
+            f64::from(work.left) + MARGIN,
+            f64::from(work.right) - width - MARGIN,
+        );
+        let y = clamp(
+            f64::from(rect.top),
+            f64::from(work.top) + MARGIN,
+            f64::from(work.bottom) - height - MARGIN,
+        );
+        if x as i32 != rect.left || y as i32 != rect.top {
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    x as i32,
+                    y as i32,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+        }
+    }
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -378,6 +437,7 @@ mod platform {
         false
     }
     pub fn place_near_tray(_window: &Window, _anchor: Option<Anchor>) {}
+    pub fn keep_on_screen(_window: &Window, _height: f32) {}
 }
 
 /// Whether the panel is on screen. While it is hidden in the tray nothing
@@ -530,6 +590,12 @@ pub fn hide(window: &mut Window) {
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 pub fn place(window: &Window, anchor: Option<Anchor>) {
     platform::place_near_tray(window, anchor);
+}
+
+/// Keeps a panel about to be `height` logical points tall inside its screen,
+/// moving it up if growing would push its lower part off the work area.
+pub fn keep_on_screen(window: &Window, height: f32) {
+    platform::keep_on_screen(window, height);
 }
 
 pub fn show(window: &mut Window, anchor: Option<Anchor>) {

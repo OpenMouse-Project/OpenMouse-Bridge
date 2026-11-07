@@ -147,6 +147,7 @@ pub(crate) enum BridgeCommand {
     SetBatteryThreshold(u8),
     SetNotificationSound(bool),
     SetNotificationVolume(u8),
+    SetNotificationRepeat(u32),
     SetAutomaticUpdates(bool),
     SetHybridMode(bool),
     SetTrayBatteryStyle(platform::TrayBatteryStyle),
@@ -405,6 +406,11 @@ fn run_server(
                     }
                     BridgeCommand::SetNotificationVolume(percent) => {
                         if let Err(error) = command_service.set_notification_volume(percent).await {
+                            tracing::error!(%error, "could not save Bridge settings");
+                        }
+                    }
+                    BridgeCommand::SetNotificationRepeat(count) => {
+                        if let Err(error) = command_service.set_notification_repeat(count).await {
                             tracing::error!(%error, "could not save Bridge settings");
                         }
                     }

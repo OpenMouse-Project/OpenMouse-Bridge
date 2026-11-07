@@ -399,6 +399,8 @@ pub(crate) fn test_snapshot() -> openmouse_bridge::service::BridgeSnapshot {
         automatic_updates: false,
         notification_sound: true,
         notification_volume: 60,
+        notification_sound_path: String::new(),
+        notification_repeat: 1,
         foreground_application: None,
         active_profile: None,
         active_profile_is_default: false,
