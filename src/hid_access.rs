@@ -12,8 +12,8 @@ pub const RULE_PATH: &str = "/etc/udev/rules.d/69-openmouse-bridge.rules";
 /// USB vendor ids the rule opens hidraw access for. Kept equal to
 /// `VENDOR_IDS` in `install-linux.sh` (a test checks).
 pub const VENDOR_IDS: &[u16] = &[
-    0x045e, 0x046d, 0x0483, 0x093a, 0x1532, 0x1915, 0x1caa, 0x1d57, 0x248a, 0x25a7, 0x2fe3, 0x31e3,
-    0x3151, 0x3367, 0x3434, 0x3554, 0x361d, 0x36a7, 0x3710, 0x373b, 0x373e, 0x3879,
+    0x045e, 0x046d, 0x0483, 0x04d9, 0x093a, 0x1532, 0x1915, 0x1caa, 0x1d57, 0x248a, 0x25a7, 0x2fe3,
+    0x31e3, 0x3151, 0x3367, 0x3434, 0x3554, 0x361d, 0x36a7, 0x3710, 0x373b, 0x373e, 0x3879,
 ];
 
 /// The udev rule: the same rules `install-linux.sh` writes.
@@ -192,6 +192,9 @@ mod tests {
             VENDOR_IDS.len()
         );
         assert!(rule.contains(r#"ATTRS{idVendor}=="046d", MODE="0666", TAG+="uaccess""#));
+        // Holtek's 0x04d9 covers the Redragon, Fater and Evision mice.
+        assert!(VENDOR_IDS.contains(&0x04d9));
+        assert!(rule.contains(r#"ATTRS{idVendor}=="04d9", MODE="0666", TAG+="uaccess""#));
         assert!(rule.contains(r#"KERNEL=="uinput""#));
     }
 
