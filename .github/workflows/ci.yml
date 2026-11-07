@@ -82,6 +82,9 @@ jobs:
         run: npm ci --prefix native-hid
       - name: Test native HID helper
         run: npm test --prefix native-hid
+      - name: Test release scripts
+        if: runner.os == 'Linux' && steps.changes.outputs.result != 'true'
+        run: node --test ".github/scripts/*.test.mjs"
       - name: Test installer script
         if: runner.os == 'Linux' && steps.changes.outputs.result != 'true'
         run: |
