@@ -429,7 +429,6 @@ impl Drop for OpenDevice {
 struct HidSession {
     session_id: u64,
     api: HidApi,
-    next_key: u64,
     device_keys: HashMap<Vec<u8>, String>,
     last_device_keys: Option<Vec<String>>,
     candidates: HashMap<String, Candidate>,
@@ -443,7 +442,6 @@ impl HidSession {
         Ok(Self {
             session_id,
             api: new_api().map_err(|error| format!("could not initialize native HID: {error}"))?,
-            next_key: 1,
             device_keys: HashMap::new(),
             last_device_keys: None,
             candidates: HashMap::new(),
@@ -578,7 +576,8 @@ impl HidSession {
             return Ok(Vec::new());
         }
 
-        let mut by_device = HashMap::<Vec<u8>, Vec<hidapi::DeviceInfo>>::new();
+        // Ordered, so devices are keyed and listed the same way every time.
+        let mut by_device = std::collections::BTreeMap::<Vec<u8>, Vec<hidapi::DeviceInfo>>::new();
         for info in self.api.device_list() {
             if vendors.contains(&info.vendor_id()) && !is_receiver_child(info.path()) {
                 by_device
@@ -593,8 +592,7 @@ impl HidSession {
             let key = if let Some(key) = self.device_keys.get(&device_id) {
                 key.clone()
             } else {
-                let key = format!("hid-{}", self.next_key);
-                self.next_key += 1;
+                let key = self.unused_key(stable_device_key(&device_id));
                 self.device_keys.insert(device_id, key.clone());
                 key
             };
@@ -628,6 +626,19 @@ impl HidSession {
         }
         summaries.sort_by(|left, right| left.key.cmp(&right.key));
         Ok(summaries)
+    }
+
+    /// `key`, or with a counter appended when another device in this session
+    /// already has it (two identical devices with no serial).
+    fn unused_key(&self, key: String) -> String {
+        let taken = |candidate: &str| self.device_keys.values().any(|used| used == candidate);
+        if !taken(&key) {
+            return key;
+        }
+        (2..)
+            .map(|count| format!("{key}-{count}"))
+            .find(|candidate| !taken(candidate))
+            .unwrap_or(key)
     }
 
     fn reconcile_inventory(&mut self, present: &HashSet<Vec<u8>>) -> Result<(), String> {
@@ -1266,6 +1277,36 @@ fn grouped_device_key(
     key
 }
 
+/// The key a device is listed under: the same for the same device across
+/// sessions, page reloads and Bridge restarts, so the control panel can
+/// remember what it learned about it (that a receiver carries a mouse, and
+/// that mouse's name). Before, keys were numbered per session in no fixed
+/// order, so a reload forgot all of it.
+///
+/// `hid-<vendor><product>-<hash>`, where the hash covers the device's
+/// grouping identity (vendor, product and serial, or the interface or path
+/// without one). The serial itself is never sent: WebHID does not give pages
+/// serial numbers, and Bridge should not either.
+fn stable_device_key(identity: &[u8]) -> String {
+    // FNV-1a: fixed, unlike `HashMap`'s randomly seeded hasher.
+    let hash = identity
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+    let id = |at: usize| {
+        u16::from_le_bytes([
+            identity.get(at).copied().unwrap_or(0),
+            identity.get(at + 1).copied().unwrap_or(0),
+        ])
+    };
+    let (vendor, product) = (id(0), id(2));
+    format!(
+        "hid-{vendor:04x}{product:04x}-{:08x}",
+        hash as u32 ^ (hash >> 32) as u32
+    )
+}
+
 fn device_group_key(info: &hidapi::DeviceInfo) -> Vec<u8> {
     grouped_device_key(
         info.vendor_id(),
@@ -1718,6 +1759,48 @@ async fn send_json(socket: &mut impl HidSocket, value: &impl Serialize) -> Resul
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn device_keys_are_stable_and_never_carry_the_serial() {
+        let receiver = grouped_device_key(0x046d, 0xc54d, b"/dev/hidraw2", Some("375D35803234"));
+        let key = stable_device_key(&receiver);
+        // Same device, another session or interface path: same key.
+        assert_eq!(
+            stable_device_key(&grouped_device_key(
+                0x046d,
+                0xc54d,
+                b"/dev/hidraw4",
+                Some("375D35803234")
+            )),
+            key
+        );
+        assert!(key.starts_with("hid-046dc54d-"), "{key}");
+        assert!(!key.contains("375D35803234"));
+        // Another receiver of the same model.
+        assert_ne!(
+            stable_device_key(&grouped_device_key(
+                0x046d,
+                0xc54d,
+                b"/dev/hidraw2",
+                Some("0000AAAA")
+            )),
+            key
+        );
+    }
+
+    #[test]
+    fn a_taken_key_gets_a_counter() {
+        let (input_tx, _, _) = input_channel();
+        let mut session = HidSession::new(u64::MAX - 41_140, input_tx).unwrap();
+        session
+            .device_keys
+            .insert(b"a".to_vec(), "hid-12345678-00000001".into());
+        assert_eq!(
+            session.unused_key("hid-12345678-00000001".into()),
+            "hid-12345678-00000001-2"
+        );
+        assert_eq!(session.unused_key("hid-other".into()), "hid-other");
+    }
+
     #[test]
     fn only_the_kernels_receiver_children_are_left_out() {
         use super::is_receiver_child_uevent as child;
