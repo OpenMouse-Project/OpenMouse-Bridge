@@ -134,6 +134,12 @@ fn try_start() -> Result<FocusWatch> {
         .build()
         .context("could not serve the focus reporter on the session bus")?;
     let dbus = DBusProxy::new(&connection)?;
+    // KWin restarting (a crash, `kwin_wayland --replace`) drops the script,
+    // so it is loaded again into the new KWin. The subscription comes before
+    // the lookup and the first load: a restart in between is then still seen.
+    let changes = dbus
+        .receive_name_owner_changed_with_args(&[(0, KWIN)])
+        .context("could not watch KWin on the session bus")?;
     let owner = dbus
         .get_name_owner(BusName::try_from(KWIN)?)
         .context("KWin is not on the session bus")?;
@@ -141,23 +147,15 @@ fn try_start() -> Result<FocusWatch> {
     load_script(&connection)?;
     tracing::info!("KWin reports the focused window to Bridge");
 
-    // KWin restarting (a crash, `kwin_wayland --replace`) drops the script:
-    // load it again into the new KWin.
     let watcher = connection.clone();
     thread::Builder::new()
         .name("openmouse-bridge-kwin-focus".into())
-        .spawn(move || watch_kwin(&watcher))
+        .spawn(move || watch_kwin(&watcher, changes))
         .context("could not start the KWin watcher")?;
     Ok(FocusWatch { connection })
 }
 
-fn watch_kwin(connection: &Connection) {
-    let Ok(dbus) = DBusProxy::new(connection) else {
-        return;
-    };
-    let Ok(changes) = dbus.receive_name_owner_changed_with_args(&[(0, KWIN)]) else {
-        return;
-    };
+fn watch_kwin(connection: &Connection, changes: zbus::blocking::fdo::NameOwnerChangedIterator) {
     for change in changes {
         let Ok(args) = change.args() else {
             continue;
