@@ -38,8 +38,56 @@ const POLL: Duration = Duration::from_millis(200);
 #[cfg(target_os = "linux")]
 const LAYER_MAP_DELAY: Duration = Duration::from_millis(150);
 
+/// Set when the process is asked to stop (SIGTERM, SIGINT or SIGHUP), so the
+/// app quits the way its Quit button does: the runtime stops and cleans up,
+/// unloading the KWin focus script among other things. Without a handler
+/// those signals ended the process on the spot.
+#[cfg(unix)]
+static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+fn watch_stop_signals() {
+    let watcher = thread::Builder::new()
+        .name("openmouse-bridge-signals".into())
+        .spawn(|| {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            runtime.block_on(async {
+                use tokio::signal::unix::{SignalKind, signal};
+                let (Ok(mut terminate), Ok(mut interrupt), Ok(mut hangup)) = (
+                    signal(SignalKind::terminate()),
+                    signal(SignalKind::interrupt()),
+                    signal(SignalKind::hangup()),
+                ) else {
+                    return;
+                };
+                loop {
+                    tokio::select! {
+                        _ = terminate.recv() => {}
+                        _ = interrupt.recv() => {}
+                        _ = hangup.recv() => {}
+                    }
+                    if STOP_REQUESTED.swap(true, Ordering::SeqCst) {
+                        // Asked again while still quitting: stop now.
+                        std::process::exit(143);
+                    }
+                    tracing::info!("asked to stop; quitting");
+                }
+            });
+        });
+    if let Err(error) = watcher {
+        tracing::warn!(%error, "could not watch for stop signals");
+    }
+}
+
 pub fn run() -> Result<()> {
     tracing::info!("starting the GPUI shell");
+    #[cfg(unix)]
+    watch_stop_signals();
     let (notice_tx, notices) = mpsc::channel();
     let Some((server, snapshots, commands, updates, panel_requests, show_panel)) =
         BackgroundServer::start(notice_tx)?
@@ -209,6 +257,11 @@ pub fn run() -> Result<()> {
                         // helper, which waits for this process to exit, installs,
                         // and relaunches. Exiting without a restart of our own.
                         tracing::info!("exiting so the staged update can be installed");
+                        cx.update(|cx| app_exit.quit(cx));
+                        break;
+                    }
+                    #[cfg(unix)]
+                    if STOP_REQUESTED.load(Ordering::SeqCst) {
                         cx.update(|cx| app_exit.quit(cx));
                         break;
                     }
