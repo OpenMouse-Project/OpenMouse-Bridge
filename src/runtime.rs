@@ -156,6 +156,7 @@ pub(crate) enum BridgeCommand {
     /// Restart into the staged update.
     ApplyUpdate,
     AcknowledgeTrayHint,
+    AcknowledgeWhatsNew,
     ForgetBattery(String),
 }
 
@@ -480,6 +481,11 @@ fn run_server(
                     }
                     BridgeCommand::AcknowledgeTrayHint => {
                         if let Err(error) = command_service.acknowledge_tray_hint().await {
+                            tracing::error!(%error, "could not save Bridge settings");
+                        }
+                    }
+                    BridgeCommand::AcknowledgeWhatsNew => {
+                        if let Err(error) = command_service.acknowledge_whats_new().await {
                             tracing::error!(%error, "could not save Bridge settings");
                         }
                     }

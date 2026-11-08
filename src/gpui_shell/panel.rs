@@ -7,10 +7,11 @@ use gpui_kit::component::{
     ActiveTheme as _, Disableable as _,
     button::{Button, ButtonVariants as _},
     switch::Switch,
+    text::TextView,
 };
 use gpui_kit::*;
 use openmouse_bridge::{
-    BRIDGE_PORT, config, hid_access,
+    BRIDGE_PORT, changelog, config, hid_access,
     platform::{self, TrayBatteryStyle},
     service::{BridgeSnapshot, KnownDeviceStatus, Notice},
     updater::{DownloadProgress, UpdateInfo, download_progress},
@@ -79,6 +80,7 @@ enum View {
     Home,
     Settings,
     Info,
+    WhatsNew,
 }
 
 impl View {
@@ -87,7 +89,8 @@ impl View {
         match self {
             View::Home => WINDOW_HEIGHT,
             View::Settings => 600.0,
-            View::Info => 380.0,
+            View::Info => 420.0,
+            View::WhatsNew => 480.0,
         }
     }
 }
@@ -99,6 +102,8 @@ const NOTE_HEIGHT: f32 = 22.0;
 const NOTICE_HEIGHT: f32 = 58.0;
 /// The progress bar under the update card's headline, with its gap.
 const BAR_HEIGHT: f32 = 14.0;
+/// Home's "Updated to …" line after an update.
+const WHATS_NEW_HEIGHT: f32 = 34.0;
 
 pub struct PanelView {
     snapshots: mpsc::Receiver<BridgeSnapshot>,
@@ -135,6 +140,12 @@ pub struct PanelView {
     /// notifications.
     overlay: Option<Overlay>,
     udev_fix: UdevFix,
+    /// The release notes of the update on offer, as `(version, notes)`, from
+    /// `latest.json`: shown at the top of What's new.
+    incoming_notes: Option<(String, String)>,
+    /// Home's "Updated to …" line was opened or dismissed this session; the
+    /// core saves it too, but the snapshot only catches up a second later.
+    whats_new_dismissed: bool,
 }
 
 pub struct Drained {
@@ -325,6 +336,7 @@ impl PanelView {
             view: match std::env::var("OPENMOUSE_BRIDGE_START_VIEW").as_deref() {
                 Ok("settings") => View::Settings,
                 Ok("info") => View::Info,
+                Ok("whats-new") => View::WhatsNew,
                 _ => View::Home,
             },
             autostart: platform::autostart_enabled(),
@@ -346,6 +358,8 @@ impl PanelView {
             overlay: Overlay::new()
                 .inspect_err(|error| tracing::warn!(%error, "Could not create the overlay"))
                 .ok(),
+            incoming_notes: None,
+            whats_new_dismissed: false,
         }
     }
 
@@ -393,6 +407,11 @@ impl PanelView {
         }
         while let Ok(event) = self.updates.try_recv() {
             self.quit_for_update |= matches!(event, UpdateEvent::Restarting(_));
+            if let UpdateEvent::Available(update) = &event
+                && !update.notes.trim().is_empty()
+            {
+                self.incoming_notes = Some((update.version.clone(), update.notes.clone()));
+            }
             self.update = UpdateState::from_event(event);
             changed = true;
         }
@@ -455,6 +474,33 @@ impl PanelView {
         cx.notify();
     }
 
+    /// Home offers this version's notes: Bridge was updated and they have not
+    /// been seen or dismissed yet.
+    fn offers_whats_new(&self) -> bool {
+        !self.whats_new_dismissed
+            && self
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.whats_new)
+    }
+
+    /// Records that this version's notes were seen, so Home stops offering
+    /// them.
+    fn acknowledge_whats_new(&mut self, cx: &mut Context<Self>) {
+        if !self.whats_new_dismissed {
+            self.whats_new_dismissed = true;
+            let _ = self.commands.send(BridgeCommand::AcknowledgeWhatsNew);
+        }
+        cx.notify();
+    }
+
+    fn show_whats_new(&mut self, cx: &mut Context<Self>) {
+        if self.offers_whats_new() {
+            self.acknowledge_whats_new(cx);
+        }
+        self.show_view(View::WhatsNew, cx);
+    }
+
     /// The height the current view needs: the base height plus a line for each
     /// extra remembered mouse, the "more" note, and the update status text.
     fn desired_height(&self) -> f32 {
@@ -490,9 +536,11 @@ impl PanelView {
                 if self.first_run_hint {
                     height += NOTE_HEIGHT * 2.0;
                 }
+                if self.offers_whats_new() {
+                    height += WHATS_NEW_HEIGHT;
+                }
             }
-            View::Settings => {}
-            View::Info => {}
+            View::Settings | View::Info | View::WhatsNew => {}
         }
         height
     }
@@ -923,6 +971,38 @@ impl PanelView {
                 "Bridge keeps running in the tray. Click its icon to open this panel again.",
             ));
         }
+        if self.offers_whats_new() {
+            content = content.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .text_sm()
+                    .child(
+                        div()
+                            .flex_1()
+                            .truncate()
+                            .child(format!("Updated to {}", env!("CARGO_PKG_VERSION"))),
+                    )
+                    .child(
+                        Button::new("home-whats-new")
+                            .compact()
+                            .label("What's new")
+                            .on_click(cx.listener(|this, _, _, cx| this.show_whats_new(cx))),
+                    )
+                    .child(
+                        Button::new("home-dismiss-whats-new")
+                            .ghost()
+                            .compact()
+                            .icon(IconName::Close)
+                            .tooltip("Dismiss")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.acknowledge_whats_new(cx);
+                            })),
+                    ),
+            );
+        }
         if let Some(problem) = native_problem(snapshot) {
             content = content.child(div().text_xs().text_color(cx.theme().danger).child(problem));
         }
@@ -979,7 +1059,22 @@ impl PanelView {
                     .items_center()
                     .gap_3()
                     .text_sm()
-                    .child(div().truncate().child(headline))
+                    .child(div().flex_1().truncate().child(headline))
+                    .children(
+                        (matches!(
+                            self.update,
+                            UpdateState::Available(_) | UpdateState::Ready(_)
+                        ) && self.incoming_notes.is_some())
+                        .then(|| {
+                            Button::new("home-update-notes")
+                                .ghost()
+                                .compact()
+                                .label("Notes")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.show_view(View::WhatsNew, cx);
+                                }))
+                        }),
+                    )
                     .children(action)
                     .children(
                         percent.map(|percent| div().flex_none().text_color(muted).child(percent)),
@@ -1371,6 +1466,76 @@ impl PanelView {
             .gap_3()
             .child(self.title_bar("Bridge info", true, false, accent, muted, cx))
             .child(details)
+            .child(
+                div().flex().flex_row().child(
+                    Button::new("info-whats-new")
+                        .ghost()
+                        .compact()
+                        .icon(IconName::Info)
+                        .label("What's new")
+                        .on_click(cx.listener(|this, _, _, cx| this.show_whats_new(cx))),
+                ),
+            )
+    }
+
+    /// The release notes: the update on offer first, when there is one, then
+    /// every entry of the built-in changelog, newest first.
+    fn whats_new(&self, muted: Hsla, accent: Hsla, cx: &mut Context<Self>) -> Div {
+        let current = env!("CARGO_PKG_VERSION");
+        let section = |id: String, heading: String, notes: SharedString| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(heading),
+                )
+                .child(div().text_sm().child(TextView::markdown(id, notes)))
+        };
+        let mut notes = div()
+            .id("whats-new-notes")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .gap_4()
+            .pr_2()
+            .overflow_y_scroll();
+        if let Some((version, incoming)) = &self.incoming_notes
+            && version != current
+        {
+            notes = notes.child(section(
+                "notes-incoming".into(),
+                format!("Coming in {version}"),
+                incoming.clone().into(),
+            ));
+        }
+        let entries = changelog::entries(changelog::CHANGELOG);
+        if entries.is_empty() {
+            notes = notes.child(div().text_sm().text_color(muted).child("No release notes."));
+        }
+        for entry in entries {
+            let heading = if entry.version == current {
+                format!("{} · installed", entry.version)
+            } else {
+                entry.version.to_owned()
+            };
+            notes = notes.child(section(
+                format!("notes-{}", entry.version),
+                heading,
+                SharedString::new_static(entry.body),
+            ));
+        }
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .p_4()
+            .gap_3()
+            .child(self.title_bar("What's new", true, false, accent, muted, cx))
+            .child(notes)
     }
 }
 
@@ -1401,6 +1566,7 @@ impl Render for PanelView {
             View::Home => self.home(muted, accent, line, fill, cx),
             View::Settings => self.settings(muted, accent, line, fill, danger, cx),
             View::Info => self.info(muted, accent, line, fill, cx),
+            View::WhatsNew => self.whats_new(muted, accent, cx),
         };
         // The ASCII field sits behind the content; the window's own Root paints
         // the background, so this shell stays clear.

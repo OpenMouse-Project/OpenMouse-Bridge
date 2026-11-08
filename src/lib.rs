@@ -1,6 +1,7 @@
 pub mod api;
 pub mod applications;
 pub mod buttons;
+pub mod changelog;
 pub mod config;
 pub mod devices;
 pub mod drivers;

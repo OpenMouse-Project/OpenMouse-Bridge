@@ -62,6 +62,10 @@ pub struct BridgeConfig {
     /// after that; the first launch opens the panel so a window actually appears.
     #[serde(default)]
     pub tray_hint_shown: bool,
+    /// The Bridge version whose "What's new" the user has seen or dismissed.
+    /// Home offers it after an update until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whats_new_seen: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -206,6 +210,7 @@ impl Default for BridgeConfig {
             allowed_origins: default_origins(),
             autostart_configured: false,
             tray_hint_shown: false,
+            whats_new_seen: None,
         }
     }
 }
@@ -629,6 +634,7 @@ mod tests {
             local_applications: Vec::new(),
             autostart_configured: false,
             tray_hint_shown: false,
+            whats_new_seen: None,
         }
         .normalized();
         assert_eq!(config.battery_threshold_percent, 100);

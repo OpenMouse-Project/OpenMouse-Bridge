@@ -485,6 +485,16 @@ pub struct BridgeService {
     battery_polling: Arc<AtomicBool>,
 }
 
+/// Whether Home should offer this version's notes: Bridge has run before
+/// (the first-run hint was shown), this version's notes have not been seen,
+/// and the built-in changelog has some.
+fn whats_new_pending(config: &BridgeConfig) -> bool {
+    let version = env!("CARGO_PKG_VERSION");
+    config.tray_hint_shown
+        && config.whats_new_seen.as_deref() != Some(version)
+        && crate::changelog::notes_for(version).is_some()
+}
+
 /// A control panel is connected when it holds a HID WebSocket session or
 /// handshook within the last few seconds.
 fn panel_connected(state: &BridgeState) -> bool {
@@ -688,6 +698,8 @@ pub struct BridgeSnapshot {
     /// Linux: `/dev/hidraw*` nodes of supported USB mice this user cannot
     /// open, because the udev rule is missing. Empty elsewhere.
     pub blocked_hid_devices: Vec<String>,
+    /// Bridge was updated and the user has not seen this version's notes yet.
+    pub whats_new: bool,
 }
 
 /// A remembered mouse as the status view shows it.
@@ -770,6 +782,20 @@ impl BridgeService {
         }
         self.update_config(|config| {
             config.tray_hint_shown = true;
+            // A first install has nothing new to announce.
+            config.whats_new_seen = Some(env!("CARGO_PKG_VERSION").into());
+            Ok(())
+        })
+        .await
+    }
+
+    /// Records that the user has seen, or dismissed, this version's notes.
+    pub async fn acknowledge_whats_new(&self) -> Result<()> {
+        if !whats_new_pending(&self.inner.read().await.config) {
+            return Ok(());
+        }
+        self.update_config(|config| {
+            config.whats_new_seen = Some(env!("CARGO_PKG_VERSION").into());
             Ok(())
         })
         .await
@@ -956,6 +982,7 @@ impl BridgeService {
             batteries,
             known_devices,
             blocked_hid_devices: crate::hid_access::blocked_devices(),
+            whats_new: whats_new_pending(&state.config),
         }
     }
 
@@ -2884,6 +2911,32 @@ mod tests {
         );
         remember_detected(&mut known, &[mouse("Logitech:046d:c547", "USB Receiver")]);
         assert_eq!(known.devices().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn whats_new_is_offered_after_an_update_once_and_never_on_a_first_install() {
+        // A first install: nothing to announce, during or after the first run.
+        let fresh = service(BridgeConfig::default());
+        assert!(!fresh.snapshot().await.whats_new);
+        fresh.acknowledge_tray_hint().await.unwrap();
+        assert!(!fresh.snapshot().await.whats_new);
+
+        // An earlier Bridge ran (hint shown) and never recorded these notes.
+        let updated = service(BridgeConfig {
+            tray_hint_shown: true,
+            ..BridgeConfig::default()
+        });
+        assert!(updated.snapshot().await.whats_new);
+        updated.acknowledge_whats_new().await.unwrap();
+        assert!(!updated.snapshot().await.whats_new);
+
+        // Seen for an older version only.
+        let older = service(BridgeConfig {
+            tray_hint_shown: true,
+            whats_new_seen: Some("0.0.1".into()),
+            ..BridgeConfig::default()
+        });
+        assert!(older.snapshot().await.whats_new);
     }
 
     #[tokio::test]
