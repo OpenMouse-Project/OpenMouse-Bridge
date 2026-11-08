@@ -463,6 +463,8 @@ mod tests {
         assert!(INSTALL_SCRIPT.contains(RULE_PATH));
     }
 
+    /// The command is for a Linux terminal; Windows joins paths with `\`.
+    #[cfg(unix)]
     #[test]
     fn the_fallback_command_quotes_its_paths() {
         let command = manual_command(Path::new("/home/o'neil/.cache/openmouse-bridge"));
