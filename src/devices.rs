@@ -19,7 +19,7 @@ const MAX_KNOWN: usize = 16;
 /// A sighting that changes nothing only rewrites the file this often.
 const REWRITE_AFTER_SECS: u64 = 10 * 60;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KnownDevice {
     pub id: String,
@@ -36,6 +36,16 @@ pub struct KnownDevice {
     pub polling_rate_hz: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub switch_mode: Option<String>,
+    /// The id of the device on the bus the mouse was last read through: its
+    /// receiver or dongle, or the mouse itself when wired. Whether the mouse
+    /// is reachable starts with whether this is plugged in, and the receiver
+    /// is not listed as a mouse of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
+    /// Bridge has read this mouse itself, so a read that goes unanswered
+    /// means the mouse is asleep or out of range rather than unsupported.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub native: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -124,7 +134,11 @@ impl DeviceStore {
         existing.dpi = update.dpi.or(existing.dpi);
         existing.polling_rate_hz = update.polling_rate_hz.or(existing.polling_rate_hz);
         existing.switch_mode = update.switch_mode.or_else(|| existing.switch_mode.take());
+        existing.via = update.via.or_else(|| existing.via.take());
+        existing.native |= update.native;
         let mut changed = before.name != existing.name
+            || before.via != existing.via
+            || before.native != existing.native
             || before.percent != existing.percent
             || before.charging != existing.charging
             || before.dpi != existing.dpi
@@ -194,11 +208,7 @@ mod tests {
             id: id.into(),
             name: name.into(),
             last_seen: seen,
-            percent: None,
-            charging: None,
-            dpi: None,
-            polling_rate_hz: None,
-            switch_mode: None,
+            ..KnownDevice::default()
         }
     }
 

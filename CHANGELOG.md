@@ -12,6 +12,8 @@ update check shows), and refuses to release a version without one.
 - The tray icon shows your mouse's battery, as a glyph or a percentage, in
   colours that follow the charge, with a tooltip that includes the time left.
 - Bridge remembers your mice and finds them as soon as they are plugged in.
+  Home lists one row per mouse rather than its receiver or dongle, and shows
+  a mouse that does not answer while its receiver is plugged in as Asleep.
 - Low-battery and game-profile alerts appear on an on-screen overlay with a
   chime, and Settings can send a test notification.
 - Reads the Attack Shark R5 Ultra's battery directly.

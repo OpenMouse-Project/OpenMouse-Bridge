@@ -12,7 +12,7 @@ use gpui_kit::*;
 use openmouse_bridge::{
     BRIDGE_PORT, config, hid_access,
     platform::{self, TrayBatteryStyle},
-    service::{BridgeSnapshot, KnownDeviceStatus, Notice},
+    service::{BridgeSnapshot, KnownDeviceState, KnownDeviceStatus, Notice},
     updater::{DownloadProgress, UpdateInfo, download_progress},
 };
 use tokio::sync::mpsc as tokio_mpsc;
@@ -736,10 +736,16 @@ fn format_uptime(seconds: u64) -> String {
 }
 
 /// What Home shows for a remembered mouse: its live reading while connected,
-/// otherwise when it was last seen and the reading it had then.
+/// "Asleep" and its last reading while its receiver is plugged in but it does
+/// not answer, otherwise when it was last seen and the reading it had then.
 fn known_device_text(device: &KnownDeviceStatus) -> String {
     let mut parts = Vec::new();
-    if device.connected {
+    if device.state == KnownDeviceState::Asleep {
+        parts.push("Asleep".into());
+        if let Some(percent) = device.percent {
+            parts.push(format!("{percent}%"));
+        }
+    } else if device.connected {
         match device.percent {
             Some(percent) if device.charging == Some(true) => {
                 parts.push(format!("{percent}% · Charging"));
@@ -888,17 +894,19 @@ impl PanelView {
                             .items_center()
                             .gap_1()
                             .child(known_device_text(device))
-                            .children((!device.connected).then(|| {
-                                let id = device.id.clone();
-                                Button::new(SharedString::from(format!("forget-{}", device.id)))
-                                    .ghost()
-                                    .compact()
-                                    .icon(IconName::Close)
-                                    .tooltip("Forget this mouse")
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.forget_device(id.clone(), cx);
-                                    }))
-                            })),
+                            .children((device.state == KnownDeviceState::Disconnected).then(
+                                || {
+                                    let id = device.id.clone();
+                                    Button::new(SharedString::from(format!("forget-{}", device.id)))
+                                        .ghost()
+                                        .compact()
+                                        .icon(IconName::Close)
+                                        .tooltip("Forget this mouse")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.forget_device(id.clone(), cx);
+                                        }))
+                                },
+                            )),
                     ),
             );
         }
