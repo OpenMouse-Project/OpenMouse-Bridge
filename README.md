@@ -73,7 +73,7 @@ The initial service provides:
   over live, with Bridge restoring the stored settings and reading the
   battery again on disconnect; without a saved profile Bridge leaves the
   mouse's own onboard memory untouched and just monitors it;
-- discovery of visible applications and the foreground application (on Linux, foreground detection needs X11; on Wayland every entry reports `foreground: false`);
+- discovery of visible applications and the foreground application (on Linux, X11 windows are found directly and KDE Plasma's Wayland session reports focus through a KWin script; on other Wayland desktops native Wayland windows report `foreground: false`);
 - persistent application profiles tied to a specific mouse;
 - low-battery notifications with a configurable threshold and cooldown, from
   battery levels Bridge reads itself every five minutes for the mice in saved
@@ -119,9 +119,12 @@ available, keeping its taskbar entry for recovery. Without a session bus or
 compatible tray host, the panel stays visible and closing it quits. If the
 host disappears, Bridge restores the panel and re-registers the icon when the
 host returns. No GTK or AppIndicator shared libraries are needed in the
-AppImage. The overlay banner and foreground detection need X11
-(on Wayland the banner falls back to a system notification and `foreground` is
-always false), and the chime needs `paplay` or `aplay`. With no
+AppImage. The overlay banner needs X11 (on Wayland it falls back to a system
+notification). Foreground detection uses X11, and on KDE Plasma 6 Wayland a
+KWin script Bridge loads at startup and unloads on exit reports the focused
+window over D-Bus (process ids only, no window titles); on other Wayland
+desktops native Wayland windows are never foreground. The chime needs
+`paplay` or `aplay`. With no
 `WAYLAND_DISPLAY` or `DISPLAY` (servers, SSH sessions), or with
 `OPENMOUSE_BRIDGE_HEADLESS=1` / `--headless`, Bridge skips the window and serves
 its HTTP API, HID, and game profiles headless (Ctrl-C stops it). Startup at

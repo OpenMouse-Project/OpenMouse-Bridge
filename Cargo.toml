@@ -53,6 +53,9 @@ ksni = { version = "0.3.7", default-features = false, features = ["blocking", "a
 # X11 overlay banner and foreground-window lookup. Pure Rust, no system
 # libraries.
 x11rb = "0.13"
+# KWin focus reports on Plasma Wayland (src/kwin_focus.rs). Already in the tree
+# through GPUI; same async-io runtime, plus the blocking API.
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
 # Hands the tray host's XDG activation token to the compositor for GPUI's
 # Wayland surface: GPUI's own activate requests are rejected, so a tray click
 # could not un-minimize the panel. client_system shares GPUI's libwayland
