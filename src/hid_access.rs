@@ -274,7 +274,8 @@ mod tests {
 
     /// The text between `<<'MARKER'` and `MARKER` in install-linux.sh.
     fn installer_heredoc(marker: &str) -> String {
-        let script = include_str!("../install-linux.sh");
+        // A Windows checkout has CRLF line endings.
+        let script = include_str!("../install-linux.sh").replace("\r\n", "\n");
         let open = format!("<<'{marker}'\n");
         let start = script.find(&open).expect("installer heredoc start") + open.len();
         let end = start
