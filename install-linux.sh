@@ -192,14 +192,18 @@ check_optionals() {
     fi
 }
 
-# Writes the hidraw udev rule to $1.
+# Writes the hidraw udev rule to $1. Where logind (or elogind) runs, which
+# /run/systemd/seats shows, only the user at the seat gets access; without it
+# nothing turns uaccess into an ACL, so the nodes are opened up instead.
 write_udev_rule() {
-    cat >"$1" <<'OPENMOUSE_UDEV_RULE'
+    local access='MODE="0666"'
+    [ -d /run/systemd/seats ] && access='TAG+="uaccess"'
+    sed "s|@ACCESS@|$access|" >"$1" <<'OPENMOUSE_UDEV_RULE'
 # OpenMouse Bridge: let the signed-in user reach mice over hidraw.
 # Installed by OpenMouse Bridge or install-linux.sh; safe to delete on uninstall.
 # Every hidraw node of a USB device with a mouse interface (a mouse or its
 # receiver), including the vendor interface its settings go through.
-SUBSYSTEM=="hidraw", SUBSYSTEMS=="usb", PROGRAM="/bin/sh /etc/udev/openmouse-bridge-is-mouse %S%p", TAG+="uaccess"
+SUBSYSTEM=="hidraw", SUBSYSTEMS=="usb", PROGRAM="/bin/sh /etc/udev/openmouse-bridge-is-mouse %S%p", @ACCESS@
 # The button listener presses keys and side buttons through a virtual keyboard and mouse.
 KERNEL=="uinput", MODE="0660", TAG+="uaccess", OPTIONS+="static_node=uinput"
 OPENMOUSE_UDEV_RULE
@@ -219,25 +223,93 @@ while [ ! -f "$dev/bNumInterfaces" ]; do
     dev=$(dirname "$dev")
 done
 interfaces="$dev/${dev##*/}:"
-# On hotplug the interfaces register one by one: give the rest up to a second.
 want=$(($(cat "$dev/bNumInterfaces")))
+
+# Whether report descriptor $1 has a Generic Desktop Mouse application
+# collection. Parses HID items, so a Report ID between the Usage Page and the
+# Usage, or a 2-byte Usage Page, still counts. Short usages take the Usage
+# Page in force at the main item; 4-byte usages carry their own.
+is_mouse_descriptor() {
+    set -- $(od -An -tu1 -v "$1")
+    page=0
+    usages=""
+    while [ "$#" -gt 0 ]; do
+        prefix=$1
+        shift
+        if [ "$prefix" -eq 254 ]; then
+            [ "$#" -ge 2 ] || return 1
+            skip=$(($1 + 2))
+            [ "$#" -ge "$skip" ] || return 1
+            shift "$skip"
+            continue
+        fi
+        size=$((prefix & 3))
+        [ "$size" -eq 3 ] && size=4
+        [ "$#" -ge "$size" ] || return 1
+        value=0
+        byte=0
+        while [ "$byte" -lt "$size" ]; do
+            value=$((value | ($1 << (8 * byte))))
+            shift
+            byte=$((byte + 1))
+        done
+        kind=$(((prefix >> 2) & 3))
+        case "$kind:$((prefix >> 4))" in
+            1:0) page=$value ;;
+            2:0)
+                if [ "$size" -eq 4 ]; then usages="$usages $value"; else usages="$usages s$value"; fi
+                ;;
+            0:10)
+                if [ "$value" -eq 1 ]; then
+                    for usage in $usages; do
+                        case "$usage" in s*) usage=$(((page << 16) | ${usage#s})) ;; esac
+                        [ "$usage" -eq 65538 ] && return 0
+                    done
+                fi
+                ;;
+        esac
+        [ "$kind" -eq 0 ] && usages=""
+    done
+    return 1
+}
+
+# On hotplug the interfaces, and the report descriptors under them, appear
+# one by one: wait (up to a second) until every interface and every HID
+# interface's descriptor is there.
+complete() {
+    count=0
+    for interface in "$interfaces"*; do
+        [ -e "$interface" ] || return 1
+        count=$((count + 1))
+        [ "$(cat "$interface/bInterfaceClass" 2>/dev/null)" = 03 ] || continue
+        for descriptor in "$interface"/*/report_descriptor; do
+            [ -e "$descriptor" ] || return 1
+        done
+    done
+    [ "$count" -ge "$want" ]
+}
 tries=0
-while [ "$tries" -lt 10 ]; do
-    set -- "$interfaces"*
-    if [ -e "$1" ] && [ "$#" -ge "$want" ]; then break; fi
+until complete || [ "$tries" -ge 10 ]; do
     tries=$((tries + 1))
     sleep 0.1
 done
+
 for interface in "$interfaces"*; do
     [ "$(cat "$interface/bInterfaceClass" 2>/dev/null)" = 03 ] || continue
     [ "$(cat "$interface/bInterfaceProtocol" 2>/dev/null)" = 02 ] && exit 0
     for descriptor in "$interface"/*/report_descriptor; do
-        [ -r "$descriptor" ] || continue
-        od -An -tx1 -v "$descriptor" | tr -s ' \n' '  ' | grep -q ' 05 01 09 02 a1 01' && exit 0
+        [ -r "$descriptor" ] && is_mouse_descriptor "$descriptor" && exit 0
     done
 done
 exit 1
 OPENMOUSE_UDEV_HELPER
+}
+
+# Installs $1 at $2 as root: copied beside it, then moved over it, so a failed
+# install never leaves a half-written file in place.
+install_root_file() {
+    local sudo="$3"
+    $sudo install -m 0644 "$1" "$2.openmouse-new" && $sudo mv -f "$2.openmouse-new" "$2"
 }
 
 # Writes the XDG autostart entry Bridge itself uses (see src/platform/linux.rs).
@@ -350,9 +422,10 @@ do_uninstall() {
     $root rm -f "$link"
     $root rm -rf "$dir"
     rm -f "$desktop" "$launcher"
-    if [ -f "$rule" ]; then
+    # The helper is checked on its own: a rule deleted by hand leaves it behind.
+    if [ -f "$rule" ] || [ -f "$UDEV_HELPER" ]; then
         if [ "$sudo" = "none" ]; then
-            die "cannot remove $rule without root; delete it manually"
+            die "cannot remove $rule and $UDEV_HELPER without root; delete them manually"
         fi
         $sudo rm -f "$rule" "$UDEV_HELPER" /etc/modules-load.d/openmouse-bridge.conf
         $sudo udevadm control --reload-rules 2>/dev/null || true
@@ -503,8 +576,8 @@ main() {
             # The helper goes first so the rule never runs without it.
             write_udev_helper "$tmp/openmouse-bridge-is-mouse"
             write_udev_rule "$tmp/69-openmouse-bridge.rules"
-            $sudo install -m 0644 "$tmp/openmouse-bridge-is-mouse" "$UDEV_HELPER"
-            $sudo install -m 0644 "$tmp/69-openmouse-bridge.rules" "$rule"
+            install_root_file "$tmp/openmouse-bridge-is-mouse" "$UDEV_HELPER" "$sudo" || die "could not install $UDEV_HELPER"
+            install_root_file "$tmp/69-openmouse-bridge.rules" "$rule" "$sudo" || die "could not install $rule"
             # /dev/uinput only exists once the uinput module is loaded.
             # Best effort: button assignments need it, the rest of Bridge does not.
             if ! { $sudo mkdir -p /etc/modules-load.d && echo uinput | $sudo tee /etc/modules-load.d/openmouse-bridge.conf >/dev/null; }; then

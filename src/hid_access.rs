@@ -23,20 +23,36 @@ pub const RULE_PATH: &str = "/etc/udev/rules.d/69-openmouse-bridge.rules";
 /// under `/usr`, which is read-only on image-based distros.
 pub const HELPER_PATH: &str = "/etc/udev/openmouse-bridge-is-mouse";
 
-/// The udev rule. `install-linux.sh` writes the same text (a test checks).
-///
-/// `uaccess` alone, without `MODE="0666"`: the user at the seat gets access
-/// through an ACL, other accounts on the machine do not. That matters because
-/// a receiver or keyboard with a mouse interface also exposes its keyboard
-/// interface here.
-pub const RULE: &str = r#"# OpenMouse Bridge: let the signed-in user reach mice over hidraw.
+/// The udev rule, with `@ACCESS@` where [`rule`] puts the access it grants.
+/// `install-linux.sh` writes the same template (a test checks).
+pub const RULE_TEMPLATE: &str = r#"# OpenMouse Bridge: let the signed-in user reach mice over hidraw.
 # Installed by OpenMouse Bridge or install-linux.sh; safe to delete on uninstall.
 # Every hidraw node of a USB device with a mouse interface (a mouse or its
 # receiver), including the vendor interface its settings go through.
-SUBSYSTEM=="hidraw", SUBSYSTEMS=="usb", PROGRAM="/bin/sh /etc/udev/openmouse-bridge-is-mouse %S%p", TAG+="uaccess"
+SUBSYSTEM=="hidraw", SUBSYSTEMS=="usb", PROGRAM="/bin/sh /etc/udev/openmouse-bridge-is-mouse %S%p", @ACCESS@
 # The button listener presses keys and side buttons through a virtual keyboard and mouse.
 KERNEL=="uinput", MODE="0660", TAG+="uaccess", OPTIONS+="static_node=uinput"
 "#;
+
+/// Access for the user at the seat only, through an ACL logind (or elogind)
+/// sets on nodes tagged `uaccess`. Other accounts get none, which matters
+/// because a combo receiver also exposes its keyboard interface here.
+const SEAT_ACCESS: &str = r#"TAG+="uaccess""#;
+
+/// Without logind nothing turns `uaccess` into an ACL (OpenRC without
+/// elogind, for one), so the nodes are opened up instead, as the rule did
+/// before it had the seat-only form.
+const OPEN_ACCESS: &str = r#"MODE="0666""#;
+
+/// The rule for this system: seat-only access where logind runs, which
+/// `/run/systemd/seats` shows while it does.
+pub fn rule() -> String {
+    rule_for(std::path::Path::new("/run/systemd/seats").is_dir())
+}
+
+fn rule_for(seat_acl: bool) -> String {
+    RULE_TEMPLATE.replace("@ACCESS@", if seat_acl { SEAT_ACCESS } else { OPEN_ACCESS })
+}
 
 /// The rule's helper: exits 0 when the hidraw node at sysfs path `$1` belongs
 /// to a USB device with a mouse interface. [`usb_device`] and
@@ -53,35 +69,105 @@ while [ ! -f "$dev/bNumInterfaces" ]; do
     dev=$(dirname "$dev")
 done
 interfaces="$dev/${dev##*/}:"
-# On hotplug the interfaces register one by one: give the rest up to a second.
 want=$(($(cat "$dev/bNumInterfaces")))
+
+# Whether report descriptor $1 has a Generic Desktop Mouse application
+# collection. Parses HID items, so a Report ID between the Usage Page and the
+# Usage, or a 2-byte Usage Page, still counts. Short usages take the Usage
+# Page in force at the main item; 4-byte usages carry their own.
+is_mouse_descriptor() {
+    set -- $(od -An -tu1 -v "$1")
+    page=0
+    usages=""
+    while [ "$#" -gt 0 ]; do
+        prefix=$1
+        shift
+        if [ "$prefix" -eq 254 ]; then
+            [ "$#" -ge 2 ] || return 1
+            skip=$(($1 + 2))
+            [ "$#" -ge "$skip" ] || return 1
+            shift "$skip"
+            continue
+        fi
+        size=$((prefix & 3))
+        [ "$size" -eq 3 ] && size=4
+        [ "$#" -ge "$size" ] || return 1
+        value=0
+        byte=0
+        while [ "$byte" -lt "$size" ]; do
+            value=$((value | ($1 << (8 * byte))))
+            shift
+            byte=$((byte + 1))
+        done
+        kind=$(((prefix >> 2) & 3))
+        case "$kind:$((prefix >> 4))" in
+            1:0) page=$value ;;
+            2:0)
+                if [ "$size" -eq 4 ]; then usages="$usages $value"; else usages="$usages s$value"; fi
+                ;;
+            0:10)
+                if [ "$value" -eq 1 ]; then
+                    for usage in $usages; do
+                        case "$usage" in s*) usage=$(((page << 16) | ${usage#s})) ;; esac
+                        [ "$usage" -eq 65538 ] && return 0
+                    done
+                fi
+                ;;
+        esac
+        [ "$kind" -eq 0 ] && usages=""
+    done
+    return 1
+}
+
+# On hotplug the interfaces, and the report descriptors under them, appear
+# one by one: wait (up to a second) until every interface and every HID
+# interface's descriptor is there.
+complete() {
+    count=0
+    for interface in "$interfaces"*; do
+        [ -e "$interface" ] || return 1
+        count=$((count + 1))
+        [ "$(cat "$interface/bInterfaceClass" 2>/dev/null)" = 03 ] || continue
+        for descriptor in "$interface"/*/report_descriptor; do
+            [ -e "$descriptor" ] || return 1
+        done
+    done
+    [ "$count" -ge "$want" ]
+}
 tries=0
-while [ "$tries" -lt 10 ]; do
-    set -- "$interfaces"*
-    if [ -e "$1" ] && [ "$#" -ge "$want" ]; then break; fi
+until complete || [ "$tries" -ge 10 ]; do
     tries=$((tries + 1))
     sleep 0.1
 done
+
 for interface in "$interfaces"*; do
     [ "$(cat "$interface/bInterfaceClass" 2>/dev/null)" = 03 ] || continue
     [ "$(cat "$interface/bInterfaceProtocol" 2>/dev/null)" = 02 ] && exit 0
     for descriptor in "$interface"/*/report_descriptor; do
-        [ -r "$descriptor" ] || continue
-        od -An -tx1 -v "$descriptor" | tr -s ' \n' '  ' | grep -q ' 05 01 09 02 a1 01' && exit 0
+        [ -r "$descriptor" ] && is_mouse_descriptor "$descriptor" && exit 0
     done
 done
 exit 1
 "##;
 
-/// The root shell script that installs [`HELPER`] (`$1`) and [`RULE`] (`$2`)
-/// and applies them to devices already plugged in, so no replug or reboot is
-/// needed. The helper goes first so the rule never runs without it.
+/// The root shell script that installs [`HELPER`] (`$1`) and the [`rule`]
+/// (`$2`) and applies them to devices already plugged in, so no replug or
+/// reboot is needed. Each file is written in full beside its place and then
+/// moved over it, so a failed install never leaves half a helper behind. The
+/// helper goes first so the rule never runs without it.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const INSTALL_SCRIPT: &str = r#"set -eu
-printf '%s' "$1" > /etc/udev/openmouse-bridge-is-mouse
-chmod 0644 /etc/udev/openmouse-bridge-is-mouse
-printf '%s' "$2" > /etc/udev/rules.d/69-openmouse-bridge.rules
-chmod 0644 /etc/udev/rules.d/69-openmouse-bridge.rules
+umask 022
+place() {
+    tmp=$(mktemp "$(dirname "$2")/.openmouse-bridge.XXXXXX")
+    if printf '%s' "$1" > "$tmp" && chmod 0644 "$tmp" && mv -f "$tmp" "$2"; then
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+place "$1" /etc/udev/openmouse-bridge-is-mouse
+place "$2" /etc/udev/rules.d/69-openmouse-bridge.rules
 udevadm control --reload-rules
 udevadm trigger --subsystem-match=hidraw --action=change
 udevadm trigger --subsystem-match=misc --sysname-match=uinput --action=change || true
@@ -95,10 +181,15 @@ const RULE_FILE: &str = "69-openmouse-bridge.rules";
 /// `dir`, for when `pkexec` is missing or fails.
 pub fn manual_command(dir: &Path) -> String {
     format!(
-        "sudo install -m 0644 '{helper}' {HELPER_PATH} && sudo install -m 0644 '{rule}' {RULE_PATH} && sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=hidraw --action=change",
-        helper = dir.join(HELPER_FILE).display(),
-        rule = dir.join(RULE_FILE).display(),
+        "sudo install -m 0644 {helper} {HELPER_PATH} && sudo install -m 0644 {rule} {RULE_PATH} && sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=hidraw --action=change",
+        helper = shell_quote(&dir.join(HELPER_FILE)),
+        rule = shell_quote(&dir.join(RULE_FILE)),
     )
+}
+
+/// `path` as one shell word, whatever it contains.
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
 }
 
 /// Saves the rule and its helper under the user's cache directory for
@@ -108,7 +199,7 @@ pub fn save_rule_files() -> anyhow::Result<PathBuf> {
     let dirs = directories::BaseDirs::new().context("could not find the cache directory")?;
     let dir = dirs.cache_dir().join("openmouse-bridge");
     fs::create_dir_all(&dir).with_context(|| format!("could not create {}", dir.display()))?;
-    for (name, text) in [(HELPER_FILE, HELPER), (RULE_FILE, RULE)] {
+    for (name, text) in [(HELPER_FILE, HELPER.to_owned()), (RULE_FILE, rule())] {
         let path = dir.join(name);
         fs::write(&path, text).with_context(|| format!("could not write {}", path.display()))?;
     }
@@ -175,11 +266,59 @@ fn describes_mouse(interface: &Path) -> bool {
     })
 }
 
-/// Usage Page (Generic Desktop), Usage (Mouse), Collection (Application).
+/// Whether a report descriptor has a Generic Desktop Mouse application
+/// collection. Parses HID items the way the helper's `is_mouse_descriptor`
+/// does: short usages take the Usage Page in force at the main item, 4-byte
+/// usages carry their own, and long items are skipped.
 fn has_mouse_collection(descriptor: &[u8]) -> bool {
-    descriptor
-        .windows(6)
-        .any(|window| window == [0x05, 0x01, 0x09, 0x02, 0xa1, 0x01])
+    const MOUSE: u32 = 0x0001_0002;
+    let mut page = 0_u32;
+    // Short usages are kept unresolved (`None` page) until the main item.
+    let mut usages: Vec<(Option<u32>, u32)> = Vec::new();
+    let mut at = 0;
+    while let Some(&prefix) = descriptor.get(at) {
+        at += 1;
+        if prefix == 0xfe {
+            let Some(&size) = descriptor.get(at) else {
+                return false;
+            };
+            at += 2 + usize::from(size);
+            continue;
+        }
+        let size = match prefix & 3 {
+            3 => 4,
+            size => usize::from(size),
+        };
+        let Some(data) = descriptor.get(at..at + size) else {
+            return false;
+        };
+        at += size;
+        let value = data.iter().enumerate().fold(0_u32, |value, (index, byte)| {
+            value | (u32::from(*byte) << (8 * index))
+        });
+        let kind = (prefix >> 2) & 3;
+        match (kind, prefix >> 4) {
+            (1, 0) => page = value,
+            (2, 0) => usages.push(if size == 4 {
+                (Some(value >> 16), value & 0xffff)
+            } else {
+                (None, value)
+            }),
+            (0, 0xa) if value == 1 => {
+                let mouse = usages
+                    .iter()
+                    .any(|(usage_page, usage)| (usage_page.unwrap_or(page) << 16 | usage) == MOUSE);
+                if mouse {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        if kind == 0 {
+            usages.clear();
+        }
+    }
+    false
 }
 
 #[cfg(target_os = "linux")]
@@ -191,7 +330,7 @@ mod imp {
 
     use anyhow::{Context, Result, bail};
 
-    use super::{HELPER, INSTALL_SCRIPT, RULE, has_mouse_interface, usb_device};
+    use super::{HELPER, INSTALL_SCRIPT, has_mouse_interface, rule, usb_device};
 
     /// The `/dev/hidraw*` nodes of USB mice and receivers that Bridge cannot
     /// open for reading and writing. Empty when all are reachable or none are
@@ -236,7 +375,8 @@ mod imp {
     pub fn install_rule() -> Result<()> {
         let output = Command::new("pkexec")
             .args(["/bin/sh", "-c", INSTALL_SCRIPT, "openmouse-bridge-udev"])
-            .args([HELPER, RULE])
+            .arg(HELPER)
+            .arg(rule())
             .output()
             .context("could not run pkexec; is polkit installed?")?;
         match output.status.code() {
@@ -287,17 +427,83 @@ mod tests {
 
     #[test]
     fn the_installer_writes_the_same_rule_and_helper() {
-        assert_eq!(installer_heredoc("OPENMOUSE_UDEV_RULE"), RULE);
+        assert_eq!(installer_heredoc("OPENMOUSE_UDEV_RULE"), RULE_TEMPLATE);
         assert_eq!(installer_heredoc("OPENMOUSE_UDEV_HELPER"), HELPER);
     }
 
+    /// The rule's hidraw line.
+    fn hidraw_line(rule: &str) -> &str {
+        let lines: Vec<&str> = rule
+            .lines()
+            .filter(|line| line.starts_with(r#"SUBSYSTEM=="hidraw""#))
+            .collect();
+        assert_eq!(lines.len(), 1, "{rule}");
+        lines[0]
+    }
+
     #[test]
-    fn the_rule_calls_the_helper_and_grants_the_seat_only() {
-        assert!(RULE.contains(&format!("PROGRAM=\"/bin/sh {HELPER_PATH} %S%p\"")));
+    fn the_rule_grants_the_seat_with_logind_and_opens_the_node_without() {
+        let seat = rule_for(true);
+        let line = hidraw_line(&seat);
+        assert!(line.contains(&format!("PROGRAM=\"/bin/sh {HELPER_PATH} %S%p\"")));
+        assert!(line.contains(r#"TAG+="uaccess""#), "{line}");
+        assert!(!seat.contains("0666"));
+
+        let open = rule_for(false);
+        let line = hidraw_line(&open);
+        assert!(line.contains(&format!("PROGRAM=\"/bin/sh {HELPER_PATH} %S%p\"")));
+        assert!(line.contains(r#"MODE="0666""#), "{line}");
+        assert!(!line.contains("uaccess"));
+
+        for rule in [&seat, &open] {
+            assert!(!rule.contains("@ACCESS@"));
+            assert!(rule.contains(r#"KERNEL=="uinput""#));
+        }
         assert!(INSTALL_SCRIPT.contains(HELPER_PATH));
         assert!(INSTALL_SCRIPT.contains(RULE_PATH));
-        assert!(!RULE.contains("0666"));
-        assert!(RULE.contains(r#"KERNEL=="uinput""#));
+    }
+
+    #[test]
+    fn the_fallback_command_quotes_its_paths() {
+        let command = manual_command(Path::new("/home/o'neil/.cache/openmouse-bridge"));
+        assert!(
+            command
+                .contains(r"'/home/o'\''neil/.cache/openmouse-bridge/openmouse-bridge-is-mouse'"),
+            "{command}"
+        );
+    }
+
+    #[test]
+    fn mouse_collections_are_parsed_not_pattern_matched() {
+        // A Report ID between the Usage Page and the Usage.
+        assert!(has_mouse_collection(&[
+            0x05, 0x01, 0x85, 0x02, 0x09, 0x02, 0xa1, 0x01
+        ]));
+        // Generic Desktop as a 2-byte Usage Page.
+        assert!(has_mouse_collection(&[
+            0x06, 0x01, 0x00, 0x09, 0x02, 0xa1, 0x01
+        ]));
+        // A 4-byte usage carries its own page, whatever the Usage Page says.
+        assert!(has_mouse_collection(&[
+            0x05, 0x0c, 0x0b, 0x02, 0x00, 0x01, 0x00, 0xa1, 0x01
+        ]));
+        // The Usage Page in force at the collection counts.
+        assert!(has_mouse_collection(&[0x09, 0x02, 0x05, 0x01, 0xa1, 0x01]));
+        // A long item is skipped whole.
+        assert!(has_mouse_collection(&[
+            0xfe, 0x02, 0x10, 0xaa, 0xbb, 0x05, 0x01, 0x09, 0x02, 0xa1, 0x01
+        ]));
+        // Not an application collection; a vendor page's usage 2; a
+        // keyboard; a usage cleared by an earlier main item; cut short.
+        assert!(!has_mouse_collection(&[0x05, 0x01, 0x09, 0x02, 0xa1, 0x00]));
+        assert!(!has_mouse_collection(&[
+            0x06, 0x00, 0xff, 0x09, 0x02, 0xa1, 0x01
+        ]));
+        assert!(!has_mouse_collection(&[0x05, 0x01, 0x09, 0x06, 0xa1, 0x01]));
+        assert!(!has_mouse_collection(&[
+            0x05, 0x01, 0x09, 0x02, 0x81, 0x02, 0xa1, 0x01
+        ]));
+        assert!(!has_mouse_collection(&[0x05, 0x01, 0x09, 0x02, 0xa1]));
     }
 
     #[test]
@@ -431,6 +637,45 @@ mod tests {
             let tree = Tree::new("descriptor");
             let nodes = tree.usb(&[Interface("00", VENDOR), Interface("00", MOUSE)]);
             assert!(nodes.iter().all(|node| opened(node)));
+        }
+
+        #[test]
+        fn unusual_mouse_descriptors_open_in_both_checks() {
+            const REPORT_ID_FIRST: &[u8] = &[0x05, 0x01, 0x85, 0x02, 0x09, 0x02, 0xa1, 0x01, 0xc0];
+            const WIDE_PAGE: &[u8] = &[0x06, 0x01, 0x00, 0x09, 0x02, 0xa1, 0x01, 0xc0];
+            const EXTENDED: &[u8] = &[0x0b, 0x02, 0x00, 0x01, 0x00, 0xa1, 0x01, 0xc0];
+            for (name, descriptor) in [
+                ("report-id", REPORT_ID_FIRST),
+                ("wide-page", WIDE_PAGE),
+                ("extended", EXTENDED),
+            ] {
+                let tree = Tree::new(name);
+                let nodes = tree.usb(&[Interface("00", VENDOR), Interface("00", descriptor)]);
+                assert!(nodes.iter().all(|node| opened(node)), "{name}");
+            }
+        }
+
+        /// On hotplug the helper waits for an interface that is not there
+        /// yet; without the wait it would see only the vendor one.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn the_helper_waits_for_an_interface_that_appears_late() {
+            let tree = Tree::new("hotplug");
+            let nodes = tree.usb(&[Interface("00", VENDOR), Interface("00", MOUSE)]);
+            let usb = tree.0.join("devices/usb1/1-2");
+            let late = usb.join("1-2:1.1");
+            let parked = tree.0.join("parked-interface");
+            fs::rename(&late, &parked).unwrap();
+            let node = fs::canonicalize(&nodes[0]).unwrap();
+            let helper = std::process::Command::new("sh")
+                .args(["-c", HELPER, "sh"])
+                .arg(node)
+                .spawn()
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            fs::rename(&parked, &late).unwrap();
+            let output = helper.wait_with_output().unwrap();
+            assert!(output.status.success());
         }
 
         #[test]
