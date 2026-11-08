@@ -313,20 +313,24 @@ mod imp {
         );
         let mut applications = BTreeMap::new();
         for process in system.processes().values() {
-            let Some(path) = process
-                .exe()
-                .map(|path| path.to_string_lossy().into_owned())
-            else {
+            // A Proton game reports the Windows program Wine runs, not the
+            // Wine loader every game shares.
+            let Some((path, executable)) = crate::games::process_program(process) else {
                 continue;
             };
-            let executable = Path::new(&path)
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
             if executable.is_empty() {
                 continue;
             }
-            let name = process_name(process);
+            let name = if crate::games::is_windows_path(&path) {
+                // Wine truncates the process name to 15 bytes; the program's
+                // file name has all of it.
+                Path::new(&executable)
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            } else {
+                process_name(process)
+            };
             if name.is_empty() {
                 continue;
             }
