@@ -212,6 +212,11 @@ pub fn matches_target(
 /// a Wine loader that path is used instead. Wine's own services under
 /// `C:\windows\` are left out: they are not programs anyone picks.
 pub(crate) fn process_program(process: &sysinfo::Process) -> Option<(String, String)> {
+    // On Linux sysinfo lists every thread too, named after the thread
+    // ("HangWatcher" for a Chromium browser); the process itself is enough.
+    if process.thread_kind().is_some() {
+        return None;
+    }
     let exe = process.exe()?;
     let file = exe.file_name()?.to_string_lossy();
     if is_wine_loader(&file) {
