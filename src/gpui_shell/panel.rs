@@ -175,6 +175,8 @@ enum UpdateState {
 impl UpdateState {
     fn from_event(event: UpdateEvent) -> Self {
         match event {
+            // Carries notes only; `drain` handles it before any state change.
+            UpdateEvent::Notes(..) => Self::Idle,
             UpdateEvent::Checking => Self::Checking,
             UpdateEvent::UpToDate => Self::UpToDate,
             UpdateEvent::Available(update) => Self::Available(update),
@@ -235,6 +237,19 @@ impl UpdateState {
             Self::Idle | Self::Checking | Self::UpToDate => return None,
         })
     }
+}
+
+/// What an update event says about the notes of the update on offer: `None`
+/// when it says nothing, otherwise the notes to show from now on. Every offer
+/// replaces them, so a later one without notes never shows an earlier
+/// version's.
+fn offered_notes(event: &UpdateEvent) -> Option<Option<(String, String)>> {
+    let (version, notes) = match event {
+        UpdateEvent::Available(update) => (&update.version, &update.notes),
+        UpdateEvent::Notes(version, notes) => (version, notes),
+        _ => return None,
+    };
+    Some((!notes.trim().is_empty()).then(|| (version.clone(), notes.clone())))
 }
 
 /// "Install", or "Download" for an install that cannot replace itself.
@@ -407,10 +422,12 @@ impl PanelView {
         }
         while let Ok(event) = self.updates.try_recv() {
             self.quit_for_update |= matches!(event, UpdateEvent::Restarting(_));
-            if let UpdateEvent::Available(update) = &event
-                && !update.notes.trim().is_empty()
-            {
-                self.incoming_notes = Some((update.version.clone(), update.notes.clone()));
+            if let Some(notes) = offered_notes(&event) {
+                self.incoming_notes = notes;
+                changed = true;
+            }
+            if matches!(event, UpdateEvent::Notes(..)) {
+                continue;
             }
             self.update = UpdateState::from_event(event);
             changed = true;
@@ -1594,7 +1611,7 @@ impl Render for PanelView {
 mod tests {
     // Not `use super::*`: that pulls in GPUI's own `test` macro, which shadows
     // `#[test]`.
-    use super::{UpdateState, step_threshold, step_volume};
+    use super::{UpdateState, offered_notes, step_threshold, step_volume};
     use crate::runtime::UpdateEvent;
 
     #[test]
@@ -1625,6 +1642,21 @@ mod tests {
 
     fn state(event: UpdateEvent) -> UpdateState {
         UpdateState::from_event(event)
+    }
+
+    #[test]
+    fn every_offer_replaces_the_notes_and_other_events_keep_them() {
+        assert_eq!(
+            offered_notes(&UpdateEvent::Notes("1.0.1".into(), "- Fix".into())),
+            Some(Some(("1.0.1".into(), "- Fix".into())))
+        );
+        // An offer without notes clears an earlier version's.
+        assert_eq!(
+            offered_notes(&UpdateEvent::Notes("1.0.2".into(), "  ".into())),
+            Some(None)
+        );
+        assert_eq!(offered_notes(&UpdateEvent::Ready("1.0.1".into())), None);
+        assert_eq!(offered_notes(&UpdateEvent::Checking), None);
     }
 
     #[test]
