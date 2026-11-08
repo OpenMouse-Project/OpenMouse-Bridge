@@ -129,6 +129,9 @@ pub fn start() -> Option<FocusWatch> {
 
 fn try_start() -> Result<FocusWatch> {
     let connection = connection::Builder::session()?
+        // A KWin that holds its name but never answers must not stall
+        // Bridge's start or its shutdown: calls give up and X11 is used.
+        .method_timeout(std::time::Duration::from_secs(5))
         .name(BUS_NAME)?
         .serve_at(OBJECT_PATH, Focus)?
         .build()
