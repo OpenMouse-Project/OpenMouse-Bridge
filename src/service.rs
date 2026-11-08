@@ -1970,8 +1970,15 @@ async fn poll_batteries_once(service: BridgeService) {
             }
             Ok(Err(error)) => {
                 tracing::debug!(%error, %device_id, "Could not read the mouse battery");
-                let through = read_through(&device_id, &discovered);
-                mark_unanswered(&service, &device_id, through.as_deref()).await;
+                // A control panel took the mouse over mid-poll: the read was
+                // never sent, so it says nothing about the mouse being awake.
+                let deferred = error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock);
+                if !deferred {
+                    let through = read_through(&device_id, &discovered);
+                    mark_unanswered(&service, &device_id, through.as_deref()).await;
+                }
             }
             Err(error) => {
                 tracing::warn!(%error, "The battery reader stopped unexpectedly");
