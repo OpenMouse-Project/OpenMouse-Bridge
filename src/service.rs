@@ -1173,7 +1173,17 @@ impl BridgeService {
     /// Turns launch-at-login on the first time a release build runs; after
     /// that the user's choice stands. Debug builds never register themselves.
     pub async fn enable_autostart_once(&self) -> Result<()> {
-        if cfg!(debug_assertions) || self.inner.read().await.config.autostart_configured {
+        // A development build would point the login entry at target/.
+        if cfg!(debug_assertions) {
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        match platform::linux::repair_autostart() {
+            Ok(true) => tracing::info!("pointed the login entry at this Bridge"),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(%error, "could not check the login entry"),
+        }
+        if self.inner.read().await.config.autostart_configured {
             return Ok(());
         }
         platform::set_autostart(true)?;
