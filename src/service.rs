@@ -783,6 +783,16 @@ fn is_receiver_of_another(known: &[KnownDevice], device: &KnownDevice) -> bool {
 /// battery it reports came from. `None` when it has none or several open:
 /// then the reading cannot be pinned to a receiver.
 fn panel_transport(open: &[(u16, u16)], detected: &[drivers::DetectedMouse]) -> Option<String> {
+    // A device the panel has open but the last scan missed could be where the
+    // reading came from.
+    let all_seen = open.iter().all(|(vendor_id, product_id)| {
+        detected
+            .iter()
+            .any(|mouse| mouse.vendor_id == *vendor_id && mouse.product_id == *product_id)
+    });
+    if !all_seen {
+        return None;
+    }
     let mut ids = detected
         .iter()
         .filter(|mouse| open.contains(&(mouse.vendor_id, mouse.product_id)))
@@ -1412,10 +1422,19 @@ impl BridgeService {
             };
             state.asleep.remove(&reading.device_id);
             // The receiver it came through is not a mouse of its own.
+            // Only a row the scan added: a device that was ever read has a
+            // reading of its own and is not just this mouse's receiver.
             let forgot_receiver = reading
                 .via
                 .as_ref()
                 .filter(|via| **via != reading.device_id)
+                .filter(|via| {
+                    state
+                        .known
+                        .devices()
+                        .iter()
+                        .any(|device| device.id == **via && device.percent.is_none())
+                })
                 .is_some_and(|via| state.known.forget(via));
             // A reading names the mouse: drop a scan-shaped entry for it.
             let duplicates: Vec<String> = state
@@ -1951,7 +1970,8 @@ async fn poll_batteries_once(service: BridgeService) {
             }
             Ok(Err(error)) => {
                 tracing::debug!(%error, %device_id, "Could not read the mouse battery");
-                mark_unanswered(&service, &device_id).await;
+                let through = read_through(&device_id, &discovered);
+                mark_unanswered(&service, &device_id, through.as_deref()).await;
             }
             Err(error) => {
                 tracing::warn!(%error, "The battery reader stopped unexpectedly");
@@ -1964,22 +1984,23 @@ async fn poll_batteries_once(service: BridgeService) {
 /// discovered device itself, or for a profile's `<brand>:<model>` id the
 /// discovered device of that brand, which is what the reader opens.
 fn read_through(device_id: &str, discovered: &[drivers::DetectedMouse]) -> Option<String> {
-    discovered
+    if let Some(mouse) = discovered.iter().find(|mouse| mouse.device_id == device_id) {
+        return Some(mouse.device_id.clone());
+    }
+    // A brand's reader opens whichever of its devices answers, so the link
+    // is only certain when the brand has one device on the bus.
+    let mut same_brand = discovered
         .iter()
-        .find(|mouse| mouse.device_id == device_id)
-        .or_else(|| {
-            discovered
-                .iter()
-                .find(|mouse| brand_of(&mouse.device_id).eq_ignore_ascii_case(brand_of(device_id)))
-        })
-        .map(|mouse| mouse.device_id.clone())
+        .filter(|mouse| brand_of(&mouse.device_id).eq_ignore_ascii_case(brand_of(device_id)));
+    let only = same_brand.next()?;
+    same_brand.next().is_none().then(|| only.device_id.clone())
 }
 
 /// A native read of `device_id` went unanswered: the mice it covers that
 /// Bridge has read before are asleep. A mouse Bridge has never read is left
 /// alone, since that failure more likely means no reader supports it. So is
 /// everything while hidraw nodes are blocked, when no read can get through.
-async fn mark_unanswered(service: &BridgeService, device_id: &str) {
+async fn mark_unanswered(service: &BridgeService, device_id: &str, through: Option<&str>) {
     let blocked = !tokio::task::spawn_blocking(crate::hid_access::blocked_devices)
         .await
         .unwrap_or_default()
@@ -1988,17 +2009,24 @@ async fn mark_unanswered(service: &BridgeService, device_id: &str) {
         return;
     }
     let mut state = service.inner.write().await;
-    let unanswered = unanswered_mice(state.known.devices(), device_id);
+    let unanswered = unanswered_mice(state.known.devices(), device_id, through);
     state.asleep.extend(unanswered);
 }
 
 /// The remembered mice a native read of `device_id` covers, among those
-/// Bridge has read itself before.
-fn unanswered_mice(known: &[KnownDevice], device_id: &str) -> Vec<String> {
+/// Bridge has read itself before: that mouse, or the mice that come through
+/// the device the read went `through` (a profile's `<brand>:<model>` id is
+/// read through its receiver).
+fn unanswered_mice(known: &[KnownDevice], device_id: &str, through: Option<&str>) -> Vec<String> {
     known
         .iter()
         .filter(|device| {
-            device.native && (device.id == device_id || device.via.as_deref() == Some(device_id))
+            device.native
+                && (device.id == device_id
+                    || device
+                        .via
+                        .as_deref()
+                        .is_some_and(|via| via == device_id || Some(via) == through))
         })
         .map(|device| device.id.clone())
         .collect()
@@ -3129,7 +3157,7 @@ mod tests {
         {
             let mut state = bridge.inner.write().await;
             remember_detected(&mut state.known, std::slice::from_ref(&dongle));
-            let asleep = unanswered_mice(state.known.devices(), &dongle.device_id);
+            let asleep = unanswered_mice(state.known.devices(), &dongle.device_id, None);
             assert_eq!(asleep, std::slice::from_ref(&native.device_id));
             state.asleep.extend(asleep);
         }
@@ -3204,7 +3232,7 @@ mod tests {
         // Bridge cannot read it itself, so a failed read says nothing about
         // whether it is asleep.
         let state = bridge.inner.read().await;
-        assert!(unanswered_mice(state.known.devices(), &dongle.device_id).is_empty());
+        assert!(unanswered_mice(state.known.devices(), &dongle.device_id, None).is_empty());
     }
 
     #[test]
@@ -3223,6 +3251,11 @@ mod tests {
         );
         assert_eq!(panel_transport(&[], &detected), None);
         assert_eq!(panel_transport(&[(0x1234, 0x5678)], &detected), None);
+        // An open device the scan missed could be where the reading came from.
+        assert_eq!(
+            panel_transport(&[(0x046d, 0xc54d), (0x1234, 0x5678)], &detected),
+            None
+        );
     }
 
     #[test]
@@ -3243,6 +3276,67 @@ mod tests {
             Some("Logitech:375D35803234")
         );
         assert_eq!(read_through("Razer:Viper", &detected), None);
+        // Two devices of the brand: the reader may open either, so no guess.
+        let two = [
+            receiver("Delux:3719C0531974", "R5 Ultra Mouse 2.4G", 0x373e, 0x0001),
+            receiver("Delux:248a:fa02", "Wireless Receiver", 0x248a, 0xfa02),
+        ];
+        assert_eq!(read_through("Delux:Attack Shark R5 Ultra", &two), None);
+        assert_eq!(
+            read_through("Delux:248a:fa02", &two).as_deref(),
+            Some("Delux:248a:fa02")
+        );
+    }
+
+    #[test]
+    fn a_failed_profile_read_marks_the_mouse_behind_its_receiver() {
+        // The profile names the mouse `Delux:…`; its readings were filed as
+        // `Attack Shark:…` through the dongle.
+        let mouse = KnownDevice {
+            id: "Attack Shark:Attack Shark R5 Ultra".into(),
+            name: "Attack Shark R5 Ultra".into(),
+            via: Some("Delux:3719C0531974".into()),
+            native: true,
+            ..KnownDevice::default()
+        };
+        let known = [mouse.clone()];
+        assert!(unanswered_mice(&known, "Delux:Attack Shark R5 Ultra", None).is_empty());
+        assert_eq!(
+            unanswered_mice(
+                &known,
+                "Delux:Attack Shark R5 Ultra",
+                Some("Delux:3719C0531974")
+            ),
+            std::slice::from_ref(&mouse.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_receiver_that_was_read_itself_is_not_forgotten_as_a_link() {
+        let bridge = BridgeService::new(BridgeConfig::default(), temp_config_path());
+        // A device with a reading of its own, which a later reading then
+        // names as its link (a wrong link, or a device that is both).
+        bridge
+            .record_battery(reading("Logitech:375D35803234", "USB Receiver", 70))
+            .await
+            .unwrap();
+        bridge
+            .record_battery(BatteryReading {
+                via: Some("Logitech:375D35803234".into()),
+                native: true,
+                ..reading("Logitech:G Pro", "G Pro", 60)
+            })
+            .await
+            .unwrap();
+        let state = bridge.inner.read().await;
+        assert!(
+            state
+                .known
+                .devices()
+                .iter()
+                .any(|device| device.id == "Logitech:375D35803234"),
+            "a device with its own reading stays remembered"
+        );
     }
 
     #[tokio::test]
