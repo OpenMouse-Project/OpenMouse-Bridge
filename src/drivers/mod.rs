@@ -28,13 +28,15 @@ pub use native_hid::{NativeBattery, NativeStatus, spawn_button_listener};
 
 /// A mouse Bridge discovered by itself, by scanning the HID bus for vendor
 /// ids its drivers recognize — no saved profile required.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DetectedMouse {
     /// Stable profile-style id, `"<Brand>:<serial or vid:pid>"` — the same
     /// `"<brand>:"` prefix convention the OpenMouse web app writes.
     pub device_id: String,
     /// Human-readable product name from the HID descriptor.
     pub name: String,
+    pub vendor_id: u16,
+    pub product_id: u16,
 }
 
 /// Brand keys and vendor ids, mirroring the helper's `native-hid/src/brands.mjs`
@@ -140,6 +142,12 @@ pub fn detect_mice() -> Vec<DetectedMouse> {
         let Some(brand) = discovered_brand(info) else {
             continue;
         };
+        // A Logitech receiver's per-mouse node on Linux is that receiver
+        // again, under the mouse's serial; counting it would list the
+        // receiver twice under two ids.
+        if crate::hid::is_receiver_child(info.path()) {
+            continue;
+        }
         // One physical mouse exposes several HID interfaces (boot mouse,
         // consumer control, vendor config, ...). Dedup on the identity
         // triple so the same mouse is not listed three times.
@@ -156,6 +164,8 @@ pub fn detect_mice() -> Vec<DetectedMouse> {
         mice.push(DetectedMouse {
             device_id: format!("{brand}:{}", identity.2),
             name: product_name(info.product_string().unwrap_or_default(), brand),
+            vendor_id,
+            product_id: info.product_id(),
         });
     }
     mice

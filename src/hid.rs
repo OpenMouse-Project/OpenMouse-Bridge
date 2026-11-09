@@ -1211,9 +1211,10 @@ pub(crate) fn feature_interfaces(
 /// expects one: it reported the receiver's name ("USB Receiver"), was tried
 /// first, and its HID++ probes went unanswered for 10-20 s before the panel
 /// fell back to the real receiver. The panel reaches paired mice through the
-/// receiver, as on the other platforms, so these nodes are left out.
+/// receiver, as on the other platforms, so these nodes are left out. Bridge's
+/// own bus scan leaves them out too: the receiver stands for its mice.
 #[cfg(target_os = "linux")]
-fn is_receiver_child(path: &std::ffi::CStr) -> bool {
+pub(crate) fn is_receiver_child(path: &std::ffi::CStr) -> bool {
     let Some(node) = path
         .to_str()
         .ok()
@@ -1226,7 +1227,7 @@ fn is_receiver_child(path: &std::ffi::CStr) -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn is_receiver_child(_path: &std::ffi::CStr) -> bool {
+pub(crate) fn is_receiver_child(_path: &std::ffi::CStr) -> bool {
     false
 }
 
