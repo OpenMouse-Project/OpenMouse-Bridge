@@ -201,10 +201,52 @@ mod platform {
             MonitorFromPoint, MonitorFromRect,
         },
         UI::WindowsAndMessaging::{
-            SW_HIDE, SW_RESTORE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow,
-            SetWindowPos, ShowWindow,
+            GetWindowRect, SW_HIDE, SW_RESTORE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+            SetForegroundWindow, SetWindowPos, ShowWindow,
         },
     };
+
+    /// Slides the panel up when a window of `height` logical points, growing
+    /// down from where it is now, would run past the work area's bottom edge.
+    pub fn keep_on_screen(window: &Window, height: f32) {
+        let Some(hwnd) = hwnd_of(window) else {
+            return;
+        };
+        let height = (f64::from(height) * f64::from(window.scale_factor())).ceil() as i32;
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+            return;
+        }
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let monitor = unsafe { MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST) };
+        if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
+            return;
+        }
+        let margin = MARGIN as i32;
+        let lowest = info.rcWork.bottom - height - margin;
+        let y = rect.top.min(lowest).max(info.rcWork.top + margin);
+        if y != rect.top {
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    rect.left,
+                    y,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+        }
+    }
 
     /// Distance kept from the work area's edges and from the icon, in pixels.
     const MARGIN: f64 = 8.0;
@@ -530,6 +572,15 @@ pub fn hide(window: &mut Window) {
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 pub fn place(window: &Window, anchor: Option<Anchor>) {
     platform::place_near_tray(window, anchor);
+}
+
+/// After the panel grows (opening Settings), keeps its bottom edge on screen.
+/// Only Windows needs this: it grows down from a fixed top-left corner.
+pub fn keep_on_screen(window: &Window, height: f32) {
+    #[cfg(windows)]
+    platform::keep_on_screen(window, height);
+    #[cfg(not(windows))]
+    let _ = (window, height);
 }
 
 pub fn show(window: &mut Window, anchor: Option<Anchor>) {
