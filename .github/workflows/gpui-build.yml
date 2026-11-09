@@ -220,7 +220,7 @@ jobs:
           exec "$HERE/usr/bin/openmouse-bridge" "$@"
           APPRUN
           chmod +x "$appdir/AppRun"
-          appstreamcli validate "$appdir/usr/share/metainfo/io.openmouse.bridge.appdata.xml"
+          appstreamcli validate --no-net "$appdir/usr/share/metainfo/io.openmouse.bridge.appdata.xml"
       - name: Build the AppImage
         run: |
           set -euo pipefail
