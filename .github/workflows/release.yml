@@ -174,8 +174,8 @@ jobs:
           # silicon and Intel since the Bridge binary itself is universal.
           find native-hid/node_modules/node-hid/prebuilds -mindepth 1 -maxdepth 1 -type d \
             ! -name HID-darwin-arm64 ! -name HID-darwin-x64 -exec rm -rf {} +
-          curl -fsSL "https://nodejs.org/dist/$NATIVE_HID_NODE_VERSION/node-$NATIVE_HID_NODE_VERSION-darwin-arm64.tar.gz" | tar -xz
-          curl -fsSL "https://nodejs.org/dist/$NATIVE_HID_NODE_VERSION/node-$NATIVE_HID_NODE_VERSION-darwin-x64.tar.gz" | tar -xz
+          curl -fsSL --retry 5 --retry-delay 5 --retry-max-time 120 "https://nodejs.org/dist/$NATIVE_HID_NODE_VERSION/node-$NATIVE_HID_NODE_VERSION-darwin-arm64.tar.gz" | tar -xz
+          curl -fsSL --retry 5 --retry-delay 5 --retry-max-time 120 "https://nodejs.org/dist/$NATIVE_HID_NODE_VERSION/node-$NATIVE_HID_NODE_VERSION-darwin-x64.tar.gz" | tar -xz
           mkdir -p native-hid/node/bin
           lipo -create \
             "node-$NATIVE_HID_NODE_VERSION-darwin-arm64/bin/node" \
@@ -291,7 +291,7 @@ jobs:
           # ever runs on linux-x64.
           find native-hid/node_modules/node-hid/prebuilds -mindepth 1 -maxdepth 1 -type d \
             ! -name HID-linux-x64 -exec rm -rf {} +
-          curl -fsSL "https://nodejs.org/dist/$NATIVE_HID_NODE_VERSION/node-$NATIVE_HID_NODE_VERSION-linux-x64.tar.xz" | tar -xJ
+          curl -fsSL --retry 5 --retry-delay 5 --retry-max-time 120 "https://nodejs.org/dist/$NATIVE_HID_NODE_VERSION/node-$NATIVE_HID_NODE_VERSION-linux-x64.tar.xz" | tar -xJ
           mkdir -p native-hid/node/bin
           cp "node-$NATIVE_HID_NODE_VERSION-linux-x64/bin/node" native-hid/node/bin/node
           chmod +x native-hid/node/bin/node
@@ -345,7 +345,7 @@ jobs:
       - name: Build the AppImage
         run: |
           set -euo pipefail
-          curl -fsSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --retry-max-time 120 -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x appimagetool
           # Runners have no FUSE, so the tool unpacks itself and runs from there.
           ARCH=x86_64 ./appimagetool --appimage-extract-and-run AppDir OpenMouse-Bridge-linux-x86_64.AppImage
