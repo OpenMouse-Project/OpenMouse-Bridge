@@ -497,21 +497,47 @@ fn captures_before_write_and_restores_original_not_handoff() {
     assert!(automation.entries.is_empty());
 }
 
+const LOGITECH_NO_DRIVER: &str = "Logitech:PRO X SUPERLIGHT 2c: unsupported acknowledged native automation readback for Logitech:PRO X SUPERLIGHT 2c";
+
 #[test]
-fn a_brand_without_native_automation_is_reported_as_no_driver() {
+fn a_brand_without_native_automation_is_left_out_of_the_panel() {
     let error = supported_brand("Logitech:PRO X SUPERLIGHT 2c").unwrap_err();
-    assert!(is_no_driver(&error.to_string()));
-    assert!(is_no_driver(
-        "unsupported acknowledged native automation readback for this driver"
-    ));
+    assert_eq!(without_no_driver(&error.to_string()), None);
     // As the panel receives it, behind the device id.
-    assert!(is_no_driver(
-        "Logitech:PRO X SUPERLIGHT 2c: unsupported acknowledged native automation readback for Logitech:PRO X SUPERLIGHT 2c"
-    ));
+    assert_eq!(without_no_driver(LOGITECH_NO_DRIVER), None);
     assert!(supported_brand("Zaunkoenig:M3K").is_ok());
     // Real failures still reach the panel.
-    assert!(!is_no_driver("mouse asleep"));
-    assert!(!is_no_driver(
-        "unsupported acknowledged DPI/polling readback"
-    ));
+    assert_eq!(
+        without_no_driver("mouse asleep").as_deref(),
+        Some("mouse asleep")
+    );
+}
+
+#[test]
+fn a_real_failure_next_to_a_no_driver_one_still_shows() {
+    let joined =
+        format!("Zaunkoenig:M3K: native restoration pending: mouse asleep; {LOGITECH_NO_DRIVER}");
+    assert_eq!(
+        without_no_driver(&joined).as_deref(),
+        Some("Zaunkoenig:M3K: native restoration pending: mouse asleep")
+    );
+}
+
+#[test]
+fn an_unaddressable_zaunkoenig_profile_is_a_real_error() {
+    for id in [
+        "Zaunkoenig:",
+        "Zaunkoenig",
+        &format!("Zaunkoenig:{}", "x".repeat(600)),
+    ] {
+        let message = supported_brand(id).unwrap_err().to_string();
+        assert!(
+            message.contains("invalid native profile device identity"),
+            "{message}"
+        );
+        assert_eq!(
+            without_no_driver(&message).as_deref(),
+            Some(message.as_str())
+        );
+    }
 }

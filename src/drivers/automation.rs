@@ -333,17 +333,27 @@ impl<F: FnMut(&serde_json::Value) -> Result<Option<Vec<u8>>>> AutomationIo for H
 /// show it.
 const NO_DRIVER: &str = "unsupported acknowledged native automation readback";
 
-pub(crate) fn is_no_driver(message: &str) -> bool {
-    // Errors are prefixed with the device id by the time they get here.
-    message.contains(NO_DRIVER)
+/// What a pass reports for several devices, joined, minus the errors that only
+/// mean Bridge has no driver for a mouse. `None` when nothing else is left, so
+/// a real failure next to a no-driver one still shows.
+pub(crate) fn without_no_driver(message: &str) -> Option<String> {
+    let kept: Vec<&str> = message
+        .split("; ")
+        .filter(|error| !error.contains(NO_DRIVER))
+        .collect();
+    (!kept.is_empty()).then(|| kept.join("; "))
 }
 
 fn supported_brand(device_id: &str) -> Result<&str> {
     let (brand, name) = device_id
         .split_once(':')
-        .ok_or_else(|| anyhow::anyhow!("unsupported native profile device identity"))?;
-    if !brand.eq_ignore_ascii_case("Zaunkoenig") || name.is_empty() || device_id.len() > 512 {
+        .ok_or_else(|| anyhow::anyhow!("invalid native profile device identity {device_id}"))?;
+    if !brand.eq_ignore_ascii_case("Zaunkoenig") {
         anyhow::bail!("{NO_DRIVER} for {device_id}");
+    }
+    // A Zaunkoenig profile that cannot be addressed is a real problem.
+    if name.is_empty() || device_id.len() > 512 {
+        anyhow::bail!("invalid native profile device identity {device_id}");
     }
     Ok(brand)
 }

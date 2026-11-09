@@ -723,13 +723,13 @@ fn native_problem(snapshot: Option<&BridgeSnapshot>) -> Option<String> {
     let error = snapshot
         .native_automation_error
         .as_deref()
-        .filter(|error| !openmouse_bridge::drivers::is_no_driver_error(error));
+        .and_then(openmouse_bridge::drivers::without_no_driver_errors);
     if snapshot.pending_native_restores > 0 {
         let mut text = format!(
             "Native restore pending ({})",
             snapshot.pending_native_restores
         );
-        if let Some(error) = error {
+        if let Some(error) = &error {
             text.push_str(": ");
             text.push_str(error);
         }
