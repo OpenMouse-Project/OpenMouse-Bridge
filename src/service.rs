@@ -1988,12 +1988,9 @@ async fn poll_batteries_once(service: BridgeService) {
 }
 
 /// The device on the bus a native read of `device_id` went through: the
-/// discovered device itself, or for a profile's `<brand>:<model>` id the
-/// discovered device of that brand, which is what the reader opens.
+/// sole discovered device of that brand. Readers select by brand even when
+/// the requested id names a specific receiver, so multiple devices are ambiguous.
 fn read_through(device_id: &str, discovered: &[drivers::DetectedMouse]) -> Option<String> {
-    if let Some(mouse) = discovered.iter().find(|mouse| mouse.device_id == device_id) {
-        return Some(mouse.device_id.clone());
-    }
     // A brand's reader opens whichever of its devices answers, so the link
     // is only certain when the brand has one device on the bus.
     let mut same_brand = discovered
@@ -3289,10 +3286,7 @@ mod tests {
             receiver("Delux:248a:fa02", "Wireless Receiver", 0x248a, 0xfa02),
         ];
         assert_eq!(read_through("Delux:Attack Shark R5 Ultra", &two), None);
-        assert_eq!(
-            read_through("Delux:248a:fa02", &two).as_deref(),
-            Some("Delux:248a:fa02")
-        );
+        assert_eq!(read_through("Delux:248a:fa02", &two).as_deref(), None);
     }
 
     #[test]
