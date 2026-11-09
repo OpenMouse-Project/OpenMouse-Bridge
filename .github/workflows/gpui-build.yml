@@ -21,7 +21,7 @@ env:
 jobs:
   macos-dmg:
     name: macOS DMG
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 60
     # Signing and notarization are automatic when these secrets exist; without
     # them the app is ad-hoc signed.
