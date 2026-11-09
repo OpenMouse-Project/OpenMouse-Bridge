@@ -464,5 +464,6 @@ pub(crate) fn test_snapshot() -> openmouse_bridge::service::BridgeSnapshot {
         batteries: vec![],
         known_devices: vec![],
         blocked_hid_devices: vec![],
+        whats_new: false,
     }
 }

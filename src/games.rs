@@ -203,6 +203,57 @@ pub fn matches_target(
     }
 }
 
+/// The program a process runs, as `(path, file name)`.
+///
+/// On Linux a Proton or Wine game's kernel executable is the Wine loader
+/// (`wine64-preloader`), the same for every game, so it would never match a
+/// catalog entry like `Overwatch.exe`. Wine writes the Windows program it
+/// started into the process's first argument (`Z:\...\Overwatch.exe`), so for
+/// a Wine loader that path is used instead. Wine's own services under
+/// `C:\windows\` are left out: they are not programs anyone picks.
+pub(crate) fn process_program(process: &sysinfo::Process) -> Option<(String, String)> {
+    // On Linux sysinfo lists every thread too, named after the thread
+    // ("HangWatcher" for a Chromium browser); the process itself is enough.
+    if process.thread_kind().is_some() {
+        return None;
+    }
+    let exe = process.exe()?;
+    let file = exe.file_name()?.to_string_lossy();
+    if is_wine_loader(&file) {
+        let cmdline = std::fs::read(format!("/proc/{}/cmdline", process.pid().as_u32())).ok()?;
+        return wine_program(&cmdline);
+    }
+    Some((exe.to_string_lossy().into_owned(), file.into_owned()))
+}
+
+/// The file names of Wine's loader, which Proton ships too.
+fn is_wine_loader(file: &str) -> bool {
+    matches!(
+        file,
+        "wine" | "wine64" | "wine-preloader" | "wine64-preloader"
+    )
+}
+
+/// The Windows program in a Wine process's `/proc/<pid>/cmdline`: the first
+/// of its first two arguments that is a Windows path or an `.exe` (a loader
+/// started by hand still has `wine` in front).
+fn wine_program(cmdline: &[u8]) -> Option<(String, String)> {
+    let path = cmdline
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .take(2)
+        .map(String::from_utf8_lossy)
+        .find(|argument| {
+            is_windows_path(argument) || argument.to_ascii_lowercase().ends_with(".exe")
+        })?
+        .into_owned();
+    if path_key(&path).starts_with("c:/windows/") {
+        return None;
+    }
+    let file = path.rsplit(['\\', '/']).next()?.to_owned();
+    (!file.is_empty()).then_some((path, file))
+}
+
 impl Default for GameDetector {
     fn default() -> Self {
         Self {
@@ -217,12 +268,8 @@ impl GameDetector {
             .processes()
             .values()
             .filter_map(|process| {
-                let path = process.exe()?;
-                let executable = path.file_name()?.to_string_lossy().into_owned();
-                Some(RunningProcess {
-                    executable,
-                    path: path.to_string_lossy().into_owned(),
-                })
+                let (path, executable) = process_program(process)?;
+                Some(RunningProcess { executable, path })
             })
             .collect()
     }
@@ -238,10 +285,7 @@ impl GameDetector {
             .processes()
             .values()
             .filter_map(|process| {
-                process
-                    .exe()
-                    .and_then(|path| path.file_name())
-                    .map(|name| name.to_string_lossy().to_ascii_lowercase())
+                process_program(process).map(|(_, executable)| executable.to_ascii_lowercase())
             })
             .collect();
         games
@@ -278,6 +322,71 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wine_process_is_the_windows_program_it_runs() {
+        // Proton: Wine puts the program's Windows path first.
+        assert_eq!(
+            wine_program(b"Z:\\games\\Overwatch\\Overwatch.exe\0-dx12\0"),
+            Some((
+                r"Z:\games\Overwatch\Overwatch.exe".into(),
+                "Overwatch.exe".into()
+            ))
+        );
+        // A loader started by hand still has `wine` in front.
+        assert_eq!(
+            wine_program(b"wine\0/home/me/Game.exe\0"),
+            Some(("/home/me/Game.exe".into(), "Game.exe".into()))
+        );
+        // Wine's own services are no program anyone picks.
+        assert_eq!(
+            wine_program(b"C:\\windows\\system32\\winedevice.exe\0"),
+            None
+        );
+        assert_eq!(wine_program(b"C:\\Windows\\explorer.exe\0"), None);
+        // Nothing that looks like a Windows program.
+        assert_eq!(wine_program(b"wine64-preloader\0--help\0"), None);
+        assert_eq!(wine_program(b""), None);
+    }
+
+    /// A process laid out like a Proton game: the kernel runs a file named
+    /// `wine64-preloader` (a copy of `sleep` here), and the first argument is
+    /// the Windows program.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_proton_game_is_detected_by_its_windows_program() {
+        use std::os::unix::process::CommandExt as _;
+
+        let directory = std::env::temp_dir().join(format!("openmouse-wine-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let loader = directory.join("wine64-preloader");
+        std::fs::copy("/bin/sleep", &loader).unwrap();
+        let mut child = std::process::Command::new(&loader)
+            .arg0(r"Z:\home\me\Steam\steamapps\common\Overwatch\Overwatch.exe")
+            .arg("30")
+            .spawn()
+            .unwrap();
+
+        let mut detector = GameDetector::default();
+        let games = [GameConfig {
+            name: "Overwatch 2".into(),
+            executables: vec!["overwatch.exe".into()],
+        }];
+        let detected = detector.detect(&games);
+        let process = detector
+            .running_processes()
+            .into_iter()
+            .find(|process| process.executable == "Overwatch.exe");
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let _ = std::fs::remove_dir_all(&directory);
+        assert_eq!(detected, ["Overwatch 2"]);
+        assert_eq!(
+            process.map(|process| process.path).as_deref(),
+            Some(r"Z:\home\me\Steam\steamapps\common\Overwatch\Overwatch.exe")
+        );
+    }
 
     #[test]
     fn running_apps_use_inventory_and_missing_paths_fail_closed() {

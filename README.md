@@ -350,10 +350,17 @@ to `/opt/openmouse-bridge` with a `/usr/local/bin` symlink), `--no-deps`
 
 Without the udev rule (an AppImage, a source build, or `--no-udev`), the
 `/dev/hidraw*` nodes are root-only and opening a mouse fails with "Permission
-denied". Bridge checks for this: while a supported USB mouse is plugged in that
-it cannot open, the panel shows a **Fix permissions** card that installs the
-same rule (`/etc/udev/rules.d/69-openmouse-bridge.rules`) through `pkexec`, the
-desktop's password prompt, and applies it to plugged-in devices. If `pkexec` is
+denied". Bridge checks for this: while a USB mouse or receiver is plugged in
+that it cannot open, the panel shows a **Fix permissions** card that installs
+the same rule (`/etc/udev/rules.d/69-openmouse-bridge.rules`, plus its helper
+`/etc/udev/openmouse-bridge-is-mouse`) through `pkexec`, the desktop's password
+prompt, and applies it to plugged-in devices.
+
+The rule is not a list of vendors. It gives the signed-in user (udev's
+`uaccess`, not world-readable) every hidraw node of any USB device that has a
+mouse interface, meaning a boot-protocol mouse or a report descriptor with a
+Generic Desktop Mouse collection. That includes the vendor interface where
+settings are read and written, so new brands need no rule change. If `pkexec` is
 missing or fails, the card offers the equivalent `sudo` command to copy. The
 blocked nodes are also listed in `/v1/status` as `blockedHidDevices`.
 
