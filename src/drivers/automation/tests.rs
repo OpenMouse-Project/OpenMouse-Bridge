@@ -496,3 +496,22 @@ fn captures_before_write_and_restores_original_not_handoff() {
     );
     assert!(automation.entries.is_empty());
 }
+
+#[test]
+fn a_brand_without_native_automation_is_reported_as_no_driver() {
+    let error = supported_brand("Logitech:PRO X SUPERLIGHT 2c").unwrap_err();
+    assert!(is_no_driver(&error.to_string()));
+    assert!(is_no_driver(
+        "unsupported acknowledged native automation readback for this driver"
+    ));
+    // As the panel receives it, behind the device id.
+    assert!(is_no_driver(
+        "Logitech:PRO X SUPERLIGHT 2c: unsupported acknowledged native automation readback for Logitech:PRO X SUPERLIGHT 2c"
+    ));
+    assert!(supported_brand("Zaunkoenig:M3K").is_ok());
+    // Real failures still reach the panel.
+    assert!(!is_no_driver("mouse asleep"));
+    assert!(!is_no_driver(
+        "unsupported acknowledged DPI/polling readback"
+    ));
+}

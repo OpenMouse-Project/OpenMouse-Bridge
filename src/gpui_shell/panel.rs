@@ -719,21 +719,23 @@ fn profile_name(snapshot: Option<&BridgeSnapshot>) -> String {
 /// readable; a selected profile is not proof the mouse took it.
 fn native_problem(snapshot: Option<&BridgeSnapshot>) -> Option<String> {
     let snapshot = snapshot?;
+    // A mouse Bridge has no driver for is not a problem to report.
+    let error = snapshot
+        .native_automation_error
+        .as_deref()
+        .filter(|error| !openmouse_bridge::drivers::is_no_driver_error(error));
     if snapshot.pending_native_restores > 0 {
         let mut text = format!(
             "Native restore pending ({})",
             snapshot.pending_native_restores
         );
-        if let Some(error) = &snapshot.native_automation_error {
+        if let Some(error) = error {
             text.push_str(": ");
             text.push_str(error);
         }
         return Some(text);
     }
-    snapshot
-        .native_automation_error
-        .as_ref()
-        .map(|error| format!("Native settings not applied: {error}"))
+    error.map(|error| format!("Native settings not applied: {error}"))
 }
 
 /// A value with a minus and a plus button either side.

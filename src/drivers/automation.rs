@@ -328,12 +328,22 @@ impl<F: FnMut(&serde_json::Value) -> Result<Option<Vec<u8>>>> AutomationIo for H
     }
 }
 
+/// What a brand without native automation reports. It is not a failure: Bridge
+/// has no driver that can apply that mouse's settings, so the panel does not
+/// show it.
+const NO_DRIVER: &str = "unsupported acknowledged native automation readback";
+
+pub(crate) fn is_no_driver(message: &str) -> bool {
+    // Errors are prefixed with the device id by the time they get here.
+    message.contains(NO_DRIVER)
+}
+
 fn supported_brand(device_id: &str) -> Result<&str> {
     let (brand, name) = device_id
         .split_once(':')
         .ok_or_else(|| anyhow::anyhow!("unsupported native profile device identity"))?;
     if !brand.eq_ignore_ascii_case("Zaunkoenig") || name.is_empty() || device_id.len() > 512 {
-        anyhow::bail!("unsupported acknowledged native automation readback for {device_id}");
+        anyhow::bail!("{NO_DRIVER} for {device_id}");
     }
     Ok(brand)
 }

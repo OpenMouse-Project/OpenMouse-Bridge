@@ -19,6 +19,12 @@ use anyhow::Result;
 use crate::config::ApplicationProfile;
 
 pub(crate) mod automation;
+
+/// Whether a native automation error only means Bridge has no driver for the
+/// mouse, so it is not worth showing as a failure.
+pub fn is_no_driver_error(message: &str) -> bool {
+    automation::is_no_driver(message)
+}
 pub mod delux;
 mod lamzu;
 mod native_hid;
