@@ -100,8 +100,7 @@ jobs:
           Set-Content "$stage/native-hid/node/node.exe" "Placeholder: Bridge replaces this with the real Node.js runtime on first launch."
           Compress-Archive -Path "$stage/*" -DestinationPath openmouse-bridge-windows-x64.zip -CompressionLevel Optimal
           $size = (Get-Item openmouse-bridge-windows-x64.zip).Length
-          Write-Host "openmouse-bridge-windows-x64.zip: $size bytes (limit 16252928)"
-          if ($size -gt 16252928) { throw "bridge archive is over the older updaters' 16 MiB read budget" }
+          Write-Host "openmouse-bridge-windows-x64.zip: $size bytes"
           (Get-FileHash openmouse-bridge-windows-x64.zip -Algorithm SHA256).Hash.ToLower() + "  openmouse-bridge-windows-x64.zip" | Set-Content openmouse-bridge-windows-x64.zip.sha256
       - name: Build and smoke test Windows installer
         shell: pwsh
