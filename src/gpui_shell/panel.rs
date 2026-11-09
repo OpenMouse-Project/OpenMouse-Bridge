@@ -55,7 +55,7 @@ fn step_volume(current: u8, up: bool) -> u8 {
 /// How many remembered mice Home lists before summarising the rest.
 const HOME_DEVICE_ROWS: usize = 3;
 
-/// Installing the udev rule that lets Bridge open supported mice (Linux).
+/// Installing the udev rule that lets Bridge open plugged-in mice (Linux).
 enum UdevFix {
     Idle,
     /// `pkexec` is showing the password prompt; its result arrives here.
@@ -68,7 +68,7 @@ enum UdevFix {
     },
 }
 
-/// Whether Home needs the permissions card: supported mice are plugged in
+/// Whether Home needs the permissions card: mice are plugged in
 /// that Bridge may not open.
 fn hid_blocked(snapshot: Option<&BridgeSnapshot>) -> bool {
     snapshot.is_some_and(|snapshot| !snapshot.blocked_hid_devices.is_empty())
@@ -378,9 +378,9 @@ impl PanelView {
                     tracing::warn!(%error, "Could not install the udev rule");
                     UdevFix::Failed {
                         error,
-                        command: hid_access::save_rule_copy()
+                        command: hid_access::save_rule_files()
                             .ok()
-                            .map(|copy| hid_access::manual_command(&copy)),
+                            .map(|dir| hid_access::manual_command(&dir)),
                     }
                 }
             };

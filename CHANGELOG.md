@@ -23,7 +23,9 @@ update check shows), and refuses to release a version without one.
 - Linux: a tray icon on KDE Plasma and other desktops with StatusNotifierItem
   support, and the panel opens in the corner beside it.
 - Linux: when mice cannot be opened because a udev rule is missing, the panel
-  offers a Fix permissions button that installs it.
+  offers a Fix permissions button that installs it. The rule covers every USB
+  mouse and receiver, whatever the brand, and only the signed-in user gets
+  access.
 - Linux: the control panel reconnects faster to mice paired through a
   Logitech receiver.
 - macOS: Bridge no longer freezes the cursor while it talks to a mouse.
