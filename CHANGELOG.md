@@ -23,8 +23,8 @@ update check shows), and refuses to release a version without one.
 - What's new: the release notes are built into Bridge. After an update Home
   offers them once, the update card shows the incoming version's notes, and
   Bridge info lists every release.
-- Real installers: a per-user Windows installer, a signed and notarized macOS
-  app in a DMG, and an AppImage on Linux.
+- Real installers: a per-user Windows installer, a macOS app in a
+  DMG, and an AppImage on Linux.
 - Linux: a tray icon on KDE Plasma and other desktops with StatusNotifierItem
   support, and the panel opens in the corner beside it.
 - Linux: when mice cannot be opened because a udev rule is missing, the panel
