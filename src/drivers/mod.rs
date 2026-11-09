@@ -19,6 +19,12 @@ use anyhow::Result;
 use crate::config::ApplicationProfile;
 
 pub(crate) mod automation;
+
+/// A native automation error with the parts that only mean Bridge has no driver
+/// for a mouse removed, or `None` if that was all it said.
+pub fn without_no_driver_errors(message: &str) -> Option<String> {
+    automation::without_no_driver(message)
+}
 pub mod delux;
 mod lamzu;
 mod native_hid;
