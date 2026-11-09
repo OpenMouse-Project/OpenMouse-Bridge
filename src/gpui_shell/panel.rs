@@ -1587,6 +1587,7 @@ impl Render for PanelView {
         let desired = self.desired_height();
         if (window.viewport_size().height.as_f32() - desired).abs() > 1.0 {
             window.resize(size(px(WINDOW_WIDTH), px(desired)));
+            super::tray::keep_on_screen(window, desired);
         }
         let field = self.field.element(window, cx);
         let content = match self.view {
