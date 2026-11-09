@@ -156,6 +156,7 @@ pub(crate) enum BridgeCommand {
     /// Restart into the staged update.
     ApplyUpdate,
     AcknowledgeTrayHint,
+    AcknowledgeWhatsNew,
     ForgetBattery(String),
 }
 
@@ -165,6 +166,10 @@ enum Startup {
 }
 
 pub(crate) enum UpdateEvent {
+    /// The release notes of an update about to be staged, as `(version,
+    /// notes)`: an automatic install goes straight to `Downloading`, so the
+    /// panel would otherwise never see them. Changes no update state.
+    Notes(String, String),
     Checking,
     UpToDate,
     Available(UpdateInfo),
@@ -483,6 +488,11 @@ fn run_server(
                             tracing::error!(%error, "could not save Bridge settings");
                         }
                     }
+                    BridgeCommand::AcknowledgeWhatsNew => {
+                        if let Err(error) = command_service.acknowledge_whats_new().await {
+                            tracing::error!(%error, "could not save Bridge settings");
+                        }
+                    }
                 }
             }
         });
@@ -580,6 +590,7 @@ async fn finish_stub_install(events: SyncSender<UpdateEvent>) {
 /// Downloads and stages `update`; it applies when the user restarts into it.
 async fn install_update(update: UpdateInfo, events: &SyncSender<UpdateEvent>) {
     let version = update.version.clone();
+    let _ = events.try_send(UpdateEvent::Notes(version.clone(), update.notes.clone()));
     if updater::prepared_version().as_deref() != Some(version.as_str()) {
         let _ = events.try_send(UpdateEvent::Downloading(version.clone()));
     }
