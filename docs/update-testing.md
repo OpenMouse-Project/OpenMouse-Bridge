@@ -3,7 +3,9 @@
 Run this on each OS before tagging a release that changes the updater. It
 points Bridge at a fake `latest.json` served from your own machine, so it
 needs no real release. Linux (AppImage) was tested this way when the updater
-landed; the Windows installer and macOS bundle paths have not been run yet.
+landed. The macOS bundle path has been run too (an ad-hoc signed `.app`:
+update, relaunch and the bad-checksum refusal); a signed and notarized build
+has not. The Windows installer path has not been run yet.
 
 The fake release offers version `1.0.1`, which is newer than the build you
 run, using a copy of an asset you already have. Bridge only compares version
