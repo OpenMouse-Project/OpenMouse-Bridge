@@ -133,7 +133,7 @@ jobs:
   macos:
     name: macOS universal
     needs: preflight
-    runs-on: macos-14
+    runs-on: macos-15
     # Signing and notarization are automatic when these secrets exist;
     # without them the app is ad-hoc signed.
     env:
