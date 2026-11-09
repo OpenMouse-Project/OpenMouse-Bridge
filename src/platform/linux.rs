@@ -52,12 +52,35 @@ pub fn repair_autostart() -> Result<bool> {
     let Ok(current) = fs::read_to_string(&path) else {
         return Ok(false);
     };
-    let wanted = launch_entry()?;
+    let wanted = repair_entry(&current, &launch_entry()?);
     if current == wanted {
         return Ok(false);
     }
     fs::write(&path, wanted).with_context(|| format!("could not write {}", path.display()))?;
     Ok(true)
+}
+
+/// Preserve desktop startup preferences and custom keys; only refresh Exec.
+fn repair_entry(current: &str, launch: &str) -> String {
+    let exec = launch
+        .lines()
+        .find(|line| line.starts_with("Exec="))
+        .unwrap();
+    let mut desktop = false;
+    current
+        .split_inclusive('\n')
+        .map(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                desktop = trimmed == "[Desktop Entry]";
+            }
+            if desktop && line.starts_with("Exec=") {
+                format!("{exec}{}", if line.ends_with('\n') { "\n" } else { "" })
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect()
 }
 
 /// The login entry for the Bridge that is running.
@@ -129,6 +152,15 @@ mod tests {
             "{entry}"
         );
         assert!(desktop_entry("/opt/bad\nentry").is_err());
+    }
+
+    #[test]
+    fn repair_preserves_disabled_flags_and_custom_keys() {
+        let entry = "[Desktop Entry]\nExec=/old\nHidden=true\nX-GNOME-Autostart-enabled=false\nOnlyShowIn=KDE;\n";
+        assert_eq!(
+            repair_entry(entry, "[Desktop Entry]\nExec=/new\n"),
+            entry.replace("Exec=/old", "Exec=/new")
+        );
     }
 
     #[test]
