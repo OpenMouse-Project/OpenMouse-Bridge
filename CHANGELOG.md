@@ -28,4 +28,6 @@ update check shows), and refuses to release a version without one.
   access.
 - Linux: the control panel reconnects faster to mice paired through a
   Logitech receiver.
+- Linux: games running through Proton or Wine are recognised, so their game
+  profiles switch on.
 - macOS: Bridge no longer freezes the cursor while it talks to a mouse.
