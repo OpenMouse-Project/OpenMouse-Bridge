@@ -518,11 +518,23 @@ fn run_server(
         // about to apply a download this removes.
         tokio::task::spawn_blocking(updater::remove_stale_downloads);
         let _ = ready.send(Ok(Startup::Serving { show_panel }));
+        // Now that this is the one Bridge running: on Plasma Wayland, have
+        // KWin report the focused window (issue #59).
+        #[cfg(target_os = "linux")]
+        let focus = tokio::task::spawn_blocking(openmouse_bridge::kwin_focus::start)
+            .await
+            .ok()
+            .flatten();
         let outcome = axum::serve(listener, api::router(service, &origins))
             .with_graceful_shutdown(async {
                 let _ = shutdown.await;
             })
             .await;
+        // Unloads the KWin script.
+        #[cfg(target_os = "linux")]
+        if let Some(focus) = focus {
+            let _ = tokio::task::spawn_blocking(move || drop(focus)).await;
+        }
         snapshot_publisher.abort();
         update_timer.abort();
         command_handler.abort();

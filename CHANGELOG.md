@@ -33,6 +33,8 @@ update check shows), and refuses to release a version without one.
   access.
 - Linux: the control panel reconnects faster to mice paired through a
   Logitech receiver.
+- Linux: on KDE Plasma's Wayland session, Bridge sees which window has focus,
+  so focused-app profiles switch for native Wayland apps too.
 - Linux: games running through Proton or Wine are recognised, so their game
   profiles switch on.
 - macOS: Bridge no longer freezes the cursor while it talks to a mouse.

@@ -374,10 +374,16 @@ mod imp {
         None
     }
 
-    /// The PID owning the active X11 window, via `_NET_ACTIVE_WINDOW` and
-    /// `_NET_WM_PID`. `None` without an X connection (e.g. on Wayland) or
-    /// when the window manager reports no active window.
+    /// The PID owning the focused window. On Plasma Wayland KWin reports it
+    /// (`kwin_focus`), which covers native Wayland windows too; otherwise the
+    /// active X11 window, via `_NET_ACTIVE_WINDOW` and `_NET_WM_PID`, which
+    /// is `None` without an X connection or an active window.
     fn active_window_pid() -> Option<u32> {
+        // XWayland only knows X11 windows, so while KWin reports, it alone
+        // decides: X11 would still name the last X11 window to have focus.
+        if let Some(pid) = crate::kwin_focus::focused_pid() {
+            return pid;
+        }
         let (conn, screen) = x11rb::connect(None).ok()?;
         let root = conn.setup().roots[screen].root;
         let active_window = intern(&conn, b"_NET_ACTIVE_WINDOW")?;

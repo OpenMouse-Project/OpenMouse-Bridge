@@ -188,7 +188,7 @@ check_optionals() {
         warn "no DISPLAY or WAYLAND_DISPLAY: Bridge installs fine, but the tray panel needs a desktop session"
     fi
     if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -z "${DISPLAY:-}" ]; then
-        warn "Wayland-only session: foreground-app detection and the overlay banner need X11 (banner falls back to a system notification)"
+        warn "Wayland-only session: the overlay banner needs X11 (it falls back to a system notification), and foreground-app detection needs X11 or KDE Plasma 6"
     fi
 }
 
