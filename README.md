@@ -104,6 +104,8 @@ On Linux, install the system libraries for the window first (Ubuntu 22.04 or
 sudo apt-get update && sudo apt-get install -y build-essential clang cmake pkg-config libudev-dev libssl-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libvulkan-dev libgl1-mesa-dev libfontconfig-dev libfreetype-dev libasound2-dev
 ```
 
+NixOS users can build and run Bridge with `nix run` from this checkout (or `nix run github:OpenMouse-Project/openmouse-bridge` after this support is merged). The flake builds against NixOS libraries and exposes the system Vulkan ICD. HID access still needs a udev rule; see the installer help and configure the rule declaratively in NixOS.
+
 Linux notes: the tray uses StatusNotifierItem/DBusMenu on the session bus
 (KDE Plasma and other compatible hosts; GNOME needs an AppIndicator/SNI
 extension). It shows the battery glyph, charge colour and the same battery
