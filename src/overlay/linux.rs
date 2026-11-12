@@ -8,8 +8,10 @@
 //! shared CPU renderer, so the window just blits them with `PutImage` and
 //! fades by scaling the alpha channel and re-blitting.
 //!
-//! Wayland has no X connection, so `Window::new` fails there and notices
-//! fall back to system notifications (see `TrayApp::present`).
+//! Wayland sessions never get this window: XWayland would provide an X
+//! display, but its root spans every output, so the banner would be centred
+//! on the seam between monitors. `Window::new` refuses there and notices fall
+//! back to system notifications (see `TrayApp::present`).
 
 use anyhow::{Context, Result, ensure};
 
@@ -26,6 +28,22 @@ use super::render::Banner;
 
 /// Distance from the top of the screen, in pixels.
 const TOP_MARGIN: i16 = 24;
+
+/// Whether the session is Wayland, judged by the session type or, when that
+/// is unset, by a Wayland display being present.
+fn is_wayland_session() -> bool {
+    wayland_session(
+        std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
+        std::env::var_os("WAYLAND_DISPLAY").is_some(),
+    )
+}
+
+fn wayland_session(session_type: Option<&str>, wayland_display: bool) -> bool {
+    match session_type {
+        Some(kind) if !kind.is_empty() => kind.eq_ignore_ascii_case("wayland"),
+        _ => wayland_display,
+    }
+}
 
 /// A banner blitted into an X pixmap and copied to the window, ready to be
 /// shown. The pixmap is recreated only when the banner size changes, so
@@ -48,6 +66,10 @@ pub struct Window {
 
 impl Window {
     pub fn new() -> Result<Self> {
+        ensure!(
+            !is_wayland_session(),
+            "Wayland session: using system notifications, XWayland's root spans every output"
+        );
         let (conn, screen) = x11rb::connect(None).context("could not open the X display")?;
         let (root, depth) = {
             let setup = conn.setup();
@@ -489,5 +511,18 @@ mod tests {
             return;
         }
         assert!(Window::new().is_err());
+    }
+
+    #[test]
+    fn session_type_decides_when_set() {
+        assert!(wayland_session(Some("wayland"), false));
+        assert!(!wayland_session(Some("x11"), true));
+    }
+
+    #[test]
+    fn falls_back_to_the_wayland_display() {
+        assert!(wayland_session(None, true));
+        assert!(wayland_session(Some(""), true));
+        assert!(!wayland_session(None, false));
     }
 }
