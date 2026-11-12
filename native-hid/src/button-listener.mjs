@@ -59,7 +59,7 @@ async function findClient(entry, wantedName) {
   const others = [];
   const closeOthers = () => Promise.all(others.map((other) => other.client.close().catch(() => undefined)));
   for (const vendorId of entry.vendorIds) {
-    for (const device of candidateDevices(vendorId)) {
+    for (const device of candidateDevices(vendorId, entry)) {
       for (const candidate of entry.classes) {
         try {
           const found = await probe(device, candidate);

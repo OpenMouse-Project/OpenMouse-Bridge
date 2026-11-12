@@ -119,7 +119,7 @@ async function main() {
   let client = null;
   let status = null;
   outer: for (const vendorId of entry.vendorIds) {
-    for (const device of candidateDevices(vendorId)) {
+    for (const device of candidateDevices(vendorId, entry)) {
       for (const candidate of entry.classes) {
         try {
           ({ client, status } = await probe(device, candidate));
