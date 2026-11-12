@@ -40,18 +40,41 @@ KERNEL=="uinput", MODE="0660", TAG+="uaccess", OPTIONS+="static_node=uinput"
 const SEAT_ACCESS: &str = r#"TAG+="uaccess""#;
 
 /// Without logind nothing turns `uaccess` into an ACL (OpenRC without
-/// elogind, for one), so the nodes are opened up instead, as the rule did
-/// before it had the seat-only form.
-const OPEN_ACCESS: &str = r#"MODE="0666""#;
-
-/// The rule for this system: seat-only access where logind runs, which
-/// `/run/systemd/seats` shows while it does.
-pub fn rule() -> String {
-    rule_for(std::path::Path::new("/run/systemd/seats").is_dir())
+/// elogind, for one), so the nodes go to the account that installed the rule
+/// (by uid, which udev and eudev both take for `OWNER`). Never `MODE="0666"`:
+/// that would hand a combo receiver's keyboard to every local account.
+fn owner_access(uid: u32) -> String {
+    format!(r#"OWNER="{uid}", MODE="0600""#)
 }
 
-fn rule_for(seat_acl: bool) -> String {
-    RULE_TEMPLATE.replace("@ACCESS@", if seat_acl { SEAT_ACCESS } else { OPEN_ACCESS })
+/// The rule for this system: seat-only access where logind runs, which
+/// `/run/systemd/seats` shows while it does, and otherwise access for this
+/// account only.
+pub fn rule() -> String {
+    rule_for(
+        std::path::Path::new("/run/systemd/seats").is_dir(),
+        current_uid(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn current_uid() -> u32 {
+    // SAFETY: getuid has no preconditions and cannot fail.
+    unsafe { libc::getuid() }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn current_uid() -> u32 {
+    0
+}
+
+fn rule_for(seat_acl: bool, uid: u32) -> String {
+    let access = if seat_acl {
+        SEAT_ACCESS.to_owned()
+    } else {
+        owner_access(uid)
+    };
+    RULE_TEMPLATE.replace("@ACCESS@", &access)
 }
 
 /// The rule's helper: exits 0 when the hidraw node at sysfs path `$1` belongs
@@ -442,18 +465,20 @@ mod tests {
     }
 
     #[test]
-    fn the_rule_grants_the_seat_with_logind_and_opens_the_node_without() {
-        let seat = rule_for(true);
+    fn the_rule_grants_the_seat_with_logind_and_the_owner_without() {
+        let seat = rule_for(true, 1000);
         let line = hidraw_line(&seat);
         assert!(line.contains(&format!("PROGRAM=\"/bin/sh {HELPER_PATH} %S%p\"")));
         assert!(line.contains(r#"TAG+="uaccess""#), "{line}");
         assert!(!seat.contains("0666"));
+        assert!(!seat.contains("OWNER"));
 
-        let open = rule_for(false);
+        let open = rule_for(false, 1000);
         let line = hidraw_line(&open);
         assert!(line.contains(&format!("PROGRAM=\"/bin/sh {HELPER_PATH} %S%p\"")));
-        assert!(line.contains(r#"MODE="0666""#), "{line}");
+        assert!(line.contains(r#"OWNER="1000", MODE="0600""#), "{line}");
         assert!(!line.contains("uaccess"));
+        assert!(!open.contains("0666"), "no node is opened to every account");
 
         for rule in [&seat, &open] {
             assert!(!rule.contains("@ACCESS@"));
