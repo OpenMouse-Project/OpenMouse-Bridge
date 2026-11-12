@@ -2,7 +2,9 @@ name: Bridge CI
 
 on:
   push:
-    branches: [dev]
+    # main as well as dev: the build cache is only shared with pull requests
+    # when it was saved from the default branch.
+    branches: [main, dev]
   pull_request:
   workflow_dispatch:
 
@@ -14,25 +16,25 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
+  # No incremental artefacts or debug info: CI builds once from a cold cache, so
+  # they only cost compile time and cache size.
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
   # Keep in sync with release.yml's NATIVE_HID_NODE_VERSION.
   NATIVE_HID_NODE_VERSION: v24.18.1
 
 jobs:
-  check:
-    name: Check (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    # Builds and tests run dependency code with read-only repository access.
+  # A pull request that only touches the native-hid pins does not need the Rust
+  # builds, so the heavy jobs skip it.
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: read
+    outputs:
+      protocol_only: ${{ steps.changes.outputs.result }}
     steps:
-      - uses: actions/checkout@v5
-        with:
-          persist-credentials: false
       - uses: actions/github-script@v7
         id: changes
         with:
@@ -49,24 +51,89 @@ jobs:
               'native-hid/package-lock.json',
             ]);
             return files.length > 0 && files.every(file => protocolFiles.has(file.filename));
+
+  test:
+    name: Test (${{ matrix.os }})
+    needs: changes
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    # Builds and tests run dependency code with read-only repository access.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - name: Install Linux HID and GUI dependencies
-        if: runner.os == 'Linux' && steps.changes.outputs.result != 'true'
+        if: runner.os == 'Linux' && needs.changes.outputs.protocol_only != 'true'
         run: sudo apt-get update && sudo apt-get install -y build-essential clang cmake pkg-config libudev-dev libssl-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libvulkan-dev libgl1-mesa-dev libfontconfig-dev libfreetype-dev libasound2-dev
       - uses: dtolnay/rust-toolchain@stable
-        if: steps.changes.outputs.result != 'true'
+        if: needs.changes.outputs.protocol_only != 'true'
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-        if: steps.changes.outputs.result != 'true'
-      - name: Check formatting
-        if: runner.os == 'Linux' && steps.changes.outputs.result != 'true'
-        run: cargo fmt --check
+        if: needs.changes.outputs.protocol_only != 'true'
+        with:
+          # Pull requests read main's cache but never write their own: each copy is
+          # ~1 GB per OS, and they pushed the repo past its 10 GB cache limit.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Test
-        if: steps.changes.outputs.result != 'true'
+        if: needs.changes.outputs.protocol_only != 'true'
         run: cargo test --locked
+
+  clippy:
+    name: Clippy (${{ matrix.os }})
+    needs: changes
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    # Builds and tests run dependency code with read-only repository access.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Install Linux HID and GUI dependencies
+        if: runner.os == 'Linux' && needs.changes.outputs.protocol_only != 'true'
+        run: sudo apt-get update && sudo apt-get install -y build-essential clang cmake pkg-config libudev-dev libssl-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libvulkan-dev libgl1-mesa-dev libfontconfig-dev libfreetype-dev libasound2-dev
+      - uses: dtolnay/rust-toolchain@stable
+        if: needs.changes.outputs.protocol_only != 'true'
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        if: needs.changes.outputs.protocol_only != 'true'
+        with:
+          # Pull requests read main's cache but never write their own: each copy is
+          # ~1 GB per OS, and they pushed the repo past its 10 GB cache limit.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Check formatting
+        if: runner.os == 'Linux' && needs.changes.outputs.protocol_only != 'true'
+        run: cargo fmt --check
       - name: Clippy
-        if: steps.changes.outputs.result != 'true'
+        if: needs.changes.outputs.protocol_only != 'true'
         run: cargo clippy --locked --all-targets -- -D warnings
+
+  helper:
+    name: Helper and scripts (${{ matrix.os }})
+    needs: changes
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    # Builds and tests run dependency code with read-only repository access.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v5
         with:
           node-version: 24
@@ -83,12 +150,30 @@ jobs:
       - name: Test native HID helper
         run: npm test --prefix native-hid
       - name: Test release scripts
-        if: runner.os == 'Linux' && steps.changes.outputs.result != 'true'
+        if: runner.os == 'Linux' && needs.changes.outputs.protocol_only != 'true'
         run: node --test ".github/scripts/*.test.mjs"
       - name: Test installer script
-        if: runner.os == 'Linux' && steps.changes.outputs.result != 'true'
+        if: runner.os == 'Linux' && needs.changes.outputs.protocol_only != 'true'
         run: |
           bash -n install-linux.sh
           bash tests/linux_startup.sh "${{ runner.temp }}"
           bash install-linux.sh --help
           bash -c 'export HOME=/root OPENMOUSE_INSTALL_SOURCED=1; source ./install-linux.sh; D=$(mktemp -d); write_udev_rule "$D/rule"; write_udev_helper "$D/helper"; grep -q "PROGRAM=\"/bin/sh $UDEV_HELPER %S%p\"" "$D/rule"; sh -n "$D/helper"; write_autostart "$D/a.desktop" "/opt/x/b"; grep -q "Exec=\"/opt/x/b\"" "$D/a.desktop"; write_launcher "$D/l.desktop" "/opt/x/b" "/opt/x/i.png"; grep -q "^Name=OpenMouse Bridge$" "$D/l.desktop"; grep -q "^Terminal=false$" "$D/l.desktop"; for pm in apt dnf pacman zypper apk; do pm_packages "$pm" | grep -q curl || exit 1; done; rm -rf "$D"'
+
+  # The required status checks are named "Check (<os>)". They gate on the jobs
+  # above, which run side by side instead of one after another.
+  check:
+    name: Check (${{ matrix.os }})
+    needs: [changes, test, clippy, helper]
+    if: always()
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every job to pass
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "$RESULTS"
+          case " $RESULTS " in *" failure "*|*" cancelled "*) exit 1;; esac

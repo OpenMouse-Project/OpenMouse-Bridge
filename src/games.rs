@@ -350,8 +350,10 @@ mod tests {
     }
 
     /// A process laid out like a Proton game: the kernel runs a file named
-    /// `wine64-preloader` (a copy of `sleep` here), and the first argument is
-    /// the Windows program.
+    /// `wine64-preloader` (a copy of `sh` here), and the first argument is the
+    /// Windows program. `sh` rather than `sleep`: from Ubuntu 26.04 `sleep` is
+    /// part of a multi-call coreutils that picks its tool from argv[0], so a
+    /// renamed copy exits at once and there is no process left to detect.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_proton_game_is_detected_by_its_windows_program() {
@@ -360,10 +362,12 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("openmouse-wine-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let loader = directory.join("wine64-preloader");
-        std::fs::copy("/bin/sleep", &loader).unwrap();
+        std::fs::copy("/bin/sh", &loader).unwrap();
         let mut child = std::process::Command::new(&loader)
             .arg0(r"Z:\home\me\Steam\steamapps\common\Overwatch\Overwatch.exe")
-            .arg("30")
+            // The trailing `:` keeps the shell from exec-ing `sleep`, which
+            // would replace the process this test is about.
+            .args(["-c", "sleep 30; :"])
             .spawn()
             .unwrap();
 
