@@ -25,6 +25,10 @@ const READ_TIMEOUT_MS: i32 = 100;
 const SHARED_READ_IDLE: std::time::Duration = std::time::Duration::from_millis(2);
 const MICROSOFT_VENDOR_ID: u16 = 0x045E;
 const RAZER_VENDOR_ID: u16 = 0x1532;
+/// FIDO Alliance usage page: security keys (U2F/CTAP). Never offered over the
+/// WebSocket, like the browser's own WebHID blocklist, so a page cannot talk
+/// to a security key through Bridge.
+const FIDO_USAGE_PAGE: u16 = 0xF1D0;
 const RAZER_FEATURE_BUFFER_LEN: usize = 91;
 const RESUME_WATCH_STEP: Duration = Duration::from_secs(2);
 /// A step that overshoots by this much means the machine was suspended.
@@ -578,8 +582,12 @@ impl HidSession {
 
         // Ordered, so devices are keyed and listed the same way every time.
         let mut by_device = std::collections::BTreeMap::<Vec<u8>, Vec<hidapi::DeviceInfo>>::new();
+        let blocked = security_key_paths(&self.api);
         for info in self.api.device_list() {
-            if vendors.contains(&info.vendor_id()) && !is_receiver_child(info.path()) {
+            if vendors.contains(&info.vendor_id())
+                && !blocked.contains(info.path())
+                && !is_receiver_child(info.path())
+            {
                 by_device
                     .entry(device_group_key(info))
                     .or_default()
@@ -792,10 +800,11 @@ impl HidSession {
             .find(|(_, device_key)| device_key.as_str() == key)
             .map(|(identity, _)| identity.clone())
             .ok_or_else(|| "the selected HID interface is no longer available".to_owned())?;
+        let blocked = security_key_paths(&self.api);
         let infos = self
             .api
             .device_list()
-            .filter(|info| device_group_key(info) == identity)
+            .filter(|info| device_group_key(info) == identity && !blocked.contains(info.path()))
             .cloned()
             .collect::<Vec<_>>();
         if infos.is_empty() {
@@ -1308,6 +1317,24 @@ fn stable_device_key(identity: &[u8]) -> String {
     )
 }
 
+/// The paths that carry a FIDO collection. A path is blocked whole, since one
+/// hidraw node can hold a security key's collection beside others.
+fn security_key_paths(api: &HidApi) -> HashSet<std::ffi::CString> {
+    security_key_paths_in(
+        api.device_list()
+            .map(|info| (info.path(), info.usage_page())),
+    )
+}
+
+fn security_key_paths_in<'a>(
+    interfaces: impl Iterator<Item = (&'a std::ffi::CStr, u16)>,
+) -> HashSet<std::ffi::CString> {
+    interfaces
+        .filter(|(_, usage_page)| *usage_page == FIDO_USAGE_PAGE)
+        .map(|(path, _)| path.to_owned())
+        .collect()
+}
+
 fn device_group_key(info: &hidapi::DeviceInfo) -> Vec<u8> {
     grouped_device_key(
         info.vendor_id(),
@@ -1425,6 +1452,11 @@ struct CollectionNode {
     parent: Option<usize>,
 }
 
+/// Deepest collection nesting accepted. Real devices nest a handful deep; a
+/// descriptor from a hostile device could otherwise nest ~1,400 deep and
+/// drive the recursive tree building and serialization.
+const MAX_COLLECTION_DEPTH: usize = 64;
+
 fn parse_report_descriptor(bytes: &[u8]) -> Result<(Vec<CollectionInfo>, ReportLayout), String> {
     let mut globals = GlobalState::default();
     let mut global_stack = Vec::new();
@@ -1483,6 +1515,9 @@ fn parse_report_descriptor(bytes: &[u8]) -> Result<(Vec<CollectionInfo>, ReportL
                 (u32::from(globals.usage_page) << 16) | (value & 0xffff)
             }),
             (0, 10) => {
+                if collections.len() >= MAX_COLLECTION_DEPTH {
+                    return Err("HID descriptor nests collections too deep".into());
+                }
                 let usage = usages.first().copied().unwrap_or(0);
                 let index = nodes.len();
                 let parent = collections.last().copied();
@@ -2147,5 +2182,35 @@ mod tests {
             collections[0].children[0].input_reports[0].items[0].report_size,
             1
         );
+    }
+
+    #[test]
+    fn descriptor_nesting_is_capped() {
+        let nested = |depth: usize| {
+            let mut descriptor = vec![0x06, 0x00, 0xff, 0x09, 0x01];
+            descriptor.extend(std::iter::repeat_n([0xa1, 0x02], depth).flatten());
+            descriptor.extend(std::iter::repeat_n(0xc0, depth));
+            descriptor
+        };
+        assert!(parse_report_descriptor(&nested(MAX_COLLECTION_DEPTH)).is_ok());
+        assert!(parse_report_descriptor(&nested(MAX_COLLECTION_DEPTH + 1)).is_err());
+        assert!(parse_report_descriptor(&nested(1_400)).is_err());
+    }
+
+    #[test]
+    fn a_path_with_a_security_key_collection_is_blocked_whole() {
+        let key = c"/dev/hidraw3";
+        let mouse = c"/dev/hidraw1";
+        let blocked = security_key_paths_in(
+            [
+                (mouse, 0x0001),
+                (mouse, 0xff00),
+                (key, 0x0001),
+                (key, FIDO_USAGE_PAGE),
+            ]
+            .into_iter(),
+        );
+        assert!(blocked.contains(key));
+        assert!(!blocked.contains(mouse));
     }
 }
