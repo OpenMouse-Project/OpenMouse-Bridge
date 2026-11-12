@@ -222,9 +222,18 @@ jobs:
           chmod +x "$appdir/AppRun"
           appstreamcli validate --no-net "$appdir/usr/share/metainfo/io.openmouse.bridge.appdata.xml"
       - name: Build the AppImage
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --retry-max-time 120 -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          # Pinned and checksummed; fetched with the workflow token (not anonymously),
+          # retrying because the release CDN has been returning 504s.
+          for attempt in 1 2 3 4 5 6; do
+            gh release download 1.9.1 --repo AppImage/appimagetool --pattern appimagetool-x86_64.AppImage --output appimagetool --clobber && break
+            [ "$attempt" -lt 6 ] || { echo "appimagetool download failed" >&2; exit 1; }
+            sleep $((attempt * 10))
+          done
+          echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool" | sha256sum -c -
           chmod +x appimagetool
           # Runners have no FUSE, so the tool unpacks itself and runs from there.
           ARCH=x86_64 ./appimagetool --appimage-extract-and-run AppDir OpenMouse-Bridge-linux-x86_64.AppImage

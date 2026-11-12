@@ -19,10 +19,6 @@ binary="$1"
 output="$2"
 shift 2
 
-# The old reader's budget is 16 MiB (16777216 bytes) and it reads the entire
-# archive, so stay clear of it.
-limit=16252928
-
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
 
@@ -50,8 +46,6 @@ rm -f "$output"
 (cd "$stage" && zip -r -X -q -9 "$output" .)
 
 size="$(wc -c < "$output" | tr -d ' ')"
-echo "$output: $size bytes (limit $limit)"
-if [ "$size" -gt "$limit" ]; then
-  echo "bridge archive is over the older updaters' 16 MiB read budget" >&2
-  exit 1
-fi
+# No size cap: Bridge 1.0.0 is a fresh release that nothing older updates from,
+# so the 16 MiB read budget of beta.19/.20 no longer constrains this archive.
+echo "$output: $size bytes"
