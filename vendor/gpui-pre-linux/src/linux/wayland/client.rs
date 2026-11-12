@@ -798,10 +798,21 @@ impl WaylandClientStatePtr {
         let client = self.get_client();
         let mut state = client.borrow_mut();
         let closed_window = state.windows.remove(surface_id).unwrap();
-        if let Some(window) = state.mouse_focused_window.take()
-            && !window.ptr_eq(&closed_window)
-        {
-            state.mouse_focused_window = Some(window);
+        match state.mouse_focused_window.take() {
+            Some(window) if !window.ptr_eq(&closed_window) => {
+                state.mouse_focused_window = Some(window);
+            }
+            // The compositor sends no Leave for a surface the client destroys,
+            // so the pointer position (and button) would stay on the closed
+            // window. The next window would start with that position and draw
+            // whatever sat under it as hovered: closing the tray panel with its
+            // close button left that button highlighted on the next open.
+            // (OpenMouse Bridge patch.)
+            Some(_) => {
+                state.mouse_location = None;
+                state.button_pressed = None;
+            }
+            None => {}
         }
         if let Some(window) = state.keyboard_focused_window.take()
             && !window.ptr_eq(&closed_window)
