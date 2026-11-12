@@ -153,6 +153,7 @@ pub fn run() -> Result<()> {
             // environment.
             let show_panel =
                 show_panel || std::env::var_os("OPENMOUSE_BRIDGE_SHOW_WINDOW").is_some();
+            hide_when_unfocused(cx, handle, &view);
             let (tray_commands, mut tray_handle) = match tray::install(cx, handle) {
                 Some((commands, tray)) => (Some(commands), Some(tray)),
                 None => (None, None),
@@ -376,6 +377,22 @@ fn panel_wanted_after(shown: bool, api_request: bool, commands: &[tray::Command]
     wanted
 }
 
+/// Hides the panel to the tray when a click elsewhere takes its focus, where it
+/// is a popup by the tray (see [`tray::hides_on_blur`]).
+fn hide_when_unfocused(cx: &mut App, handle: AnyWindowHandle, view: &Entity<PanelView>) {
+    let _ = cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |_, cx| {
+            cx.observe_window_activation(window, |_, window, _| {
+                if !window.is_window_active() && tray::hides_on_blur() {
+                    tracing::debug!("hiding the panel after it lost focus");
+                    tray::hide_on_blur(window);
+                }
+            })
+            .detach();
+        });
+    });
+}
+
 /// Makes the window's close button hide the panel to the tray, or quit when
 /// there is no tray to bring it back from.
 #[cfg(target_os = "linux")]
@@ -431,8 +448,9 @@ fn open_layer_panel(
     };
     let view = view.clone();
     match open_window(options, cx, move |_, _| view) {
-        Ok((handle, _)) => {
+        Ok((handle, view)) => {
             close_hides_or_quits(cx, handle, exit);
+            hide_when_unfocused(cx, handle, &view);
             Some(handle)
         }
         Err(error) => {

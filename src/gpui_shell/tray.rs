@@ -4,9 +4,13 @@
 //!
 //! Linux uses StatusNotifierItem over D-Bus, without a GTK event loop.
 
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    mpsc,
+use std::{
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    time::{Duration, Instant},
 };
 
 #[cfg(any(target_os = "macos", windows))]
@@ -572,6 +576,48 @@ pub fn can_hide() -> bool {
     cfg!(any(target_os = "macos", windows))
 }
 
+/// When the panel last hid itself because it lost focus.
+static HIDDEN_ON_BLUR_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// How soon after the panel hides on losing focus a click on the icon counts
+/// as the click that took the focus: pressing the icon takes focus from the
+/// panel before the click arrives, and that click should leave it closed.
+const BLUR_CLICK_WINDOW: Duration = Duration::from_millis(500);
+
+/// Whether the panel hides when it loses focus, like a popup: where it sits by
+/// the tray and the icon brings it back. Not for a normal Linux window (no
+/// layer-shell), which has a taskbar entry and stays where it was put.
+pub fn hides_on_blur() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        layer_panel() && can_hide()
+    }
+    #[cfg(not(target_os = "linux"))]
+    can_hide()
+}
+
+/// Hides the panel because a click elsewhere took its focus.
+pub fn hide_on_blur(window: &mut Window) {
+    if !shown() {
+        return;
+    }
+    hide(window);
+    if let Ok(mut at) = HIDDEN_ON_BLUR_AT.lock() {
+        *at = Some(Instant::now());
+    }
+}
+
+/// What a click on the icon sends: a toggle, or nothing when the panel has
+/// just hidden because pressing the icon took its focus.
+pub fn click_command(anchor: Option<Anchor>) -> Option<Command> {
+    let just_hidden = HIDDEN_ON_BLUR_AT
+        .lock()
+        .ok()
+        .and_then(|mut at| at.take())
+        .is_some_and(|at| at.elapsed() < BLUR_CLICK_WINDOW);
+    (!just_hidden).then_some(Command::Toggle(anchor))
+}
+
 pub fn hide(window: &mut Window) {
     platform::hide_window(window);
     #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
@@ -721,11 +767,14 @@ pub fn install(
                 _ => return,
             };
             let anchor = Some(anchor);
-            let _ = sender.send(if double_click {
-                Command::Show(anchor)
+            let command = if double_click {
+                Some(Command::Show(anchor))
             } else {
-                Command::Toggle(anchor)
-            });
+                click_command(anchor)
+            };
+            if let Some(command) = command {
+                let _ = sender.send(command);
+            }
         }
     }));
 

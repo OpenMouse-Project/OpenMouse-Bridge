@@ -290,7 +290,9 @@ impl Tray for LinuxTray {
             right: f64::from(x),
             bottom: f64::from(y),
         });
-        let _ = self.sender.send(Command::Toggle(anchor));
+        if let Some(command) = super::click_command(anchor) {
+            let _ = self.sender.send(command);
+        }
     }
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         use ksni::menu::StandardItem;
