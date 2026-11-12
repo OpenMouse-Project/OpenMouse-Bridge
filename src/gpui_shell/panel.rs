@@ -945,6 +945,9 @@ impl PanelView {
                     .flex()
                     .flex_row()
                     .justify_between()
+                    // The forget button makes the reading taller than the name;
+                    // centre both so they share a line.
+                    .items_center()
                     .gap_3()
                     .text_sm()
                     .child(
