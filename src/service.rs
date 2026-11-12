@@ -121,6 +121,14 @@ const BATTERY_STALE_AFTER: Duration = Duration::from_secs(12 * 60);
 /// dropped from the list instead of lingering as a ghost device.
 const BATTERY_EVICT_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Battery readings held at once. Far above any real desk of mice; the oldest
+/// goes when a new device would pass it, so `PUT /v1/battery` with made-up
+/// ids cannot grow memory without bound.
+const MAX_BATTERY_ENTRIES: usize = 64;
+
+/// The longest device id, name or switch mode a control panel may report.
+const MAX_BATTERY_TEXT_BYTES: usize = 256;
+
 /// How many samples of each device's percent history are kept for the tray
 /// tooltip's time-remaining estimate.
 const BATTERY_HISTORY_SAMPLES: usize = 48;
@@ -1385,6 +1393,20 @@ impl BridgeService {
     /// Records a battery a control panel reported (`PUT /v1/battery`), linked
     /// to the receiver the panel has open when that is a single device.
     pub async fn record_panel_battery(&self, mut reading: BatteryReading) -> Result<bool> {
+        // A client names the device: keep what it can make Bridge hold small.
+        if reading.device_id.trim().is_empty()
+            || reading.device_id.len() > MAX_BATTERY_TEXT_BYTES
+            || reading.device_name.len() > MAX_BATTERY_TEXT_BYTES
+            || reading
+                .switch_mode
+                .as_ref()
+                .is_some_and(|mode| mode.len() > MAX_BATTERY_TEXT_BYTES)
+        {
+            return Err(crate::local_targets::InvalidInput(format!(
+                "deviceId must be set, and deviceId, deviceName and switchMode at most {MAX_BATTERY_TEXT_BYTES} bytes"
+            ))
+            .into());
+        }
         let open: Vec<(u16, u16)> = crate::hid::active_devices()
             .iter()
             .map(|device| (device.vendor_id, device.product_id))
@@ -1426,6 +1448,19 @@ impl BridgeService {
             let (previous_dpi, previous_rate, previous_mode) = previous
                 .map(|entry| (entry.dpi, entry.polling_rate_hz, entry.switch_mode.clone()))
                 .unwrap_or((None, None, None));
+            if !state.battery.contains_key(&reading.device_id) {
+                while state.battery.len() >= MAX_BATTERY_ENTRIES {
+                    let Some(oldest) = state
+                        .battery
+                        .iter()
+                        .min_by_key(|(_, entry)| entry.updated_at)
+                        .map(|(id, _)| id.clone())
+                    else {
+                        break;
+                    };
+                    state.battery.remove(&oldest);
+                }
+            }
             state.battery.insert(
                 reading.device_id.clone(),
                 BatteryState {
@@ -3079,6 +3114,42 @@ mod tests {
         assert_eq!(snapshot.known_devices[0].name, "G Pro");
         assert_eq!(snapshot.known_devices[0].percent, Some(72));
         assert_eq!(snapshot.known_devices[0].dpi, Some(1600));
+    }
+
+    #[tokio::test]
+    async fn made_up_battery_devices_cannot_grow_memory_without_bound() {
+        let bridge = BridgeService::new(BridgeConfig::default(), temp_config_path());
+        let long = "x".repeat(MAX_BATTERY_TEXT_BYTES + 1);
+        let error = bridge
+            .record_panel_battery(reading(&long, "Mouse", 50))
+            .await
+            .expect_err("an oversized id is refused");
+        assert!(
+            error
+                .downcast_ref::<crate::local_targets::InvalidInput>()
+                .is_some()
+        );
+        assert!(
+            bridge
+                .record_panel_battery(reading("", "Mouse", 50))
+                .await
+                .is_err()
+        );
+
+        for index in 0..MAX_BATTERY_ENTRIES + 10 {
+            bridge
+                .record_battery(reading(&format!("Fake:{index}"), "Mouse", 50))
+                .await
+                .unwrap();
+        }
+        let state = bridge.inner.read().await;
+        assert_eq!(state.battery.len(), MAX_BATTERY_ENTRIES);
+        assert!(
+            state
+                .battery
+                .contains_key(&format!("Fake:{}", MAX_BATTERY_ENTRIES + 9)),
+            "the newest reading is kept"
+        );
     }
 
     #[tokio::test]
