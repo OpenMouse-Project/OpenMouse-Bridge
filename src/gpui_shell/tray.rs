@@ -1,5 +1,6 @@
 //! The tray icon for the GPUI shell: closing the panel hides it, a click on the
-//! icon brings it back, and the menu offers Open / Restart / Quit.
+//! icon brings it back (or hides it again), and the menu offers Open / Restart /
+//! Quit.
 //!
 //! Linux uses StatusNotifierItem over D-Bus, without a GTK event loop.
 
@@ -91,9 +92,12 @@ impl TrayHandle {
 
 #[derive(Debug)]
 pub enum Command {
-    /// Show the panel, beside the icon when the icon was clicked.
+    /// Show the panel, beside the icon when the icon was double-clicked.
     #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
     Show(Option<Anchor>),
+    /// A click on the icon: hide the panel when it is showing, otherwise show
+    /// it beside the icon.
+    Toggle(Option<Anchor>),
     // Only the Windows tray has a menu to send these from.
     #[cfg_attr(not(windows), allow(dead_code))]
     Restart,
@@ -426,6 +430,13 @@ mod platform {
 /// repaints it. Stays true where there is no tray to hide it to.
 static VISIBLE: AtomicBool = AtomicBool::new(true);
 
+/// Whether the panel was last shown rather than hidden through [`show`] and
+/// [`hide`], which is what a click on the icon toggles. Unlike [`is_visible`]
+/// this does not assume a Linux window is on screen.
+pub fn shown() -> bool {
+    VISIBLE.load(Ordering::Relaxed)
+}
+
 pub fn is_visible() -> bool {
     // Linux's taskbar can restore a minimized window without a tray command;
     // a closed layer-shell panel cannot be restored that way.
@@ -650,6 +661,12 @@ pub fn install(
             let _ = menu_sender.send(command);
         }));
     }
+    // A double-click arrives as an up, a double-click and a second up. The
+    // first up toggles and the double-click shows, so the second up is
+    // skipped: otherwise a double-click would open the panel and close it.
+    // Only an up soon after the double-click is skipped, in case a platform
+    // sends none.
+    let double_clicked_at = std::sync::Mutex::new(None::<std::time::Instant>);
     TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
         if matches!(
             event,
@@ -657,16 +674,20 @@ pub fn install(
         ) {
             tracing::debug!(?event, "tray icon event");
         }
-        // A left click, a double-click, and on macOS (no menu there) a right
-        // click all show the panel, beside the icon.
+        // A left click, and on macOS (no menu there) a right click, toggle the
+        // panel beside the icon; a double-click shows it.
+        let double_click = matches!(
+            event,
+            TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            }
+        );
         let clicked = matches!(
             event,
             TrayIconEvent::Click {
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Up,
-                ..
-            } | TrayIconEvent::DoubleClick {
-                button: MouseButton::Left,
                 ..
             }
         ) || (cfg!(target_os = "macos")
@@ -678,7 +699,18 @@ pub fn install(
                     ..
                 }
             ));
-        if clicked {
+        if let Ok(mut double_clicked_at) = double_clicked_at.lock() {
+            if double_click {
+                *double_clicked_at = Some(std::time::Instant::now());
+            } else if clicked
+                && double_clicked_at
+                    .take()
+                    .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(500))
+            {
+                return;
+            }
+        }
+        if clicked || double_click {
             #[cfg(target_os = "macos")]
             let anchor = platform::anchor_of_click();
             #[cfg(windows)]
@@ -688,7 +720,12 @@ pub fn install(
                 }
                 _ => return,
             };
-            let _ = sender.send(Command::Show(Some(anchor)));
+            let anchor = Some(anchor);
+            let _ = sender.send(if double_click {
+                Command::Show(anchor)
+            } else {
+                Command::Toggle(anchor)
+            });
         }
     }));
 
