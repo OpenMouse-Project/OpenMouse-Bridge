@@ -194,10 +194,18 @@ check_optionals() {
 
 # Writes the hidraw udev rule to $1. Where logind (or elogind) runs, which
 # /run/systemd/seats shows, only the user at the seat gets access; without it
-# nothing turns uaccess into an ACL, so the nodes are opened up instead.
+# nothing turns uaccess into an ACL, so the nodes go to the installing
+# account only (by uid; the same rule src/hid_access.rs writes). Never 0666:
+# that would hand a combo receiver's keyboard to every local account.
 write_udev_rule() {
-    local access='MODE="0666"'
-    [ -d /run/systemd/seats ] && access='TAG+="uaccess"'
+    local access owner_uid
+    if [ -d /run/systemd/seats ]; then
+        access='TAG+="uaccess"'
+    else
+        owner_uid="$(id -u "${SUDO_USER:-$(id -un)}")" || return 1
+        case "$owner_uid" in '' | *[!0-9]*) return 1 ;; esac
+        access="OWNER=\"$owner_uid\", MODE=\"0600\""
+    fi
     sed "s|@ACCESS@|$access|" >"$1" <<'OPENMOUSE_UDEV_RULE'
 # OpenMouse Bridge: let the signed-in user reach mice over hidraw.
 # Installed by OpenMouse Bridge or install-linux.sh; safe to delete on uninstall.
