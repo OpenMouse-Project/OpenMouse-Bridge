@@ -268,6 +268,11 @@ impl BridgeConfig {
                 self.allowed_origins.push((*origin).to_owned());
             }
         }
+        // Earlier releases saved the dev origins as defaults; drop them again.
+        if !cfg!(debug_assertions) {
+            self.allowed_origins
+                .retain(|origin| !DEV_ORIGINS.contains(&origin.as_str()));
+        }
         self.allowed_origins.sort();
         self.allowed_origins.dedup();
         self
@@ -459,15 +464,20 @@ fn default_tray_battery_style() -> String {
     "glyph".to_owned()
 }
 
+/// The control panel's local dev server (Vite). Trusted only by debug builds:
+/// in a release build any page on that port, from any program or account on
+/// the machine, would get the whole API and raw HID.
+const DEV_ORIGINS: &[&str] = &["http://localhost:5173", "http://127.0.0.1:5173"];
+
 fn default_origins() -> Vec<String> {
-    vec![
-        "https://control.openmouse.app".to_owned(),
-        "https://dev.openmouse.app".to_owned(),
-        "https://openmouse.app".to_owned(),
-        "https://www.openmouse.app".to_owned(),
-        "http://localhost:5173".to_owned(),
-        "http://127.0.0.1:5173".to_owned(),
-    ]
+    let mut origins: Vec<String> = OFFICIAL_ORIGINS
+        .iter()
+        .map(|&origin| origin.to_owned())
+        .collect();
+    if cfg!(debug_assertions) {
+        origins.extend(DEV_ORIGINS.iter().map(|&origin| origin.to_owned()));
+    }
+    origins
 }
 
 #[cfg(test)]
@@ -652,6 +662,35 @@ mod tests {
                 .allowed_origins
                 .iter()
                 .any(|origin| origin == "https://control.openmouse.app")
+        );
+    }
+
+    #[test]
+    fn only_debug_builds_trust_the_dev_server() {
+        let saved = BridgeConfig {
+            allowed_origins: DEV_ORIGINS
+                .iter()
+                .map(|&origin| origin.to_owned())
+                .chain(["https://example.test".to_owned()])
+                .collect(),
+            ..BridgeConfig::default()
+        }
+        .normalized();
+        for origins in [&saved.allowed_origins, &default_origins()] {
+            for dev in DEV_ORIGINS {
+                assert_eq!(
+                    origins.iter().any(|origin| origin == dev),
+                    cfg!(debug_assertions),
+                    "{dev} in {origins:?}"
+                );
+            }
+        }
+        assert!(
+            saved
+                .allowed_origins
+                .iter()
+                .any(|origin| origin == "https://example.test"),
+            "an origin the user added stays"
         );
     }
 
