@@ -2,7 +2,9 @@ name: Bridge CI
 
 on:
   push:
-    branches: [dev]
+    # main as well as dev: the build cache is only shared with pull requests
+    # when it was saved from the default branch.
+    branches: [main, dev]
   pull_request:
   workflow_dispatch:
 
@@ -14,6 +16,10 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
+  # No incremental artefacts or debug info: CI builds once from a cold cache, so
+  # they only cost compile time and cache size.
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
   # Keep in sync with release.yml's NATIVE_HID_NODE_VERSION.
   NATIVE_HID_NODE_VERSION: v24.18.1
 
