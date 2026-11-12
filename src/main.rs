@@ -4,11 +4,13 @@
 )]
 
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
-mod desktop;
-#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
-mod native_ui;
+mod gpui_shell;
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 mod overlay;
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+mod runtime;
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+mod tray_battery;
 
 use std::fs;
 
@@ -36,7 +38,7 @@ use tokio::net::TcpListener;
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 fn main() {
     let log_guard = init_tracing();
-    if let Err(error) = desktop::run() {
+    if let Err(error) = runtime::run() {
         tracing::error!(%error, "OpenMouse Bridge failed");
         // `process::exit` skips the log guard's flush, which is how a second
         // launch used to die on the taken port without a line in the log.

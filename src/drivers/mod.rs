@@ -19,7 +19,14 @@ use anyhow::Result;
 use crate::config::ApplicationProfile;
 
 pub(crate) mod automation;
+
+/// A native automation error with the parts that only mean Bridge has no driver
+/// for a mouse removed, or `None` if that was all it said.
+pub fn without_no_driver_errors(message: &str) -> Option<String> {
+    automation::without_no_driver(message)
+}
 pub mod delux;
+mod lamzu;
 mod native_hid;
 pub mod pulsar;
 
@@ -27,13 +34,15 @@ pub use native_hid::{NativeBattery, NativeStatus, spawn_button_listener};
 
 /// A mouse Bridge discovered by itself, by scanning the HID bus for vendor
 /// ids its drivers recognize — no saved profile required.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DetectedMouse {
     /// Stable profile-style id, `"<Brand>:<serial or vid:pid>"` — the same
     /// `"<brand>:"` prefix convention the OpenMouse web app writes.
     pub device_id: String,
     /// Human-readable product name from the HID descriptor.
     pub name: String,
+    pub vendor_id: u16,
+    pub product_id: u16,
 }
 
 /// Brand keys and vendor ids, mirroring the helper's `native-hid/src/brands.mjs`
@@ -62,6 +71,20 @@ const KNOWN_BRANDS: &[(&str, &[u16])] = &[
     ("Microsoft", &[0x045e]),
     ("WALLHACK", &[0x3879, 0x1caa]),
 ];
+
+/// The brand a model name starts with ("Attack Shark R5 Ultra" is Attack
+/// Shark's), for mice that vendor-id discovery labels with another brand.
+pub fn brand_in_name(name: &str) -> Option<&'static str> {
+    let name = name.trim().to_ascii_lowercase();
+    KNOWN_BRANDS
+        .iter()
+        .map(|(brand, _)| *brand)
+        .filter(|brand| {
+            name.strip_prefix(&brand.to_ascii_lowercase())
+                .is_some_and(|rest| rest.starts_with(' '))
+        })
+        .max_by_key(|brand| brand.len())
+}
 
 /// Logitech is special: every Logitech-branded device (keyboards, headsets)
 /// shares vendor id 0x046d and the HID++ transport (`mouse-protocol`'s
@@ -111,7 +134,7 @@ fn discovered_brand(info: &hidapi::DeviceInfo) -> Option<&'static str> {
 /// Deliberately does not open any device — enumeration only — so it is safe
 /// to call while a web panel session or another driver operation runs.
 pub fn detect_mice() -> Vec<DetectedMouse> {
-    let api = match hidapi::HidApi::new() {
+    let api = match crate::hid::new_api() {
         Ok(api) => api,
         Err(error) => {
             tracing::warn!(%error, "could not enumerate HID devices");
@@ -125,6 +148,12 @@ pub fn detect_mice() -> Vec<DetectedMouse> {
         let Some(brand) = discovered_brand(info) else {
             continue;
         };
+        // A Logitech receiver's per-mouse node on Linux is that receiver
+        // again, under the mouse's serial; counting it would list the
+        // receiver twice under two ids.
+        if crate::hid::is_receiver_child(info.path()) {
+            continue;
+        }
         // One physical mouse exposes several HID interfaces (boot mouse,
         // consumer control, vendor config, ...). Dedup on the identity
         // triple so the same mouse is not listed three times.
@@ -141,6 +170,8 @@ pub fn detect_mice() -> Vec<DetectedMouse> {
         mice.push(DetectedMouse {
             device_id: format!("{brand}:{}", identity.2),
             name: product_name(info.product_string().unwrap_or_default(), brand),
+            vendor_id,
+            product_id: info.product_id(),
         });
     }
     mice
@@ -187,6 +218,10 @@ pub(crate) fn manual_report_access(
     }
     Ok(access)
 }
+
+/// Serializes tests that drive native HID or the process-wide session count.
+#[cfg(test)]
+pub(crate) static TEST_NATIVE: Mutex<()> = Mutex::new(());
 
 fn ensure_native_ownership() -> Result<()> {
     if crate::hid::client_session_active() {
@@ -244,17 +279,34 @@ pub fn apply_profile(profile: &ApplicationProfile) -> Result<bool> {
     }
 }
 
+/// Whether an automatic reconcile pass reached the hardware.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Reconciled {
+    Done,
+    /// The control panel holds the HID session, so nothing was sent. The
+    /// automation state is untouched, so a later pass after the panel
+    /// disconnects still applies or restores whatever is due.
+    Deferred,
+}
+
+/// Background counterpart of the manual entry points. A panel session is the
+/// expected owner of the mouse, not a failure, so this defers instead of
+/// returning the ownership error. The check runs under `device_access`, which
+/// a new session also takes, so no write can interleave with its traffic.
 pub(crate) fn reconcile_automatic(
     automation: &mut automation::NativeAutomation,
     desired: Option<&ApplicationProfile>,
-) -> Result<()> {
+) -> Result<Reconciled> {
     let access = device_access();
     automation.observe_manual_intent(&access);
-    ensure_native_ownership()?;
+    if crate::hid::client_session_active() {
+        return Ok(Reconciled::Deferred);
+    }
     automation.reconcile(
         desired,
         &mut automation::HelperIo(|request: &serde_json::Value| native_hid::run_helper(request)),
-    )
+    )?;
+    Ok(Reconciled::Done)
 }
 
 /// Reads the onboard-memory state of the mouse `device_id` names
@@ -269,6 +321,14 @@ pub fn read_status(device_id: &str) -> Result<Option<NativeStatus>> {
     ensure_native_ownership()?;
     if brand.eq_ignore_ascii_case(pulsar::BRAND) {
         return pulsar::read_status();
+    }
+    // The Attack Shark R5 Ultra is labelled "Delux" by its vendor id. The node
+    // helper cannot read it, so it is read natively; a mouse that is not
+    // plugged in falls through to the helper like any other Delux device.
+    if lamzu::handles(brand)
+        && let Some(status) = lamzu::read_status()?
+    {
+        return Ok(Some(status));
     }
     native_hid::read_status(brand)
 }
@@ -310,8 +370,6 @@ mod tests {
             enabled: true,
         }
     }
-
-    static TEST_NATIVE: Mutex<()> = Mutex::new(());
 
     struct FakeNative {
         dpi: u32,
@@ -372,6 +430,88 @@ mod tests {
             assert!(apply_settings("Zaunkoenig", Some(3200), None).unwrap());
             reconcile_automatic(&mut automation, None).unwrap();
             assert_eq!(values.lock().unwrap().dpi, 3200);
+        });
+    }
+
+    #[test]
+    fn open_panel_session_defers_automatic_apply_until_it_closes() {
+        let _serial = TEST_NATIVE.lock().unwrap_or_else(|e| e.into_inner());
+        let (values, helper) = fake_native();
+        native_hid::with_test_helper(helper, || {
+            let mut automation = automation::NativeAutomation::default();
+            let mut game = profile("Zaunkoenig:M3K");
+            game.settings.dpi = Some(1600);
+            game.settings.polling_rate_hz = None;
+
+            let session = crate::hid::hold_client_session();
+            for _ in 0..3 {
+                assert_eq!(
+                    reconcile_automatic(&mut automation, Some(&game)).unwrap(),
+                    Reconciled::Deferred
+                );
+            }
+            assert!(values.lock().unwrap().calls.is_empty());
+            assert_eq!(values.lock().unwrap().dpi, 800);
+            drop(session);
+
+            assert_eq!(
+                reconcile_automatic(&mut automation, Some(&game)).unwrap(),
+                Reconciled::Done
+            );
+            assert_eq!(values.lock().unwrap().dpi, 1600);
+        });
+    }
+
+    #[test]
+    fn open_panel_session_defers_automatic_restore_until_it_closes() {
+        let _serial = TEST_NATIVE.lock().unwrap_or_else(|e| e.into_inner());
+        let (values, helper) = fake_native();
+        native_hid::with_test_helper(helper, || {
+            let mut automation = automation::NativeAutomation::default();
+            let mut game = profile("Zaunkoenig:M3K");
+            game.settings.dpi = Some(1600);
+            game.settings.polling_rate_hz = None;
+            reconcile_automatic(&mut automation, Some(&game)).unwrap();
+            assert_eq!(values.lock().unwrap().dpi, 1600);
+
+            let session = crate::hid::hold_client_session();
+            let calls = values.lock().unwrap().calls.len();
+            assert_eq!(
+                reconcile_automatic(&mut automation, None).unwrap(),
+                Reconciled::Deferred
+            );
+            assert_eq!(values.lock().unwrap().calls.len(), calls);
+            assert_eq!(automation.pending_restores_for(None), 1);
+            drop(session);
+
+            assert_eq!(
+                reconcile_automatic(&mut automation, None).unwrap(),
+                Reconciled::Done
+            );
+            assert_eq!(values.lock().unwrap().dpi, 800);
+            assert_eq!(automation.pending_restores_for(None), 0);
+        });
+    }
+
+    #[test]
+    fn open_panel_session_still_refuses_direct_native_writes() {
+        let _serial = TEST_NATIVE.lock().unwrap_or_else(|e| e.into_inner());
+        let (values, helper) = fake_native();
+        native_hid::with_test_helper(helper, || {
+            let _session = crate::hid::hold_client_session();
+            for error in [
+                apply_settings("Zaunkoenig", Some(3200), None).unwrap_err(),
+                apply_profile(&profile("Zaunkoenig:M3K")).unwrap_err(),
+                read_status("Zaunkoenig:M3K").unwrap_err(),
+            ] {
+                assert_eq!(
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .map(std::io::Error::kind),
+                    Some(std::io::ErrorKind::WouldBlock)
+                );
+            }
+            assert!(values.lock().unwrap().calls.is_empty());
         });
     }
 

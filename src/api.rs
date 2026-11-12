@@ -382,9 +382,9 @@ async fn record_battery(
     Json(reading): Json<BatteryReading>,
 ) -> Result<Json<ApiResult>, (StatusCode, String)> {
     service
-        .record_battery(reading)
+        .record_panel_battery(reading)
         .await
-        .map_err(internal_error)?;
+        .map_err(profile_error)?;
     Ok(Json(ApiResult { ok: true }))
 }
 

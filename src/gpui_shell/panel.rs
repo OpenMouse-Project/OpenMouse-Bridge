@@ -1,0 +1,1729 @@
+//! The tray panel's views: Home, Settings and the Bridge info page.
+
+use std::{sync::mpsc, time::Duration};
+
+use gpui_kit::assets::IconName;
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _,
+    button::{Button, ButtonVariants as _},
+    switch::Switch,
+    text::TextView,
+};
+use gpui_kit::*;
+use openmouse_bridge::{
+    BRIDGE_PORT, changelog, config, hid_access,
+    platform::{self, TrayBatteryStyle},
+    service::{BridgeSnapshot, KnownDeviceState, KnownDeviceStatus, Notice},
+    updater::{DownloadProgress, UpdateInfo, download_progress},
+};
+use tokio::sync::mpsc as tokio_mpsc;
+
+use super::{ExitFlags, ascii};
+use crate::overlay::Overlay;
+use crate::runtime::{
+    BridgeCommand, UpdateEvent, WINDOW_HEIGHT, WINDOW_WIDTH, notify_natively, open_logs,
+    service_label,
+};
+
+const OPENMOUSE_URL: &str = "https://control.openmouse.app";
+
+/// The low-battery alert levels on offer.
+const BATTERY_THRESHOLDS: [u8; 7] = [10, 15, 20, 25, 30, 40, 50];
+const VOLUME_STEP: u8 = 10;
+
+/// The alert level `steps` places from `current` in [`BATTERY_THRESHOLDS`],
+/// stopping at either end; a stored value that is not on the list counts as the
+/// closest one.
+fn step_threshold(current: u8, steps: i32) -> u8 {
+    let nearest = BATTERY_THRESHOLDS
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, level)| level.abs_diff(current))
+        .map_or(0, |(index, _)| index);
+    let index = (nearest as i32 + steps).clamp(0, BATTERY_THRESHOLDS.len() as i32 - 1);
+    BATTERY_THRESHOLDS[index as usize]
+}
+
+/// The volume one step up or down, kept between 0 and 100.
+fn step_volume(current: u8, up: bool) -> u8 {
+    if up {
+        current.saturating_add(VOLUME_STEP).min(100)
+    } else {
+        current.saturating_sub(VOLUME_STEP)
+    }
+}
+
+/// How many remembered mice Home lists before summarising the rest.
+const HOME_DEVICE_ROWS: usize = 3;
+
+/// Installing the udev rule that lets Bridge open plugged-in mice (Linux).
+enum UdevFix {
+    Idle,
+    /// `pkexec` is showing the password prompt; its result arrives here.
+    Running(mpsc::Receiver<Result<(), String>>),
+    /// It failed or was cancelled: why, and a terminal command to do it by
+    /// hand when the rule copy could be saved.
+    Failed {
+        error: String,
+        command: Option<String>,
+    },
+}
+
+/// Whether Home needs the permissions card: mice are plugged in
+/// that Bridge may not open.
+fn hid_blocked(snapshot: Option<&BridgeSnapshot>) -> bool {
+    snapshot.is_some_and(|snapshot| !snapshot.blocked_hid_devices.is_empty())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum View {
+    Home,
+    Settings,
+    Info,
+    WhatsNew,
+}
+
+impl View {
+    /// The panel's base height in logical points.
+    fn base_height(self) -> f32 {
+        match self {
+            View::Home => WINDOW_HEIGHT,
+            View::Settings => 600.0,
+            View::Info => 420.0,
+            View::WhatsNew => 480.0,
+        }
+    }
+}
+
+/// Extra height for one more line of content, in logical points.
+const ROW_HEIGHT: f32 = 24.0;
+const NOTE_HEIGHT: f32 = 22.0;
+/// The update card on Home.
+const NOTICE_HEIGHT: f32 = 58.0;
+/// The progress bar under the update card's headline, with its gap.
+const BAR_HEIGHT: f32 = 14.0;
+/// Home's "Updated to …" line after an update.
+const WHATS_NEW_HEIGHT: f32 = 34.0;
+
+pub struct PanelView {
+    snapshots: mpsc::Receiver<BridgeSnapshot>,
+    commands: tokio_mpsc::UnboundedSender<BridgeCommand>,
+    updates: mpsc::Receiver<UpdateEvent>,
+    notices: mpsc::Receiver<Notice>,
+    panel_requests: mpsc::Receiver<()>,
+    exit: ExitFlags,
+    snapshot: Option<BridgeSnapshot>,
+    view: View,
+    autostart: bool,
+    automatic_updates: bool,
+    hybrid_mode: bool,
+    tray_style: TrayBatteryStyle,
+    battery_threshold: u8,
+    notification_sound: bool,
+    notification_volume: u8,
+    update: UpdateState,
+    /// Bytes received of the archive being downloaded, while one is.
+    progress: Option<DownloadProgress>,
+    /// Set when the updater has staged a new version and handed off to its
+    /// helper, which waits for this process to exit before swapping files in.
+    quit_for_update: bool,
+    /// Shown on Home until the panel is first closed: the first launch opens
+    /// the panel, so the app's home in the tray needs saying.
+    first_run_hint: bool,
+    error: Option<String>,
+    /// Lets the panel take key presses, so Escape can dismiss it.
+    focus: FocusHandle,
+    field: ascii::Field,
+    was_visible: bool,
+    /// The on-screen banner for low-battery and game-profile notices. Without
+    /// it (no display for the native window), notices fall back to system
+    /// notifications.
+    overlay: Option<Overlay>,
+    udev_fix: UdevFix,
+    /// The release notes of the update on offer, as `(version, notes)`, from
+    /// `latest.json`: shown at the top of What's new.
+    incoming_notes: Option<(String, String)>,
+    /// Home's "Updated to …" line was opened or dismissed this session; the
+    /// core saves it too, but the snapshot only catches up a second later.
+    whats_new_dismissed: bool,
+}
+
+pub struct Drained {
+    pub changed: bool,
+    pub panel_requested: bool,
+    /// The updater has handed off: the app must exit now so its helper can
+    /// install the new version and relaunch it.
+    pub quit_for_update: bool,
+    /// How soon the overlay needs the next tick while a banner is fading.
+    pub overlay_delay: Option<Duration>,
+}
+
+/// Where the update flow stands.
+#[derive(Clone)]
+enum UpdateState {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(UpdateInfo),
+    Downloading(String),
+    /// Downloaded and verified; "Restart to update" applies it.
+    Ready(String),
+    Restarting(String),
+    Failed(String),
+}
+
+impl UpdateState {
+    fn from_event(event: UpdateEvent) -> Self {
+        match event {
+            // Carries notes only; `drain` handles it before any state change.
+            UpdateEvent::Notes(..) => Self::Idle,
+            UpdateEvent::Checking => Self::Checking,
+            UpdateEvent::UpToDate => Self::UpToDate,
+            UpdateEvent::Available(update) => Self::Available(update),
+            UpdateEvent::Downloading(version) => Self::Downloading(version),
+            UpdateEvent::Ready(version) => Self::Ready(version),
+            UpdateEvent::Restarting(version) => Self::Restarting(version),
+            UpdateEvent::Failed(error) => Self::Failed(error),
+        }
+    }
+
+    /// Something is in progress, so another check or install must wait.
+    fn busy(&self) -> bool {
+        matches!(
+            self,
+            Self::Checking | Self::Downloading(_) | Self::Restarting(_)
+        )
+    }
+
+    /// Worth a card on Home, not only a line in Settings.
+    fn is_notice(&self) -> bool {
+        matches!(
+            self,
+            Self::Available(_)
+                | Self::Downloading(_)
+                | Self::Ready(_)
+                | Self::Restarting(_)
+                | Self::Failed(_)
+        )
+    }
+
+    /// A progress bar goes under the headline.
+    fn shows_bar(&self) -> bool {
+        matches!(self, Self::Downloading(_) | Self::Restarting(_))
+    }
+
+    /// The one line Settings shows for any state.
+    fn text(&self, progress: Option<DownloadProgress>) -> Option<String> {
+        Some(match self {
+            Self::Idle => return None,
+            Self::Checking => "Checking for updates…".into(),
+            Self::UpToDate => "Bridge is up to date".into(),
+            Self::Available(update) => format!("Version {} is available", update.version),
+            Self::Downloading(version) => downloading_text(version, progress),
+            Self::Ready(version) => format!("Version {version} is ready to install"),
+            Self::Restarting(version) => format!("Restarting into {version}…"),
+            Self::Failed(error) => format!("Update failed: {error}"),
+        })
+    }
+
+    /// The short headline of the card on Home.
+    fn headline(&self, progress: Option<DownloadProgress>) -> Option<String> {
+        Some(match self {
+            Self::Failed(_) => "Update failed".into(),
+            Self::Ready(version) => format!("Update {version} is ready"),
+            Self::Available(_) | Self::Downloading(_) | Self::Restarting(_) => {
+                self.text(progress)?
+            }
+            Self::Idle | Self::Checking | Self::UpToDate => return None,
+        })
+    }
+}
+
+/// What an update event says about the notes of the update on offer: `None`
+/// when it says nothing, otherwise the notes to show from now on. Every offer
+/// replaces them, so a later one without notes never shows an earlier
+/// version's.
+fn offered_notes(event: &UpdateEvent) -> Option<Option<(String, String)>> {
+    let (version, notes) = match event {
+        UpdateEvent::Available(update) => (&update.version, &update.notes),
+        UpdateEvent::Notes(version, notes) => (version, notes),
+        _ => return None,
+    };
+    Some((!notes.trim().is_empty()).then(|| (version.clone(), notes.clone())))
+}
+
+/// "Install", or "Download" for an install that cannot replace itself.
+fn install_label(update: &UpdateInfo) -> &'static str {
+    if update.manual_download_url().is_some() {
+        "Download"
+    } else {
+        "Install"
+    }
+}
+
+/// "Downloading 2.0.0…" with the percentage once the size is known, and
+/// "Preparing" for the checks and unpacking after the last byte.
+fn downloading_text(version: &str, progress: Option<DownloadProgress>) -> String {
+    match progress {
+        Some(progress) if progress.is_complete() => format!("Preparing {version}…"),
+        Some(progress) => match progress.fraction() {
+            Some(fraction) => format!("Downloading {version} · {}%", (fraction * 100.0) as u32),
+            None => format!("Downloading {version}…"),
+        },
+        None => format!("Downloading {version}…"),
+    }
+}
+
+/// A thin progress bar. With a fraction it fills that far; without one (the
+/// size is unknown, or the download is being checked and unpacked) a segment
+/// sweeps across it.
+fn progress_bar(fraction: Option<f32>, fill: Hsla, track: Hsla) -> AnyElement {
+    let bar = div()
+        .relative()
+        .h(px(4.))
+        .w_full()
+        .flex_none()
+        .rounded_full()
+        .overflow_hidden()
+        .bg(track);
+    match fraction {
+        Some(fraction) => bar
+            .child(
+                div()
+                    .h_full()
+                    .w(relative(fraction.clamp(0.0, 1.0)))
+                    .rounded_full()
+                    .bg(fill),
+            )
+            .into_any_element(),
+        None => bar
+            .child(
+                div()
+                    .absolute()
+                    .top(px(0.))
+                    .h_full()
+                    .w(relative(0.35))
+                    .rounded_full()
+                    .bg(fill)
+                    .with_animation(
+                        "update-sweep",
+                        Animation::new(Duration::from_millis(1100)).repeat(),
+                        |segment, delta| segment.left(relative(delta * 1.35 - 0.35)),
+                    ),
+            )
+            .into_any_element(),
+    }
+}
+
+/// The channels between the panel and the core.
+pub struct CoreLinks {
+    pub snapshots: mpsc::Receiver<BridgeSnapshot>,
+    pub commands: tokio_mpsc::UnboundedSender<BridgeCommand>,
+    pub updates: mpsc::Receiver<UpdateEvent>,
+    pub notices: mpsc::Receiver<Notice>,
+    pub panel_requests: mpsc::Receiver<()>,
+}
+
+impl PanelView {
+    pub fn new(links: CoreLinks, exit: ExitFlags, first_run: bool, focus: FocusHandle) -> Self {
+        let CoreLinks {
+            snapshots,
+            commands,
+            updates,
+            notices,
+            panel_requests,
+        } = links;
+        if first_run {
+            // Tell the core the tray hint was shown, so later launches start
+            // hidden in the tray instead of opening the panel again.
+            let _ = commands.send(BridgeCommand::AcknowledgeTrayHint);
+        }
+        Self {
+            snapshots,
+            commands,
+            updates,
+            notices,
+            panel_requests,
+            exit,
+            snapshot: None,
+            // A development aid: OPENMOUSE_BRIDGE_START_VIEW=settings|info opens
+            // straight onto that view.
+            view: match std::env::var("OPENMOUSE_BRIDGE_START_VIEW").as_deref() {
+                Ok("settings") => View::Settings,
+                Ok("info") => View::Info,
+                Ok("whats-new") => View::WhatsNew,
+                _ => View::Home,
+            },
+            autostart: platform::autostart_enabled(),
+            automatic_updates: false,
+            hybrid_mode: true,
+            tray_style: TrayBatteryStyle::Glyph,
+            battery_threshold: 20,
+            notification_sound: true,
+            notification_volume: 60,
+            update: UpdateState::Idle,
+            udev_fix: UdevFix::Idle,
+            progress: None,
+            quit_for_update: false,
+            first_run_hint: first_run,
+            error: None,
+            focus,
+            field: ascii::Field::default(),
+            was_visible: true,
+            overlay: Overlay::new()
+                .inspect_err(|error| tracing::warn!(%error, "Could not create the overlay"))
+                .ok(),
+            incoming_notes: None,
+            whats_new_dismissed: false,
+        }
+    }
+
+    /// What the tray icon should show for the latest snapshot.
+    pub fn tray_battery(&self) -> Option<crate::tray_battery::TrayBattery> {
+        crate::tray_battery::from_snapshot(self.snapshot.as_ref())
+    }
+
+    /// Takes everything the core has queued since the last poll. Notices become
+    /// system notifications for now; the GPUI overlay replaces that later.
+    pub fn drain(&mut self) -> Drained {
+        let mut changed = false;
+        while let Ok(snapshot) = self.snapshots.try_recv() {
+            self.autostart = snapshot.autostart_enabled;
+            self.automatic_updates = snapshot.automatic_updates;
+            self.hybrid_mode = snapshot.hybrid_mode;
+            self.tray_style = TrayBatteryStyle::from_config_str(&snapshot.tray_battery_style);
+            self.battery_threshold = snapshot.battery_threshold_percent;
+            self.notification_sound = snapshot.notification_sound;
+            self.notification_volume = snapshot.notification_volume;
+            self.snapshot = Some(snapshot);
+            changed = true;
+        }
+        if let UdevFix::Running(result) = &self.udev_fix
+            && let Ok(result) = result.try_recv()
+        {
+            self.udev_fix = match result {
+                Ok(()) => UdevFix::Idle,
+                Err(error) => {
+                    tracing::warn!(%error, "Could not install the udev rule");
+                    UdevFix::Failed {
+                        error,
+                        command: hid_access::save_rule_files()
+                            .ok()
+                            .map(|dir| hid_access::manual_command(&dir)),
+                    }
+                }
+            };
+            changed = true;
+        }
+        // Fixed another way (the terminal command, a replug): drop the failure.
+        if matches!(self.udev_fix, UdevFix::Failed { .. }) && !hid_blocked(self.snapshot.as_ref()) {
+            self.udev_fix = UdevFix::Idle;
+            changed = true;
+        }
+        while let Ok(event) = self.updates.try_recv() {
+            self.quit_for_update |= matches!(event, UpdateEvent::Restarting(_));
+            if let Some(notes) = offered_notes(&event) {
+                self.incoming_notes = notes;
+                changed = true;
+            }
+            if matches!(event, UpdateEvent::Notes(..)) {
+                continue;
+            }
+            self.update = UpdateState::from_event(event);
+            changed = true;
+        }
+        // The counter is a shared atomic, not an event, so sample it while a
+        // download runs and repaint when it moved.
+        if matches!(self.update, UpdateState::Downloading(_)) {
+            let progress = download_progress();
+            if self.progress != Some(progress) {
+                self.progress = Some(progress);
+                changed = true;
+            }
+        } else if self.progress.take().is_some() {
+            changed = true;
+        }
+        while let Ok(notice) = self.notices.try_recv() {
+            self.present(&notice);
+        }
+        let mut panel_requested = false;
+        while self.panel_requests.try_recv().is_ok() {
+            panel_requested = true;
+        }
+        // Nothing repaints a panel that is hidden in the tray; the state above
+        // keeps up regardless, and one repaint on showing it catches up.
+        let visible = super::tray::is_visible();
+        let became_visible = visible && !self.was_visible;
+        self.was_visible = visible;
+        Drained {
+            changed: (changed && visible) || became_visible,
+            panel_requested,
+            quit_for_update: self.quit_for_update,
+            overlay_delay: self.overlay.as_mut().and_then(Overlay::tick),
+        }
+    }
+
+    /// Shows `notice` on the overlay with its chime, or as a system
+    /// notification when there is no overlay. Low-battery alerts and the
+    /// profile switch for a detected game both arrive here.
+    fn present(&mut self, notice: &Notice) {
+        let (sound, volume) = self.snapshot.as_ref().map_or((true, 60), |snapshot| {
+            (snapshot.notification_sound, snapshot.notification_volume)
+        });
+        let Some(overlay) = self.overlay.as_mut() else {
+            notify_natively(notice);
+            return;
+        };
+        if let Err(error) = overlay.show(&notice.title, &notice.detail) {
+            tracing::warn!(%error, "Could not show the overlay");
+            notify_natively(notice);
+            return;
+        }
+        tracing::info!(title = %notice.title, sound, volume, "Showed a notice on the overlay");
+        if sound && let Err(error) = overlay.chime(volume) {
+            tracing::warn!(%error, "Could not play the notification sound");
+        }
+    }
+
+    fn show_view(&mut self, view: View, cx: &mut Context<Self>) {
+        self.view = view;
+        self.error = None;
+        cx.notify();
+    }
+
+    /// Home offers this version's notes: Bridge was updated and they have not
+    /// been seen or dismissed yet.
+    fn offers_whats_new(&self) -> bool {
+        !self.whats_new_dismissed
+            && self
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.whats_new)
+    }
+
+    /// Records that this version's notes were seen, so Home stops offering
+    /// them.
+    fn acknowledge_whats_new(&mut self, cx: &mut Context<Self>) {
+        if !self.whats_new_dismissed {
+            self.whats_new_dismissed = true;
+            let _ = self.commands.send(BridgeCommand::AcknowledgeWhatsNew);
+        }
+        cx.notify();
+    }
+
+    fn show_whats_new(&mut self, cx: &mut Context<Self>) {
+        if self.offers_whats_new() {
+            self.acknowledge_whats_new(cx);
+        }
+        self.show_view(View::WhatsNew, cx);
+    }
+
+    /// The height the current view needs: the base height plus a line for each
+    /// extra remembered mouse, the "more" note, and the update status text.
+    fn desired_height(&self) -> f32 {
+        let mut height = self.view.base_height();
+        match self.view {
+            View::Home => {
+                let known = self
+                    .snapshot
+                    .as_ref()
+                    .map_or(0, |snapshot| snapshot.known_devices.len());
+                height += ROW_HEIGHT * known.min(HOME_DEVICE_ROWS).saturating_sub(1) as f32;
+                if known > HOME_DEVICE_ROWS {
+                    height += NOTE_HEIGHT;
+                }
+                if self.update.is_notice() {
+                    height += NOTICE_HEIGHT;
+                    if self.update.shows_bar() {
+                        height += BAR_HEIGHT;
+                    }
+                    if matches!(self.update, UpdateState::Failed(_)) {
+                        height += NOTE_HEIGHT * 2.0;
+                    }
+                }
+                if native_problem(self.snapshot.as_ref()).is_some() {
+                    height += NOTE_HEIGHT * 2.0;
+                }
+                if hid_blocked(self.snapshot.as_ref()) {
+                    height += NOTICE_HEIGHT + NOTE_HEIGHT * 2.0;
+                    if matches!(self.udev_fix, UdevFix::Failed { .. }) {
+                        height += NOTE_HEIGHT * 2.0;
+                    }
+                }
+                if self.first_run_hint {
+                    height += NOTE_HEIGHT * 2.0;
+                }
+                if self.offers_whats_new() {
+                    height += WHATS_NEW_HEIGHT;
+                }
+            }
+            View::Settings | View::Info | View::WhatsNew => {}
+        }
+        height
+    }
+
+    /// Installs the udev rule through `pkexec` on a thread of its own: the
+    /// password prompt blocks until the user answers it.
+    fn fix_hid_permissions(&mut self, cx: &mut Context<Self>) {
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(hid_access::install_rule().map_err(|error| error.to_string()));
+        });
+        self.udev_fix = UdevFix::Running(receiver);
+        cx.notify();
+    }
+
+    fn set_autostart(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        match platform::set_autostart(enabled) {
+            Ok(()) => {
+                self.autostart = enabled;
+                self.error = None;
+            }
+            Err(error) => self.error = Some(error.to_string()),
+        }
+        cx.notify();
+    }
+
+    fn set_automatic_updates(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.automatic_updates = enabled;
+        let _ = self
+            .commands
+            .send(BridgeCommand::SetAutomaticUpdates(enabled));
+        cx.notify();
+    }
+
+    /// Forgets a remembered mouse that is no longer plugged in.
+    fn forget_device(&mut self, id: String, cx: &mut Context<Self>) {
+        let _ = self.commands.send(BridgeCommand::ForgetBattery(id));
+        cx.notify();
+    }
+
+    fn set_hybrid_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.hybrid_mode = enabled;
+        let _ = self.commands.send(BridgeCommand::SetHybridMode(enabled));
+        cx.notify();
+    }
+
+    fn set_tray_style(&mut self, style: TrayBatteryStyle, cx: &mut Context<Self>) {
+        self.tray_style = style;
+        let _ = self
+            .commands
+            .send(BridgeCommand::SetTrayBatteryStyle(style));
+        cx.notify();
+    }
+
+    fn step_battery_threshold(&mut self, steps: i32, cx: &mut Context<Self>) {
+        self.battery_threshold = step_threshold(self.battery_threshold, steps);
+        let _ = self
+            .commands
+            .send(BridgeCommand::SetBatteryThreshold(self.battery_threshold));
+        cx.notify();
+    }
+
+    fn set_notification_sound(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.notification_sound = enabled;
+        let _ = self
+            .commands
+            .send(BridgeCommand::SetNotificationSound(enabled));
+        cx.notify();
+    }
+
+    fn step_notification_volume(&mut self, up: bool, cx: &mut Context<Self>) {
+        self.notification_volume = step_volume(self.notification_volume, up);
+        let _ = self.commands.send(BridgeCommand::SetNotificationVolume(
+            self.notification_volume,
+        ));
+        cx.notify();
+    }
+
+    fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        self.update = UpdateState::Checking;
+        let _ = self.commands.send(BridgeCommand::CheckForUpdates);
+        cx.notify();
+    }
+
+    /// Downloads and stages `update`, or for an install that cannot replace
+    /// itself, opens the page to download it from.
+    fn install_update(&mut self, update: UpdateInfo, cx: &mut Context<Self>) {
+        if let Some(url) = update.manual_download_url() {
+            cx.open_url(url);
+            return;
+        }
+        self.update = UpdateState::Downloading(update.version.clone());
+        let _ = self.commands.send(BridgeCommand::InstallUpdate(update));
+        cx.notify();
+    }
+
+    /// Restarts into the staged update.
+    fn apply_update(&mut self, version: String, cx: &mut Context<Self>) {
+        self.update = UpdateState::Restarting(version);
+        let _ = self.commands.send(BridgeCommand::ApplyUpdate);
+        cx.notify();
+    }
+
+    /// Sends a notice down the same path a low-battery alert or a detected
+    /// game's profile switch takes, so it shows the overlay and plays the chime.
+    fn test_notification(&mut self, cx: &mut Context<Self>) {
+        self.present(&Notice {
+            title: "Test notification".into(),
+            detail: "This is how OpenMouse Bridge alerts look.".into(),
+        });
+        cx.notify();
+    }
+
+    fn open_logs(&mut self, cx: &mut Context<Self>) {
+        self.error = open_logs().err().map(|error| error.to_string());
+        cx.notify();
+    }
+}
+
+fn row(muted: Hsla, label: &'static str, value: impl Into<SharedString>) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .justify_between()
+        .gap_3()
+        .text_sm()
+        .child(div().text_color(muted).child(label))
+        .child(div().truncate().child(value.into()))
+}
+
+fn card(line: Hsla, fill: Hsla) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p_3()
+        .rounded_lg()
+        .border_1()
+        .border_color(line)
+        .bg(fill)
+}
+
+/// The profile row: the game's profile while one is active, otherwise Default.
+fn profile_name(snapshot: Option<&BridgeSnapshot>) -> String {
+    snapshot
+        .and_then(|snapshot| {
+            snapshot
+                .active_profile
+                .as_ref()
+                .filter(|_| !snapshot.active_profile_is_default)
+        })
+        .map_or_else(
+            || "Default".into(),
+            |profile| profile.application.name.clone(),
+        )
+}
+
+/// A failed or pending hardware write, kept out of the profile row so it stays
+/// readable; a selected profile is not proof the mouse took it.
+fn native_problem(snapshot: Option<&BridgeSnapshot>) -> Option<String> {
+    let snapshot = snapshot?;
+    // A mouse Bridge has no driver for is not a problem to report.
+    let error = snapshot
+        .native_automation_error
+        .as_deref()
+        .and_then(openmouse_bridge::drivers::without_no_driver_errors);
+    if snapshot.pending_native_restores > 0 {
+        let mut text = format!(
+            "Native restore pending ({})",
+            snapshot.pending_native_restores
+        );
+        if let Some(error) = &error {
+            text.push_str(": ");
+            text.push_str(error);
+        }
+        return Some(text);
+    }
+    error.map(|error| format!("Native settings not applied: {error}"))
+}
+
+/// A value with a minus and a plus button either side.
+fn stepper(
+    id: &'static str,
+    value: String,
+    on_minus: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_plus: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .child(
+            Button::new(SharedString::from(format!("{id}-down")))
+                .ghost()
+                .compact()
+                .icon(IconName::Minus)
+                .on_click(on_minus),
+        )
+        .child(div().w(px(44.)).text_center().text_sm().child(value))
+        .child(
+            Button::new(SharedString::from(format!("{id}-up")))
+                .ghost()
+                .compact()
+                .icon(IconName::Plus)
+                .on_click(on_plus),
+        )
+}
+
+fn switch_row(label: &'static str, control: impl IntoElement) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .justify_between()
+        .items_center()
+        .text_sm()
+        .child(label)
+        .child(control)
+}
+
+fn format_age(seconds: u64) -> String {
+    match seconds {
+        0..=59 => "just now".into(),
+        60..=3_599 => format!("{} min ago", seconds / 60),
+        3_600..=86_399 => format!("{} h ago", seconds / 3_600),
+        _ => format!("{} d ago", seconds / 86_400),
+    }
+}
+
+fn format_uptime(seconds: u64) -> String {
+    let (days, hours, minutes) = (
+        seconds / 86_400,
+        seconds % 86_400 / 3_600,
+        seconds % 3_600 / 60,
+    );
+    if days > 0 {
+        format!("{days} d {hours} h")
+    } else if hours > 0 {
+        format!("{hours} h {minutes} min")
+    } else {
+        format!("{minutes} min")
+    }
+}
+
+/// What Home shows for a remembered mouse: its live reading while connected,
+/// "Asleep" and its last reading while its receiver is plugged in but it does
+/// not answer, otherwise when it was last seen and the reading it had then.
+fn known_device_text(device: &KnownDeviceStatus) -> String {
+    let mut parts = Vec::new();
+    if device.state == KnownDeviceState::Asleep {
+        parts.push("Asleep".into());
+        if let Some(percent) = device.percent {
+            parts.push(format!("{percent}%"));
+        }
+    } else if device.connected {
+        match device.percent {
+            Some(percent) if device.charging == Some(true) => {
+                parts.push(format!("{percent}% · Charging"));
+            }
+            Some(percent) => parts.push(format!("{percent}%")),
+            None => parts.push("Connected".into()),
+        }
+        if let Some(dpi) = device.dpi {
+            parts.push(format!("{dpi} DPI"));
+        }
+    } else {
+        parts.push(format!(
+            "Last seen {}",
+            format_age(device.last_seen_seconds_ago)
+        ));
+        if let Some(percent) = device.percent {
+            parts.push(format!("{percent}%"));
+        }
+    }
+    parts.join(" · ")
+}
+
+impl PanelView {
+    /// The panel's title bar: an optional back button, the title (which, with
+    /// the space after it, drags the borderless window), the version, the
+    /// settings button on Home, and a close button that hides the panel to the
+    /// tray (or quits where there is no tray).
+    fn title_bar(
+        &self,
+        title: &'static str,
+        back: bool,
+        settings: bool,
+        accent: Hsla,
+        muted: Hsla,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let mut bar = div().flex().flex_row().items_center().gap_1();
+        if back {
+            bar = bar.child(
+                Button::new("back")
+                    .ghost()
+                    .compact()
+                    .icon(IconName::ArrowLeft)
+                    .tooltip("Back")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_view(View::Home, cx);
+                    })),
+            );
+        }
+        // Only the title area starts a window move, so the buttons keep their
+        // own clicks.
+        bar = bar
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .items_center()
+                    .gap_2()
+                    .py_1()
+                    .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
+                    .child(div().size(px(8.)).flex_none().rounded_full().bg(accent))
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
+            );
+        if settings {
+            bar = bar.child(
+                Button::new("settings")
+                    .ghost()
+                    .compact()
+                    .icon(IconName::Settings)
+                    .tooltip("Settings")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_view(View::Settings, cx);
+                    })),
+            );
+        }
+        bar.child(
+            Button::new("close")
+                .ghost()
+                .compact()
+                .icon(IconName::Close)
+                .tooltip(if super::tray::can_hide() {
+                    "Hide to tray"
+                } else {
+                    "Quit"
+                })
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.first_run_hint = false;
+                    if super::tray::can_hide() {
+                        super::tray::hide(window);
+                    } else {
+                        this.exit.quit(cx);
+                    }
+                })),
+        )
+    }
+
+    fn home(
+        &self,
+        muted: Hsla,
+        accent: Hsla,
+        line: Hsla,
+        fill: Hsla,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let snapshot = self.snapshot.as_ref();
+        let mut details = card(line, fill)
+            .child(row(muted, "Service", service_label(snapshot)))
+            .child(row(muted, "Profile", profile_name(snapshot)));
+        let known = snapshot
+            .map(|snapshot| snapshot.known_devices.as_slice())
+            .unwrap_or(&[]);
+        if known.is_empty() {
+            details = details.child(row(muted, "Mouse", "No mouse detected yet"));
+        }
+        for device in known.iter().take(HOME_DEVICE_ROWS) {
+            details = details.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    // The forget button makes the reading taller than the name;
+                    // centre both so they share a line.
+                    .items_center()
+                    .gap_3()
+                    .text_sm()
+                    .child(
+                        div()
+                            .truncate()
+                            .text_color(if device.connected { accent } else { muted })
+                            .child(device.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_none()
+                            .items_center()
+                            .gap_1()
+                            .child(known_device_text(device))
+                            .children((device.state == KnownDeviceState::Disconnected).then(
+                                || {
+                                    let id = device.id.clone();
+                                    Button::new(SharedString::from(format!("forget-{}", device.id)))
+                                        .ghost()
+                                        .compact()
+                                        .icon(IconName::Close)
+                                        .tooltip("Forget this mouse")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.forget_device(id.clone(), cx);
+                                        }))
+                                },
+                            )),
+                    ),
+            );
+        }
+        if known.len() > HOME_DEVICE_ROWS {
+            details = details.child(div().text_xs().text_color(muted).child(format!(
+                "+{} more remembered",
+                known.len() - HOME_DEVICE_ROWS
+            )));
+        }
+
+        let exit = self.exit.clone();
+        let mut content = div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .p_4()
+            .gap_3()
+            .child(self.title_bar("OpenMouse Bridge", false, true, accent, muted, cx))
+            .child(details);
+        if self.first_run_hint {
+            content = content.child(div().text_xs().text_color(muted).child(
+                "Bridge keeps running in the tray. Click its icon to open this panel again.",
+            ));
+        }
+        if self.offers_whats_new() {
+            content = content.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .text_sm()
+                    .child(
+                        div()
+                            .flex_1()
+                            .truncate()
+                            .child(format!("Updated to {}", env!("CARGO_PKG_VERSION"))),
+                    )
+                    .child(
+                        Button::new("home-whats-new")
+                            .compact()
+                            .label("What's new")
+                            .on_click(cx.listener(|this, _, _, cx| this.show_whats_new(cx))),
+                    )
+                    .child(
+                        Button::new("home-dismiss-whats-new")
+                            .ghost()
+                            .compact()
+                            .icon(IconName::Close)
+                            .tooltip("Dismiss")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.acknowledge_whats_new(cx);
+                            })),
+                    ),
+            );
+        }
+        if let Some(problem) = native_problem(snapshot) {
+            content = content.child(div().text_xs().text_color(cx.theme().danger).child(problem));
+        }
+        if hid_blocked(snapshot) {
+            content = content.child(self.hid_permissions_card(muted, line, fill, cx));
+        }
+        if let Some(headline) = self.update.headline(self.progress) {
+            let action = match &self.update {
+                UpdateState::Available(update) => {
+                    let update = update.clone();
+                    Some(
+                        Button::new("home-install-update")
+                            .primary()
+                            .compact()
+                            .label(install_label(&update))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.install_update(update.clone(), cx);
+                            })),
+                    )
+                }
+                UpdateState::Ready(version) => {
+                    let version = version.clone();
+                    Some(
+                        Button::new("home-apply-update")
+                            .primary()
+                            .compact()
+                            .label("Restart to update")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.apply_update(version.clone(), cx);
+                            })),
+                    )
+                }
+                UpdateState::Failed(_) => Some(
+                    Button::new("home-retry-update")
+                        .compact()
+                        .label("Retry")
+                        .on_click(cx.listener(|this, _, _, cx| this.check_for_updates(cx))),
+                ),
+                _ => None,
+            };
+            let percent = match (&self.update, self.progress) {
+                (UpdateState::Downloading(_), Some(progress)) if !progress.is_complete() => {
+                    progress
+                        .fraction()
+                        .map(|fraction| format!("{}%", (fraction * 100.0) as u32))
+                }
+                _ => None,
+            };
+            let mut notice = card(line, fill).child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .items_center()
+                    .gap_3()
+                    .text_sm()
+                    .child(div().flex_1().truncate().child(headline))
+                    .children(
+                        (matches!(
+                            self.update,
+                            UpdateState::Available(_) | UpdateState::Ready(_)
+                        ) && self.incoming_notes.is_some())
+                        .then(|| {
+                            Button::new("home-update-notes")
+                                .ghost()
+                                .compact()
+                                .label("Notes")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.show_view(View::WhatsNew, cx);
+                                }))
+                        }),
+                    )
+                    .children(action)
+                    .children(
+                        percent.map(|percent| div().flex_none().text_color(muted).child(percent)),
+                    ),
+            );
+            if self.update.shows_bar() {
+                // Downloading shows how far; the checks after the last byte,
+                // and the restart, have no length to show.
+                let fraction = match (&self.update, self.progress) {
+                    (UpdateState::Downloading(_), Some(progress)) if !progress.is_complete() => {
+                        progress.fraction()
+                    }
+                    _ => None,
+                };
+                notice = notice.child(progress_bar(fraction, accent, line));
+            }
+            if let UpdateState::Failed(error) = &self.update {
+                notice = notice.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().danger)
+                        .child(error.clone()),
+                );
+            }
+            content = content.child(notice);
+        }
+        content.child(div().flex_1()).child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .child(
+                    Button::new("open-openmouse")
+                        .primary()
+                        .compact()
+                        .label("Open OpenMouse")
+                        .on_click(cx.listener(|_, _, _, cx| {
+                            cx.open_url(OPENMOUSE_URL);
+                        })),
+                )
+                .child(
+                    Button::new("restart")
+                        .compact()
+                        .label("Restart")
+                        .on_click(cx.listener(move |_, _, _, cx| exit.restart(cx))),
+                )
+                .child(
+                    Button::new("quit")
+                        .ghost()
+                        .compact()
+                        .label("Quit")
+                        .on_click(cx.listener(|this, _, _, cx| this.exit.quit(cx))),
+                ),
+        )
+    }
+
+    /// Home's card for mice Bridge may not open: what is wrong, a button that
+    /// installs the udev rule, and when that fails, the terminal command.
+    fn hid_permissions_card(
+        &self,
+        muted: Hsla,
+        line: Hsla,
+        fill: Hsla,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let running = matches!(self.udev_fix, UdevFix::Running(_));
+        let mut card = card(line, fill)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .items_center()
+                    .gap_3()
+                    .text_sm()
+                    .child(div().truncate().child("Mouse access is blocked"))
+                    .child(
+                        Button::new("fix-hid-permissions")
+                            .primary()
+                            .compact()
+                            .label(if running { "Waiting…" } else { "Fix permissions" })
+                            .disabled(running)
+                            .on_click(cx.listener(|this, _, _, cx| this.fix_hid_permissions(cx))),
+                    ),
+            )
+            .child(div().text_xs().text_color(muted).child(
+                "Linux needs a udev rule to let Bridge open supported mice. Fixing it asks for your password once.",
+            ));
+        if let UdevFix::Failed { error, command } = &self.udev_fix {
+            card = card.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .child(error.clone()),
+            );
+            if let Some(command) = command.clone() {
+                card = card.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(div().flex_1().truncate().child("Or run it in a terminal"))
+                        .child(
+                            Button::new("copy-udev-command")
+                                .ghost()
+                                .compact()
+                                .icon(IconName::Copy)
+                                .label("Copy command")
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        command.clone(),
+                                    ));
+                                }),
+                        ),
+                );
+            }
+        }
+        card
+    }
+
+    fn settings(
+        &self,
+        muted: Hsla,
+        accent: Hsla,
+        line: Hsla,
+        fill: Hsla,
+        danger: Hsla,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let content = div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .p_4()
+            .gap_3()
+            .child(self.title_bar("Settings", true, false, accent, muted, cx));
+        // The title bar stays put; everything below it scrolls, so the panel
+        // fits a short screen.
+        let mut body = div()
+            .id("settings-body")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .gap_3()
+            .overflow_y_scroll()
+            .child(
+                card(line, fill)
+                    .child(switch_row(
+                        "Run on start",
+                        Switch::new("autostart")
+                            .checked(self.autostart)
+                            .on_change(cx.listener(|this, enabled: &bool, _, cx| {
+                                this.set_autostart(*enabled, cx);
+                            })),
+                    ))
+                    .child(switch_row(
+                        "Hybrid mode",
+                        Switch::new("hybrid-mode")
+                            .checked(self.hybrid_mode)
+                            .on_change(cx.listener(|this, enabled: &bool, _, cx| {
+                                this.set_hybrid_mode(*enabled, cx);
+                            })),
+                    ))
+                    .child(div().text_xs().text_color(muted).child(
+                        "While OpenMouse is closed, Bridge applies the active profile \
+                         and reads the battery itself.",
+                    )),
+            )
+            .child(
+                card(line, fill)
+                    .child(switch_row(
+                        "Tray icon",
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_1()
+                            .child(self.style_button(
+                                "style-glyph",
+                                "Battery",
+                                TrayBatteryStyle::Glyph,
+                                cx,
+                            ))
+                            .child(self.style_button(
+                                "style-percentage",
+                                "Number",
+                                TrayBatteryStyle::Percentage,
+                                cx,
+                            )),
+                    ))
+                    .child(switch_row(
+                        "Low battery alert",
+                        stepper(
+                            "threshold",
+                            format!("{}%", self.battery_threshold),
+                            cx.listener(|this, _, _, cx| this.step_battery_threshold(-1, cx)),
+                            cx.listener(|this, _, _, cx| this.step_battery_threshold(1, cx)),
+                        ),
+                    ))
+                    .child(switch_row(
+                        "Notification sound",
+                        Switch::new("notification-sound")
+                            .checked(self.notification_sound)
+                            .on_change(cx.listener(|this, enabled: &bool, _, cx| {
+                                this.set_notification_sound(*enabled, cx);
+                            })),
+                    ))
+                    .child(switch_row(
+                        "Volume",
+                        stepper(
+                            "volume",
+                            format!("{}%", self.notification_volume),
+                            cx.listener(|this, _, _, cx| this.step_notification_volume(false, cx)),
+                            cx.listener(|this, _, _, cx| this.step_notification_volume(true, cx)),
+                        ),
+                    )),
+            );
+
+        let mut updates = card(line, fill)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .items_center()
+                    .text_sm()
+                    .child("Update automatically")
+                    .child(
+                        Switch::new("automatic-updates")
+                            .checked(self.automatic_updates)
+                            .on_change(cx.listener(|this, enabled: &bool, _, cx| {
+                                this.set_automatic_updates(*enabled, cx);
+                            })),
+                    ),
+            )
+            .child(
+                div().flex().flex_row().items_center().gap_2().child(
+                    Button::new("check-updates")
+                        .compact()
+                        .label("Check for updates")
+                        .loading(self.update.busy())
+                        .disabled(self.update.busy())
+                        .on_click(cx.listener(|this, _, _, cx| this.check_for_updates(cx))),
+                ),
+            );
+        if let UpdateState::Available(update) = self.update.clone() {
+            updates = updates.child(
+                Button::new("install-update")
+                    .primary()
+                    .compact()
+                    .label(format!("{} {}", install_label(&update), update.version))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.install_update(update.clone(), cx);
+                    })),
+            );
+        }
+        if let UpdateState::Ready(version) = self.update.clone() {
+            updates = updates.child(
+                Button::new("apply-update")
+                    .primary()
+                    .compact()
+                    .label("Restart to update")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.apply_update(version.clone(), cx);
+                    })),
+            );
+        }
+        if self.update.shows_bar() {
+            let fraction = match (&self.update, self.progress) {
+                (UpdateState::Downloading(_), Some(progress)) if !progress.is_complete() => {
+                    progress.fraction()
+                }
+                _ => None,
+            };
+            updates = updates.child(progress_bar(fraction, accent, line));
+        }
+        if let Some(text) = self.update.text(self.progress) {
+            updates = updates.child(div().text_xs().text_color(muted).child(text.clone()));
+        }
+        body = body.child(updates).child(
+            card(line, fill)
+                .child(
+                    Button::new("test-notification")
+                        .ghost()
+                        .compact()
+                        .icon(IconName::Bell)
+                        .label("Test notification")
+                        .on_click(cx.listener(|this, _, _, cx| this.test_notification(cx))),
+                )
+                .child(
+                    Button::new("open-logs")
+                        .ghost()
+                        .compact()
+                        .icon(IconName::FileText)
+                        .label("Open logs")
+                        .on_click(cx.listener(|this, _, _, cx| this.open_logs(cx))),
+                )
+                .child(
+                    Button::new("info")
+                        .ghost()
+                        .compact()
+                        .icon(IconName::Info)
+                        .label("OpenMouse Bridge info")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.show_view(View::Info, cx);
+                        })),
+                ),
+        );
+        if let Some(error) = &self.error {
+            body = body.child(div().text_xs().text_color(danger).child(error.clone()));
+        }
+        content.child(body)
+    }
+
+    /// One of the tray icon's two styles, highlighted while it is the chosen one.
+    fn style_button(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        style: TrayBatteryStyle,
+        cx: &mut Context<Self>,
+    ) -> Button {
+        let button = Button::new(id).compact().label(label);
+        let button = if self.tray_style == style {
+            button.primary()
+        } else {
+            button.ghost()
+        };
+        button.on_click(cx.listener(move |this, _, _, cx| this.set_tray_style(style, cx)))
+    }
+
+    fn info(
+        &self,
+        muted: Hsla,
+        accent: Hsla,
+        line: Hsla,
+        fill: Hsla,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let snapshot = self.snapshot.as_ref();
+        let platform_text = match snapshot.and_then(|snapshot| snapshot.linux_distribution.clone())
+        {
+            Some(distribution) => format!("{} · {distribution}", platform::platform_name()),
+            None => platform::platform_name().to_owned(),
+        };
+        let path_text = |path: anyhow::Result<std::path::PathBuf>| {
+            path.map(|path| path.display().to_string())
+                .unwrap_or_else(|_| "unavailable".into())
+        };
+        let mut details = card(line, fill)
+            .child(row(muted, "Version", env!("CARGO_PKG_VERSION")))
+            .child(row(muted, "Platform", platform_text))
+            .child(row(muted, "Address", format!("127.0.0.1:{BRIDGE_PORT}")));
+        if let Some(snapshot) = snapshot {
+            details = details
+                .child(row(
+                    muted,
+                    "Running for",
+                    format_uptime(snapshot.uptime_seconds),
+                ))
+                .child(row(
+                    muted,
+                    "Control panel",
+                    if snapshot.client_connected {
+                        "Connected"
+                    } else {
+                        "Not connected"
+                    },
+                ))
+                .child(row(muted, "Device mode", snapshot.device_mode.clone()))
+                .child(row(muted, "Profiles", snapshot.profile_count.to_string()))
+                .child(row(
+                    muted,
+                    "Remembered mice",
+                    snapshot.known_devices.len().to_string(),
+                ));
+        }
+        details = details
+            .child(row(muted, "Config", path_text(config::config_path())))
+            .child(row(muted, "Logs", path_text(config::log_dir())));
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .p_4()
+            .gap_3()
+            .child(self.title_bar("Bridge info", true, false, accent, muted, cx))
+            .child(details)
+            .child(
+                div().flex().flex_row().child(
+                    Button::new("info-whats-new")
+                        .ghost()
+                        .compact()
+                        .icon(IconName::Info)
+                        .label("What's new")
+                        .on_click(cx.listener(|this, _, _, cx| this.show_whats_new(cx))),
+                ),
+            )
+    }
+
+    /// The release notes: the update on offer first, when there is one, then
+    /// every entry of the built-in changelog, newest first.
+    fn whats_new(&self, muted: Hsla, accent: Hsla, cx: &mut Context<Self>) -> Div {
+        let current = env!("CARGO_PKG_VERSION");
+        let section = |id: String, heading: String, notes: SharedString| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(heading),
+                )
+                .child(div().text_sm().child(TextView::markdown(id, notes)))
+        };
+        let mut notes = div()
+            .id("whats-new-notes")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .gap_4()
+            .pr_2()
+            .overflow_y_scroll();
+        if let Some((version, incoming)) = &self.incoming_notes
+            && version != current
+        {
+            notes = notes.child(section(
+                "notes-incoming".into(),
+                format!("Coming in {version}"),
+                incoming.clone().into(),
+            ));
+        }
+        let entries = changelog::entries(changelog::CHANGELOG);
+        if entries.is_empty() {
+            notes = notes.child(div().text_sm().text_color(muted).child("No release notes."));
+        }
+        for entry in entries {
+            let heading = if entry.version == current {
+                format!("{} · installed", entry.version)
+            } else {
+                entry.version.to_owned()
+            };
+            notes = notes.child(section(
+                format!("notes-{}", entry.version),
+                heading,
+                SharedString::new_static(entry.body),
+            ));
+        }
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .p_4()
+            .gap_3()
+            .child(self.title_bar("What's new", true, false, accent, muted, cx))
+            .child(notes)
+    }
+}
+
+impl Render for PanelView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (muted, accent, foreground, danger) = (
+            theme.muted_foreground,
+            theme.primary,
+            theme.foreground,
+            theme.danger,
+        );
+        let line = Hsla {
+            a: 0.7,
+            ..theme.border
+        };
+        let fill = Hsla {
+            a: 0.35,
+            ..theme.sidebar
+        };
+        // Keep the window as tall as its content so nothing is clipped.
+        let desired = self.desired_height();
+        if (window.viewport_size().height.as_f32() - desired).abs() > 1.0 {
+            window.resize(size(px(WINDOW_WIDTH), px(desired)));
+            super::tray::keep_on_screen(window, desired);
+        }
+        let field = self.field.element(window, cx);
+        let content = match self.view {
+            View::Home => self.home(muted, accent, line, fill, cx),
+            View::Settings => self.settings(muted, accent, line, fill, danger, cx),
+            View::Info => self.info(muted, accent, line, fill, cx),
+            View::WhatsNew => self.whats_new(muted, accent, cx),
+        };
+        // The ASCII field sits behind the content; the window's own Root paints
+        // the background, so this shell stays clear.
+        // Escape hides the panel to the tray, where there is one. The panel
+        // takes focus whenever it is drawn and does not have it.
+        if !self.focus.is_focused(window) {
+            window.focus(&self.focus, cx);
+        }
+        div()
+            .relative()
+            .size_full()
+            .text_color(foreground)
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(|_, event: &KeyDownEvent, window, _| {
+                if event.keystroke.key == "escape" && super::tray::can_hide() {
+                    super::tray::hide(window);
+                }
+            }))
+            .child(field)
+            .child(content)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `use super::*`: that pulls in GPUI's own `test` macro, which shadows
+    // `#[test]`.
+    use super::{UpdateState, offered_notes, step_threshold, step_volume};
+    use crate::runtime::UpdateEvent;
+
+    #[test]
+    fn the_alert_level_steps_along_the_offered_list() {
+        assert_eq!(step_threshold(20, 1), 25);
+        assert_eq!(step_threshold(20, -1), 15);
+        assert_eq!(step_threshold(10, -1), 10, "stops at the lowest");
+        assert_eq!(step_threshold(50, 1), 50, "stops at the highest");
+        assert_eq!(step_threshold(30, 1), 40, "the list is uneven past 30");
+    }
+
+    #[test]
+    fn a_stored_level_off_the_list_steps_from_the_nearest() {
+        assert_eq!(step_threshold(22, 1), 25, "22 is nearest 20, so up is 25");
+        assert_eq!(step_threshold(100, -1), 40, "above the list counts as 50");
+        assert_eq!(step_threshold(0, 1), 15, "below the list counts as 10");
+    }
+
+    #[test]
+    fn the_volume_moves_by_ten_and_stays_in_range() {
+        assert_eq!(step_volume(60, true), 70);
+        assert_eq!(step_volume(60, false), 50);
+        assert_eq!(step_volume(95, true), 100);
+        assert_eq!(step_volume(100, true), 100);
+        assert_eq!(step_volume(5, false), 0);
+        assert_eq!(step_volume(0, false), 0);
+    }
+
+    fn state(event: UpdateEvent) -> UpdateState {
+        UpdateState::from_event(event)
+    }
+
+    #[test]
+    fn every_offer_replaces_the_notes_and_other_events_keep_them() {
+        assert_eq!(
+            offered_notes(&UpdateEvent::Notes("1.0.1".into(), "- Fix".into())),
+            Some(Some(("1.0.1".into(), "- Fix".into())))
+        );
+        // An offer without notes clears an earlier version's.
+        assert_eq!(
+            offered_notes(&UpdateEvent::Notes("1.0.2".into(), "  ".into())),
+            Some(None)
+        );
+        assert_eq!(offered_notes(&UpdateEvent::Ready("1.0.1".into())), None);
+        assert_eq!(offered_notes(&UpdateEvent::Checking), None);
+    }
+
+    #[test]
+    fn only_work_in_progress_is_busy() {
+        assert!(state(UpdateEvent::Checking).busy());
+        assert!(state(UpdateEvent::Downloading("2.0.0".into())).busy());
+        assert!(state(UpdateEvent::Restarting("2.0.0".into())).busy());
+        assert!(!UpdateState::Idle.busy());
+        assert!(!state(UpdateEvent::UpToDate).busy());
+        assert!(!state(UpdateEvent::Failed("no network".into())).busy());
+    }
+
+    #[test]
+    fn home_gets_a_card_for_updates_that_need_attention_only() {
+        assert!(!UpdateState::Idle.is_notice());
+        assert!(!state(UpdateEvent::Checking).is_notice());
+        assert!(!state(UpdateEvent::UpToDate).is_notice());
+        assert!(state(UpdateEvent::Downloading("2.0.0".into())).is_notice());
+        assert!(state(UpdateEvent::Restarting("2.0.0".into())).is_notice());
+        assert!(state(UpdateEvent::Failed("no network".into())).is_notice());
+        let ready = state(UpdateEvent::Ready("2.0.0".into()));
+        assert!(ready.is_notice() && !ready.busy() && !ready.shows_bar());
+        assert_eq!(
+            ready.headline(None).as_deref(),
+            Some("Update 2.0.0 is ready")
+        );
+    }
+
+    #[test]
+    fn the_texts_name_the_version_and_the_failure() {
+        assert_eq!(UpdateState::Idle.text(None), None);
+        assert_eq!(
+            state(UpdateEvent::UpToDate).text(None).as_deref(),
+            Some("Bridge is up to date")
+        );
+        assert_eq!(
+            state(UpdateEvent::Downloading("2.0.0".into()))
+                .headline(None)
+                .as_deref(),
+            Some("Downloading 2.0.0…")
+        );
+        assert_eq!(
+            state(UpdateEvent::Restarting("2.0.0".into()))
+                .headline(None)
+                .as_deref(),
+            Some("Restarting into 2.0.0…")
+        );
+        let failed = state(UpdateEvent::Failed("no network".into()));
+        assert_eq!(failed.headline(None).as_deref(), Some("Update failed"));
+        assert_eq!(
+            failed.text(None).as_deref(),
+            Some("Update failed: no network")
+        );
+        assert_eq!(state(UpdateEvent::Checking).headline(None), None);
+    }
+}

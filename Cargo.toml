@@ -1,6 +1,6 @@
 [package]
 name = "openmouse-bridge"
-version = "1.0.0-beta.21"
+version = "1.0.0"
 edition = "2024"
 description = "Local native HID and desktop companion for the OpenMouse control panel"
 license = "MIT"
@@ -31,25 +31,38 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zip = { version = "9.0", default-features = false, features = ["deflate"] }
 
 [target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
-eframe = { version = "0.36.1", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
-# The profile-switch overlay draws its banner on the CPU with the same font
-# stack egui already builds (skrifa outlines, vello_cpu rasterizer).
+# The window is GPUI; see docs/gpui-migration.md.
+gpui-kit = "0.7"
+# Native handles for panel hide/restore operations on each desktop backend.
+raw-window-handle = "0.6"
+# The profile-switch overlay draws its banner on the CPU: skrifa outlines, the
+# vello_cpu rasterizer, and epaint_default_fonts for fallback glyphs.
 epaint_default_fonts = "0.36.1"
 skrifa = { version = "0.44", default-features = false, features = ["std"] }
 vello_cpu = { version = "0.1", default-features = false, features = ["std", "u8_pipeline"] }
-# No libxdo: tray-icon's default features link libxdo (via muda) for the
-# predefined Copy/Cut/Paste/SelectAll menu items, which Bridge never uses
-# (desktop.rs only builds plain MenuItems). The gtk feature alone keeps the
-# AppIndicator menu working and removes the libxdo.so.3 runtime requirement,
-# which Arch/CachyOS cannot satisfy (their xdotool ships libxdo.so.4).
-tray-icon = { version = "0.24.2", default-features = false, features = ["gtk"] }
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+# No default features: they link libxdo (via muda) for menu items Bridge never
+# uses. Linux uses the D-Bus StatusNotifierItem backend below instead.
+tray-icon = { version = "0.24.2", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# tray-icon's GTK menu needs gtk::init() on the main thread before it is built.
-gtk = "0.18"
-# X11 overlay banner and foreground-window lookup. Pure Rust; no system
-# libraries beyond what eframe/tray-icon already require.
+# Pure Rust StatusNotifierItem/DBusMenu; no GTK loop or AppIndicator shared libraries.
+# Match GPUI's zbus runtime; enabling zbus/tokio would affect its smol tasks.
+ksni = { version = "0.3.7", default-features = false, features = ["blocking", "async-io"] }
+# X11 overlay banner and foreground-window lookup. Pure Rust, no system
+# libraries.
 x11rb = "0.13"
+# KWin focus reports on Plasma Wayland (src/kwin_focus.rs). Already in the tree
+# through GPUI; same async-io runtime, plus the blocking API.
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+# Hands the tray host's XDG activation token to the compositor for GPUI's
+# Wayland surface: GPUI's own activate requests are rejected, so a tray click
+# could not un-minimize the panel. client_system shares GPUI's libwayland
+# display; both crates are already in GPUI's tree.
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 # Virtual keyboard and mouse for the button listener (/dev/uinput).
 libc = "0.2"
 
@@ -60,6 +73,7 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
   "NSBitmapImageRep",
   "NSColor",
   "NSControl",
+  "NSEvent",
   "NSGraphics",
   "NSImage",
   "NSImageRep",
@@ -95,9 +109,22 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+# Exercise the D-Bus backend's pixels and command routing on every CI host.
+ksni = { version = "0.3.7", default-features = false, features = ["blocking", "async-io"] }
+# Type-check the Linux tray's X11 restore request on every CI host too.
+x11rb = "0.13"
 tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 # Keeps the binary small: the bridge package the older updaters download has to
 # compress under their 16 MiB archive-metadata budget.
 strip = true
+
+[patch.crates-io]
+# Keep GPUI 0.3.9; correct source-over alpha in its macOS Metal compositor.
+# Same patch OpenMouse Desktop carries (vendored from there).
+gpui-pre-apple = { path = "vendor/gpui-pre-apple" }
+# Keep GPUI 0.3.9; report server decorations for Wayland layer-shell surfaces,
+# which otherwise shrink below their buffer (see the patch note in
+# vendor/gpui-pre-linux/src/linux/wayland/window.rs).
+gpui-pre-linux = { path = "vendor/gpui-pre-linux" }

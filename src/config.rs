@@ -21,7 +21,8 @@ pub struct BridgeConfig {
     pub battery_threshold_percent: u8,
     #[serde(default = "default_alert_cooldown")]
     pub alert_cooldown_minutes: u64,
-    #[serde(default)]
+    /// On unless turned off: new installs keep themselves up to date.
+    #[serde(default = "enabled_by_default")]
     pub automatic_updates: bool,
     /// Whether the on-screen banner plays a chime, and how loud (0–100).
     #[serde(default = "enabled_by_default")]
@@ -61,6 +62,10 @@ pub struct BridgeConfig {
     /// after that; the first launch opens the panel so a window actually appears.
     #[serde(default)]
     pub tray_hint_shown: bool,
+    /// The Bridge version whose "What's new" the user has seen or dismissed.
+    /// Home offers it after an update until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whats_new_seen: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -192,7 +197,7 @@ impl Default for BridgeConfig {
         Self {
             battery_threshold_percent: DEFAULT_BATTERY_THRESHOLD,
             alert_cooldown_minutes: DEFAULT_ALERT_COOLDOWN_MINUTES,
-            automatic_updates: false,
+            automatic_updates: true,
             notification_sound: true,
             notification_volume: DEFAULT_NOTIFICATION_VOLUME,
             tray_battery_style: default_tray_battery_style(),
@@ -205,6 +210,7 @@ impl Default for BridgeConfig {
             allowed_origins: default_origins(),
             autostart_configured: false,
             tray_hint_shown: false,
+            whats_new_seen: None,
         }
     }
 }
@@ -261,6 +267,11 @@ impl BridgeConfig {
             if !self.allowed_origins.iter().any(|entry| entry == origin) {
                 self.allowed_origins.push((*origin).to_owned());
             }
+        }
+        // Earlier releases saved the dev origins as defaults; drop them again.
+        if !cfg!(debug_assertions) {
+            self.allowed_origins
+                .retain(|origin| !DEV_ORIGINS.contains(&origin.as_str()));
         }
         self.allowed_origins.sort();
         self.allowed_origins.dedup();
@@ -392,7 +403,14 @@ pub async fn load_with_catalog() -> Result<(BridgeConfig, PathBuf)> {
     Ok((config, path))
 }
 
-pub fn save(path: &PathBuf, config: &BridgeConfig) -> Result<()> {
+pub fn save(path: &std::path::Path, config: &BridgeConfig) -> Result<()> {
+    let json = serde_json::to_vec_pretty(config)?;
+    write_atomically(path, &json)
+}
+
+/// Writes `bytes` to `path` through a temporary file and a rename, so a reader
+/// never sees a truncated file. Creates the parent directory when needed.
+pub(crate) fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     use std::{
         io::Write,
         sync::atomic::{AtomicU64, Ordering},
@@ -403,7 +421,6 @@ pub fn save(path: &PathBuf, config: &BridgeConfig) -> Result<()> {
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
     fs::create_dir_all(parent).with_context(|| format!("could not create {}", parent.display()))?;
-    let json = serde_json::to_vec_pretty(config)?;
     let name = path
         .file_name()
         .context("config path has no filename")?
@@ -419,7 +436,7 @@ pub fn save(path: &PathBuf, config: &BridgeConfig) -> Result<()> {
         .open(&temporary)
         .with_context(|| format!("could not create {}", temporary.display()))?;
     let result: std::io::Result<()> = (|| {
-        file.write_all(&json)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
         fs::rename(&temporary, path)?;
@@ -447,15 +464,20 @@ fn default_tray_battery_style() -> String {
     "glyph".to_owned()
 }
 
+/// The control panel's local dev server (Vite). Trusted only by debug builds:
+/// in a release build any page on that port, from any program or account on
+/// the machine, would get the whole API and raw HID.
+const DEV_ORIGINS: &[&str] = &["http://localhost:5173", "http://127.0.0.1:5173"];
+
 fn default_origins() -> Vec<String> {
-    vec![
-        "https://control.openmouse.app".to_owned(),
-        "https://dev.openmouse.app".to_owned(),
-        "https://openmouse.app".to_owned(),
-        "https://www.openmouse.app".to_owned(),
-        "http://localhost:5173".to_owned(),
-        "http://127.0.0.1:5173".to_owned(),
-    ]
+    let mut origins: Vec<String> = OFFICIAL_ORIGINS
+        .iter()
+        .map(|&origin| origin.to_owned())
+        .collect();
+    if cfg!(debug_assertions) {
+        origins.extend(DEV_ORIGINS.iter().map(|&origin| origin.to_owned()));
+    }
+    origins
 }
 
 #[cfg(test)]
@@ -593,6 +615,15 @@ mod tests {
     }
 
     #[test]
+    fn automatic_updates_are_on_unless_turned_off() {
+        assert!(BridgeConfig::default().automatic_updates);
+        let missing: BridgeConfig = serde_json::from_str("{}").unwrap();
+        assert!(missing.automatic_updates);
+        let off: BridgeConfig = serde_json::from_str(r#"{"automaticUpdates": false}"#).unwrap();
+        assert!(!off.automatic_updates);
+    }
+
+    #[test]
     fn normalization_clamps_threshold_and_cleans_executables() {
         let config = BridgeConfig {
             battery_threshold_percent: 140,
@@ -613,6 +644,7 @@ mod tests {
             local_applications: Vec::new(),
             autostart_configured: false,
             tray_hint_shown: false,
+            whats_new_seen: None,
         }
         .normalized();
         assert_eq!(config.battery_threshold_percent, 100);
@@ -630,6 +662,35 @@ mod tests {
                 .allowed_origins
                 .iter()
                 .any(|origin| origin == "https://control.openmouse.app")
+        );
+    }
+
+    #[test]
+    fn only_debug_builds_trust_the_dev_server() {
+        let saved = BridgeConfig {
+            allowed_origins: DEV_ORIGINS
+                .iter()
+                .map(|&origin| origin.to_owned())
+                .chain(["https://example.test".to_owned()])
+                .collect(),
+            ..BridgeConfig::default()
+        }
+        .normalized();
+        for origins in [&saved.allowed_origins, &default_origins()] {
+            for dev in DEV_ORIGINS {
+                assert_eq!(
+                    origins.iter().any(|origin| origin == dev),
+                    cfg!(debug_assertions),
+                    "{dev} in {origins:?}"
+                );
+            }
+        }
+        assert!(
+            saved
+                .allowed_origins
+                .iter()
+                .any(|origin| origin == "https://example.test"),
+            "an origin the user added stays"
         );
     }
 

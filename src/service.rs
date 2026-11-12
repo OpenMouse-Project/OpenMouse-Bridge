@@ -15,6 +15,7 @@ use tokio::sync::RwLock;
 use crate::{
     applications::{self, ApplicationInfo},
     config::{self, ApplicationProfile, BridgeConfig, GameConfig, LocalApplication},
+    devices::{self, DeviceStore, KnownDevice},
     drivers,
     games::GameDetector,
     platform,
@@ -105,12 +106,28 @@ const PROFILE_DEBOUNCE: Duration = Duration::from_millis(2500);
 /// without the control panel open. Each read spawns the native-hid helper.
 const BATTERY_POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
+/// How often the HID bus is listed to see which mice are plugged in. One scan
+/// is about 5 ms and opens no device, so this costs well under 0.1% of a core.
+const DEVICE_SCAN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How often an asleep mouse is read again, so it shows as connected soon
+/// after it wakes: its receiver stays plugged in, so the bus scan cannot tell.
+const ASLEEP_RECHECK: Duration = Duration::from_secs(60);
+
 /// A reading this old is shown as stale: more than two missed polls.
 const BATTERY_STALE_AFTER: Duration = Duration::from_secs(12 * 60);
 
 /// A reading this old belongs to a mouse that is gone, not just asleep: it is
 /// dropped from the list instead of lingering as a ghost device.
 const BATTERY_EVICT_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Battery readings held at once. Far above any real desk of mice; the oldest
+/// goes when a new device would pass it, so `PUT /v1/battery` with made-up
+/// ids cannot grow memory without bound.
+const MAX_BATTERY_ENTRIES: usize = 64;
+
+/// The longest device id, name or switch mode a control panel may report.
+const MAX_BATTERY_TEXT_BYTES: usize = 256;
 
 /// How many samples of each device's percent history are kept for the tray
 /// tooltip's time-remaining estimate.
@@ -454,6 +471,18 @@ fn switch_message(
     Some(switch)
 }
 
+/// What one native automation pass did, as published to the status snapshot.
+enum NativePass {
+    /// The pass reached the hardware; `error` replaces the published outcome.
+    Ran {
+        error: Option<String>,
+        pending: usize,
+    },
+    /// The control panel held the HID session, so nothing was sent and the
+    /// previous outcome stays published.
+    Deferred { pending: usize },
+}
+
 type PanelListener = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Clone)]
@@ -464,6 +493,18 @@ pub struct BridgeService {
     show_panel: Arc<std::sync::Mutex<Option<PanelListener>>>,
     buttons: Arc<crate::buttons::ButtonListener>,
     native_automation: Arc<std::sync::Mutex<crate::drivers::automation::NativeAutomation>>,
+    // Set while a battery poll runs, so two never overlap.
+    battery_polling: Arc<AtomicBool>,
+}
+
+/// Whether Home should offer this version's notes: Bridge has run before
+/// (the first-run hint was shown), this version's notes have not been seen,
+/// and the built-in changelog has some.
+fn whats_new_pending(config: &BridgeConfig) -> bool {
+    let version = env!("CARGO_PKG_VERSION");
+    config.tray_hint_shown
+        && config.whats_new_seen.as_deref() != Some(version)
+        && crate::changelog::notes_for(version).is_some()
 }
 
 /// A control panel is connected when it holds a HID WebSocket session or
@@ -485,6 +526,13 @@ struct BridgeState {
     running_applications: Vec<ApplicationInfo>,
     application_icons: HashMap<String, Option<Vec<u8>>>,
     battery: HashMap<String, BatteryState>,
+    // Every mouse seen so far, kept in devices.json across restarts.
+    known: DeviceStore,
+    // The mice on the HID bus at the last scan; `None` until the first scan.
+    detected: Option<Vec<drivers::DetectedMouse>>,
+    // Remembered mice whose receiver is plugged in but whose last native read
+    // went unanswered: asleep, switched off or out of range.
+    asleep: HashSet<String>,
     // Debounced active-profile tracking for switch notifications.
     active_profile_key: Option<String>,
     applied_profile: Option<ApplicationProfile>,
@@ -518,7 +566,7 @@ impl DeviceMode {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BatteryReading {
     pub device_id: String,
@@ -535,6 +583,13 @@ pub struct BatteryReading {
     pub polling_rate_hz: Option<u32>,
     #[serde(default)]
     pub switch_mode: Option<String>,
+    /// The device on the bus the reading came through (`KnownDevice::via`).
+    /// Bridge fills it in; a request body cannot set it.
+    #[serde(skip)]
+    pub via: Option<String>,
+    /// Bridge read the mouse itself, rather than a control panel reporting it.
+    #[serde(skip)]
+    pub native: bool,
 }
 
 struct BatteryState {
@@ -658,10 +713,117 @@ pub struct BridgeSnapshot {
     pub client_connected: bool,
     pub active_devices: Vec<ActiveDevice>,
     pub batteries: Vec<DeviceBattery>,
+    /// Every mouse Bridge has seen, connected or not, newest first. Unlike
+    /// `batteries` this survives restarts and includes mice with no battery
+    /// reader.
+    pub known_devices: Vec<KnownDeviceStatus>,
+    /// Linux: `/dev/hidraw*` nodes of supported USB mice this user cannot
+    /// open, because the udev rule is missing. Empty elsewhere.
+    pub blocked_hid_devices: Vec<String>,
+    /// Bridge was updated and the user has not seen this version's notes yet.
+    pub whats_new: bool,
+}
+
+/// A remembered mouse as the status view shows it.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KnownDeviceStatus {
+    pub id: String,
+    pub name: String,
+    /// `state` is `Connected`.
+    pub connected: bool,
+    pub state: KnownDeviceState,
+    pub last_seen_seconds_ago: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub percent: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub charging: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dpi: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub polling_rate_hz: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub switch_mode: Option<String>,
+}
+
+/// Whether a remembered mouse can be reached right now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum KnownDeviceState {
+    /// Its receiver (or the mouse itself) is plugged in, and it answers or
+    /// nothing says otherwise.
+    Connected,
+    /// Its receiver is plugged in, but the mouse did not answer the last read.
+    Asleep,
+    /// Neither the mouse nor its receiver is plugged in.
+    Disconnected,
+}
+
+/// The state of a remembered mouse. A mouse linked to a receiver is there
+/// when the receiver is; an older entry without that link falls back to the
+/// brand or model name matching something on the bus, other than a receiver
+/// a linked mouse already comes through.
+fn known_device_state(
+    device: &KnownDevice,
+    age: u64,
+    detected: Option<&[drivers::DetectedMouse]>,
+    claimed: &HashSet<&str>,
+    asleep: bool,
+) -> KnownDeviceState {
+    let present = match detected {
+        Some(detected) => detected.iter().any(|mouse| match &device.via {
+            Some(via) => mouse.device_id == *via,
+            None => {
+                mouse.device_id == device.id
+                    || (!claimed.contains(mouse.device_id.as_str())
+                        && is_same_mouse(&device.id, &device.name, mouse))
+            }
+        }),
+        // No scan yet (just started): fall back to how recent the last
+        // sighting is.
+        None => age < BATTERY_STALE_AFTER.as_secs(),
+    };
+    if !present {
+        KnownDeviceState::Disconnected
+    } else if asleep {
+        KnownDeviceState::Asleep
+    } else {
+        KnownDeviceState::Connected
+    }
+}
+
+/// Whether `device` is the receiver some other remembered mouse comes through.
+fn is_receiver_of_another(known: &[KnownDevice], device: &KnownDevice) -> bool {
+    known
+        .iter()
+        .any(|mouse| mouse.id != device.id && mouse.via.as_deref() == Some(device.id.as_str()))
+}
+
+/// The one device on the bus a control panel has open, which is where a
+/// battery it reports came from. `None` when it has none or several open:
+/// then the reading cannot be pinned to a receiver.
+fn panel_transport(open: &[(u16, u16)], detected: &[drivers::DetectedMouse]) -> Option<String> {
+    // A device the panel has open but the last scan missed could be where the
+    // reading came from.
+    let all_seen = open.iter().all(|(vendor_id, product_id)| {
+        detected
+            .iter()
+            .any(|mouse| mouse.vendor_id == *vendor_id && mouse.product_id == *product_id)
+    });
+    if !all_seen {
+        return None;
+    }
+    let mut ids = detected
+        .iter()
+        .filter(|mouse| open.contains(&(mouse.vendor_id, mouse.product_id)))
+        .map(|mouse| mouse.device_id.as_str());
+    let first = ids.next()?;
+    ids.all(|id| id == first).then(|| first.to_owned())
 }
 
 impl BridgeService {
     pub fn new(config: BridgeConfig, config_path: PathBuf) -> Self {
+        let known = DeviceStore::load(DeviceStore::path_for(&config_path));
         Self {
             inner: Arc::new(RwLock::new(BridgeState {
                 config,
@@ -671,6 +833,9 @@ impl BridgeService {
                 running_applications: Vec::new(),
                 application_icons: HashMap::new(),
                 battery: HashMap::new(),
+                known,
+                detected: None,
+                asleep: HashSet::new(),
                 active_profile_key: None,
                 applied_profile: None,
                 native_automation_error: None,
@@ -686,6 +851,7 @@ impl BridgeService {
             show_panel: Arc::default(),
             buttons: Arc::default(),
             native_automation: Arc::default(),
+            battery_polling: Arc::default(),
         }
     }
 
@@ -715,6 +881,20 @@ impl BridgeService {
         }
         self.update_config(|config| {
             config.tray_hint_shown = true;
+            // A first install has nothing new to announce.
+            config.whats_new_seen = Some(env!("CARGO_PKG_VERSION").into());
+            Ok(())
+        })
+        .await
+    }
+
+    /// Records that the user has seen, or dismissed, this version's notes.
+    pub async fn acknowledge_whats_new(&self) -> Result<()> {
+        if !whats_new_pending(&self.inner.read().await.config) {
+            return Ok(());
+        }
+        self.update_config(|config| {
+            config.whats_new_seen = Some(env!("CARGO_PKG_VERSION").into());
             Ok(())
         })
         .await
@@ -794,6 +974,43 @@ impl BridgeService {
             })
             .collect::<Vec<_>>();
         batteries.sort_by(|a, b| a.device_id.cmp(&b.device_id));
+        let now = devices::unix_now();
+        let claimed: HashSet<&str> = state
+            .known
+            .devices()
+            .iter()
+            .filter_map(|device| device.via.as_deref())
+            .collect();
+        let mut known_devices = state
+            .known
+            .devices()
+            .iter()
+            // A receiver another mouse comes through is shown as that mouse.
+            .filter(|device| !is_receiver_of_another(state.known.devices(), device))
+            .map(|device| {
+                let age = now.saturating_sub(device.last_seen);
+                let state = known_device_state(
+                    device,
+                    age,
+                    state.detected.as_deref(),
+                    &claimed,
+                    state.asleep.contains(&device.id),
+                );
+                KnownDeviceStatus {
+                    id: device.id.clone(),
+                    name: device.name.clone(),
+                    connected: state == KnownDeviceState::Connected,
+                    state,
+                    last_seen_seconds_ago: age,
+                    percent: device.percent,
+                    charging: device.charging,
+                    dpi: device.dpi,
+                    polling_rate_hz: device.polling_rate_hz,
+                    switch_mode: device.switch_mode.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        known_devices.sort_by_key(|device| device.last_seen_seconds_ago);
         let active_devices = crate::hid::active_devices()
             .into_iter()
             .map(|device| ActiveDevice {
@@ -869,6 +1086,9 @@ impl BridgeService {
             client_connected,
             active_devices,
             batteries,
+            known_devices,
+            blocked_hid_devices: crate::hid_access::blocked_devices(),
+            whats_new: whats_new_pending(&state.config),
         }
     }
 
@@ -1086,7 +1306,17 @@ impl BridgeService {
     /// Turns launch-at-login on the first time a release build runs; after
     /// that the user's choice stands. Debug builds never register themselves.
     pub async fn enable_autostart_once(&self) -> Result<()> {
-        if cfg!(debug_assertions) || self.inner.read().await.config.autostart_configured {
+        // A development build would point the login entry at target/.
+        if cfg!(debug_assertions) {
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        match platform::linux::repair_autostart() {
+            Ok(true) => tracing::info!("pointed the login entry at this Bridge"),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(%error, "could not check the login entry"),
+        }
+        if self.inner.read().await.config.autostart_configured {
             return Ok(());
         }
         platform::set_autostart(true)?;
@@ -1151,7 +1381,45 @@ impl BridgeService {
     /// Forgets a lingering battery entry so a dead device leaves the list.
     /// Returns whether an entry was removed.
     pub async fn forget_battery(&self, device_id: &str) -> bool {
-        self.inner.write().await.battery.remove(device_id).is_some()
+        let mut state = self.inner.write().await;
+        let live = state.battery.remove(device_id).is_some();
+        let remembered = state.known.forget(device_id);
+        if remembered {
+            save_known(&mut state.known);
+        }
+        live || remembered
+    }
+
+    /// Records a battery a control panel reported (`PUT /v1/battery`), linked
+    /// to the receiver the panel has open when that is a single device.
+    pub async fn record_panel_battery(&self, mut reading: BatteryReading) -> Result<bool> {
+        // A client names the device: keep what it can make Bridge hold small.
+        if reading.device_id.trim().is_empty()
+            || reading.device_id.len() > MAX_BATTERY_TEXT_BYTES
+            || reading.device_name.len() > MAX_BATTERY_TEXT_BYTES
+            || reading
+                .switch_mode
+                .as_ref()
+                .is_some_and(|mode| mode.len() > MAX_BATTERY_TEXT_BYTES)
+        {
+            return Err(crate::local_targets::InvalidInput(format!(
+                "deviceId must be set, and deviceId, deviceName and switchMode at most {MAX_BATTERY_TEXT_BYTES} bytes"
+            ))
+            .into());
+        }
+        let open: Vec<(u16, u16)> = crate::hid::active_devices()
+            .iter()
+            .map(|device| (device.vendor_id, device.product_id))
+            .collect();
+        reading.via = self
+            .inner
+            .read()
+            .await
+            .detected
+            .as_deref()
+            .and_then(|detected| panel_transport(&open, detected));
+        reading.native = false;
+        self.record_battery(reading).await
     }
 
     pub async fn record_battery(&self, reading: BatteryReading) -> Result<bool> {
@@ -1180,6 +1448,19 @@ impl BridgeService {
             let (previous_dpi, previous_rate, previous_mode) = previous
                 .map(|entry| (entry.dpi, entry.polling_rate_hz, entry.switch_mode.clone()))
                 .unwrap_or((None, None, None));
+            if !state.battery.contains_key(&reading.device_id) {
+                while state.battery.len() >= MAX_BATTERY_ENTRIES {
+                    let Some(oldest) = state
+                        .battery
+                        .iter()
+                        .min_by_key(|(_, entry)| entry.updated_at)
+                        .map(|(id, _)| id.clone())
+                    else {
+                        break;
+                    };
+                    state.battery.remove(&oldest);
+                }
+            }
             state.battery.insert(
                 reading.device_id.clone(),
                 BatteryState {
@@ -1198,6 +1479,50 @@ impl BridgeService {
                     history,
                 },
             );
+            let entry = &state.battery[&reading.device_id];
+            let update = KnownDevice {
+                id: reading.device_id.clone(),
+                name: reading.device_name.clone(),
+                last_seen: devices::unix_now(),
+                percent: Some(entry.percent),
+                charging: Some(entry.charging),
+                dpi: entry.dpi,
+                polling_rate_hz: entry.polling_rate_hz,
+                switch_mode: entry.switch_mode.clone(),
+                via: reading.via.clone(),
+                native: reading.native,
+            };
+            state.asleep.remove(&reading.device_id);
+            // The receiver it came through is not a mouse of its own.
+            // Only a row the scan added: a device that was ever read has a
+            // reading of its own and is not just this mouse's receiver.
+            let forgot_receiver = reading
+                .via
+                .as_ref()
+                .filter(|via| **via != reading.device_id)
+                .filter(|via| {
+                    state
+                        .known
+                        .devices()
+                        .iter()
+                        .any(|device| device.id == **via && device.percent.is_none())
+                })
+                .is_some_and(|via| state.known.forget(via));
+            // A reading names the mouse: drop a scan-shaped entry for it.
+            let duplicates: Vec<String> = state
+                .known
+                .devices()
+                .iter()
+                .filter(|device| device.id != update.id && names_match(&device.name, &update.name))
+                .map(|device| device.id.clone())
+                .collect();
+            for id in duplicates {
+                state.known.forget(&id);
+            }
+            remember_known(&mut state.known, update);
+            if forgot_receiver {
+                save_known(&mut state.known);
+            }
             should_alert
         };
         if alert {
@@ -1223,7 +1548,53 @@ impl BridgeService {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
-                poll_batteries_once(service.clone()).await;
+                poll_batteries(service.clone()).await;
+            }
+        });
+        self.start_device_scanner();
+    }
+
+    /// Lists the HID bus every few seconds to keep the connected state of the
+    /// remembered mice current, and reads a battery right away when a mouse
+    /// appears instead of waiting for the next poll.
+    fn start_device_scanner(&self) {
+        let service = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(DEVICE_SCAN_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut previous: Option<HashSet<String>> = None;
+            let mut last_recheck = Instant::now();
+            loop {
+                interval.tick().await;
+                let detected = tokio::task::spawn_blocking(drivers::detect_mice)
+                    .await
+                    .unwrap_or_default();
+                let ids: HashSet<String> = detected
+                    .iter()
+                    .map(|mouse| mouse.device_id.clone())
+                    .collect();
+                let appeared = previous
+                    .as_ref()
+                    .is_some_and(|before| ids.iter().any(|id| !before.contains(id)));
+                let recheck = {
+                    let mut state = service.inner.write().await;
+                    remember_detected(&mut state.known, &detected);
+                    // A mouse whose receiver left is disconnected, not asleep.
+                    let BridgeState { known, asleep, .. } = &mut *state;
+                    asleep.retain(|id| {
+                        known.devices().iter().any(|device| {
+                            device.id == *id
+                                && device.via.as_ref().is_none_or(|via| ids.contains(via))
+                        })
+                    });
+                    state.detected = Some(detected);
+                    !state.asleep.is_empty() && last_recheck.elapsed() >= ASLEEP_RECHECK
+                };
+                if appeared || recheck {
+                    last_recheck = Instant::now();
+                    tokio::spawn(poll_batteries(service.clone()));
+                }
+                previous = Some(ids);
             }
         });
     }
@@ -1277,7 +1648,7 @@ impl BridgeService {
 
     async fn reconcile_native_with(
         &self,
-        operation: impl FnOnce(Option<ApplicationProfile>) -> (Option<String>, usize) + Send + 'static,
+        operation: impl FnOnce(Option<ApplicationProfile>) -> NativePass + Send + 'static,
     ) -> Option<ApplyOutcome> {
         let mut state = self.inner.clone().write_owned().await;
         let selected = resolve_profile_retaining(
@@ -1293,7 +1664,15 @@ impl BridgeService {
         let desired = selected;
         let result = tokio::task::spawn_blocking(move || {
             let has_profile = desired.is_some();
-            let (error, pending) = operation(desired);
+            let (error, pending) = match operation(desired) {
+                NativePass::Ran { error, pending } => (error, pending),
+                NativePass::Deferred { pending } => {
+                    // Nothing reached the mouse, so the last real outcome
+                    // still stands.
+                    state.pending_native_restores = pending;
+                    return None;
+                }
+            };
             let outcome = match &error {
                 Some(message) if message.contains("unsupported") => Some(ApplyOutcome::NoDriver),
                 Some(_) => Some(ApplyOutcome::Failed),
@@ -1321,10 +1700,18 @@ impl BridgeService {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let result = crate::drivers::reconcile_automatic(&mut automation, desired.as_ref());
-            (
-                result.err().map(|error| format!("{error:#}")),
-                automation.pending_restores_for(desired.as_ref()),
-            )
+            let pending = automation.pending_restores_for(desired.as_ref());
+            match result {
+                Ok(crate::drivers::Reconciled::Deferred) => NativePass::Deferred { pending },
+                Ok(crate::drivers::Reconciled::Done) => NativePass::Ran {
+                    error: None,
+                    pending,
+                },
+                Err(error) => NativePass::Ran {
+                    error: Some(format!("{error:#}")),
+                    pending,
+                },
+            }
         })
         .await
     }
@@ -1472,15 +1859,140 @@ impl BridgeService {
 /// panel holds the session — it reports the battery itself over
 /// `PUT /v1/battery`) and records it. Used by the five-minute monitor and by
 /// onboard-mode handovers.
+/// Writes devices.json; a failure is logged and never stops Bridge.
+fn save_known(known: &mut DeviceStore) {
+    if let Err(error) = known.save() {
+        tracing::warn!(%error, "could not save the remembered mice");
+    }
+}
+
+fn remember_known(known: &mut DeviceStore, update: KnownDevice) {
+    if known.remember(update) {
+        save_known(known);
+    }
+}
+
+/// The brand half of a `<brand>:<rest>` device id.
+fn brand_of(id: &str) -> &str {
+    id.split(':').next().unwrap_or_default()
+}
+
+/// Words that say nothing about which mouse it is.
+const NAME_NOISE: &[&str] = &[
+    "mouse",
+    "wireless",
+    "wired",
+    "gaming",
+    "usb",
+    "receiver",
+    "dongle",
+    "ghz",
+    "bluetooth",
+    "hid",
+    "device",
+    "2",
+    "4g",
+    "24g",
+];
+
+fn name_words(name: &str) -> Vec<String> {
+    name.split(|character: char| !character.is_ascii_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .filter(|word| !word.is_empty() && !NAME_NOISE.contains(&word.as_str()))
+        .collect()
+}
+
+/// Whether two display names are the same mouse: the shorter one's meaningful
+/// words, at least two of them, all appear in the longer. The bus scan reports
+/// "R5 Ultra Mouse 2.4G" where the control panel says "Attack Shark R5 Ultra".
+fn names_match(a: &str, b: &str) -> bool {
+    let (a, b) = (name_words(a), name_words(b));
+    let (short, long) = if a.len() <= b.len() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
+    short.len() >= 2 && short.iter().all(|word| long.contains(word))
+}
+
+/// Whether a mouse found on the bus is the remembered `device`: the same id,
+/// the same brand, or the same model name.
+fn is_same_mouse(device_id: &str, device_name: &str, mouse: &drivers::DetectedMouse) -> bool {
+    mouse.device_id == device_id
+        || brand_of(&mouse.device_id) == brand_of(device_id)
+        || names_match(device_name, &mouse.name)
+}
+
+/// Records the mice found on the HID bus, so one with no battery reader is
+/// still listed. A brand that already has a remembered entry is that same mouse
+/// under the id the control panel uses, so the sighting refreshes that entry
+/// instead of adding a second row.
+fn remember_detected(known: &mut DeviceStore, discovered: &[drivers::DetectedMouse]) {
+    for mouse in discovered {
+        // The receiver of a remembered mouse: seeing it says the receiver is
+        // plugged in, not that the mouse is awake, and it is no mouse itself.
+        if known
+            .devices()
+            .iter()
+            .any(|device| device.via.as_deref() == Some(mouse.device_id.as_str()))
+        {
+            continue;
+        }
+        // A mouse already linked to a receiver is only that receiver's.
+        let (id, name) = known
+            .devices()
+            .iter()
+            .find(|device| {
+                device.id != mouse.device_id
+                    && device.via.is_none()
+                    && is_same_mouse(&device.id, &device.name, mouse)
+            })
+            .map(|device| (device.id.clone(), device.name.clone()))
+            .unwrap_or_else(|| (mouse.device_id.clone(), mouse.name.clone()));
+        remember_known(
+            known,
+            KnownDevice {
+                id,
+                name,
+                last_seen: devices::unix_now(),
+                ..KnownDevice::default()
+            },
+        );
+    }
+}
+
+/// Clears the polling flag when a poll ends, even by panic.
+struct PollGuard(Arc<AtomicBool>);
+
+impl Drop for PollGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// One battery poll at a time: a scan-triggered poll skips when the timed one
+/// is already running, and the reverse.
+async fn poll_batteries(service: BridgeService) {
+    if service.battery_polling.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let _guard = PollGuard(Arc::clone(&service.battery_polling));
+    poll_batteries_once(service).await;
+}
+
 async fn poll_batteries_once(service: BridgeService) {
     let profiled = profile_devices(&service.inner.read().await.config);
     let discovered = tokio::task::spawn_blocking(drivers::detect_mice)
         .await
         .unwrap_or_default();
     let devices = merge_detected_mice(profiled, &discovered);
-    // Pruning is in-memory only, so it runs even while the
-    // control panel holds a HID session and reads are paused.
-    prune_batteries(&mut service.inner.write().await.battery, &devices);
+    {
+        // Pruning the live readings is in-memory only, so it runs even while
+        // the control panel holds a HID session and reads are paused.
+        let mut state = service.inner.write().await;
+        prune_batteries(&mut state.battery, &devices);
+        remember_detected(&mut state.known, &discovered);
+    }
     if crate::hid::client_session_active() {
         return;
     }
@@ -1502,7 +2014,12 @@ async fn poll_batteries_once(service: BridgeService) {
                     .map(|name| canonical_battery_identity(&device_id, name))
                     .unwrap_or_else(|| device_id.clone());
                 if record_id != device_id {
-                    service.inner.write().await.battery.remove(&device_id);
+                    let mut state = service.inner.write().await;
+                    state.battery.remove(&device_id);
+                    // The discovery-shaped entry was this same mouse.
+                    if state.known.forget(&device_id) {
+                        save_known(&mut state.known);
+                    }
                 }
                 let record_name = status.battery.reported_name.clone().unwrap_or(device_name);
                 let reading = BatteryReading {
@@ -1513,6 +2030,8 @@ async fn poll_batteries_once(service: BridgeService) {
                     dpi: status.dpi,
                     polling_rate_hz: status.polling_rate_hz,
                     switch_mode: status.switch_mode,
+                    via: read_through(&device_id, &discovered),
+                    native: true,
                 };
                 if let Err(error) = service.record_battery(reading).await {
                     tracing::warn!(%error, "Could not record the mouse battery");
@@ -1523,6 +2042,15 @@ async fn poll_batteries_once(service: BridgeService) {
             }
             Ok(Err(error)) => {
                 tracing::debug!(%error, %device_id, "Could not read the mouse battery");
+                // A control panel took the mouse over mid-poll: the read was
+                // never sent, so it says nothing about the mouse being awake.
+                let deferred = error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock);
+                if !deferred {
+                    let through = read_through(&device_id, &discovered);
+                    mark_unanswered(&service, &device_id, through.as_deref()).await;
+                }
             }
             Err(error) => {
                 tracing::warn!(%error, "The battery reader stopped unexpectedly");
@@ -1531,10 +2059,63 @@ async fn poll_batteries_once(service: BridgeService) {
     }
 }
 
+/// The device on the bus a native read of `device_id` went through: the
+/// sole discovered device of that brand. Readers select by brand even when
+/// the requested id names a specific receiver, so multiple devices are ambiguous.
+fn read_through(device_id: &str, discovered: &[drivers::DetectedMouse]) -> Option<String> {
+    // A brand's reader opens whichever of its devices answers, so the link
+    // is only certain when the brand has one device on the bus.
+    let mut same_brand = discovered
+        .iter()
+        .filter(|mouse| brand_of(&mouse.device_id).eq_ignore_ascii_case(brand_of(device_id)));
+    let only = same_brand.next()?;
+    same_brand.next().is_none().then(|| only.device_id.clone())
+}
+
+/// A native read of `device_id` went unanswered: the mice it covers that
+/// Bridge has read before are asleep. A mouse Bridge has never read is left
+/// alone, since that failure more likely means no reader supports it. So is
+/// everything while hidraw nodes are blocked, when no read can get through.
+async fn mark_unanswered(service: &BridgeService, device_id: &str, through: Option<&str>) {
+    let blocked = !tokio::task::spawn_blocking(crate::hid_access::blocked_devices)
+        .await
+        .unwrap_or_default()
+        .is_empty();
+    if blocked {
+        return;
+    }
+    let mut state = service.inner.write().await;
+    let unanswered = unanswered_mice(state.known.devices(), device_id, through);
+    state.asleep.extend(unanswered);
+}
+
+/// The remembered mice a native read of `device_id` covers, among those
+/// Bridge has read itself before: that mouse, or the mice that come through
+/// the device the read went `through` (a profile's `<brand>:<model>` id is
+/// read through its receiver).
+fn unanswered_mice(known: &[KnownDevice], device_id: &str, through: Option<&str>) -> Vec<String> {
+    known
+        .iter()
+        .filter(|device| {
+            device.native
+                && (device.id == device_id
+                    || device
+                        .via
+                        .as_deref()
+                        .is_some_and(|via| via == device_id || Some(via) == through))
+        })
+        .map(|device| device.id.clone())
+        .collect()
+}
+
 /// The device id the web panel would use for the same physical mouse:
 /// `<brand>:<model>`, from the driver's own `MouseStatus.name`.
 fn canonical_battery_identity(device_id: &str, reported_name: &str) -> String {
-    let brand = device_id.split(':').next().unwrap_or_default();
+    // A name that starts with a brand ("Attack Shark R5 Ultra") names the
+    // brand the control panel files the mouse under, which can differ from the
+    // discovery brand when brands share a vendor id.
+    let brand = drivers::brand_in_name(reported_name)
+        .unwrap_or_else(|| device_id.split(':').next().unwrap_or_default());
     format!("{brand}:{reported_name}")
 }
 
@@ -1585,7 +2166,7 @@ async fn resume_onboard(service: &BridgeService) {
             apply_natively(&profile);
         });
     }
-    tokio::spawn(poll_batteries_once(service.clone()));
+    tokio::spawn(poll_batteries(service.clone()));
 }
 
 fn apply_natively(profile: &ApplicationProfile) -> ApplyOutcome {
@@ -1624,7 +2205,21 @@ mod tests {
     use crate::remote_image::PNG_SIGNATURE;
 
     fn service(config: BridgeConfig) -> BridgeService {
-        BridgeService::new(config, PathBuf::from("unused-test-config.json"))
+        BridgeService::new(config, temp_config_path())
+    }
+
+    /// A config path in a fresh temp directory, so tests never write
+    /// devices.json into the working directory.
+    fn temp_config_path() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "openmouse-service-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        directory.join("config.json")
     }
 
     fn test_profile(
@@ -1666,6 +2261,49 @@ mod tests {
         }
     }
 
+    /// The tray panel shows `native_automation_error` as "Native settings not
+    /// applied: …". The game monitor reconciles every few seconds, so while
+    /// the web panel holds the HID socket that must defer quietly rather than
+    /// publish the ownership guard as a failure.
+    #[test]
+    fn open_panel_session_defers_native_reconcile_without_an_error() {
+        // A plain test so the std lock is never held across an await.
+        let _serial = crate::drivers::TEST_NATIVE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let session = crate::hid::hold_client_session();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let snapshot = runtime.block_on(async {
+            let bridge = service(BridgeConfig::default());
+            assert_eq!(bridge.reconcile_native().await, None);
+            bridge.snapshot().await
+        });
+        drop(session);
+        assert_eq!(snapshot.native_automation_error, None);
+        assert_eq!(snapshot.pending_native_restores, 0);
+    }
+
+    #[tokio::test]
+    async fn deferred_native_pass_keeps_the_last_real_outcome() {
+        let bridge = service(BridgeConfig::default());
+        bridge.inner.write().await.native_automation_error = Some("mouse asleep".into());
+        assert_eq!(
+            bridge
+                .reconcile_native_with(|_| NativePass::Deferred { pending: 2 })
+                .await,
+            None
+        );
+        let state = bridge.inner.read().await;
+        assert_eq!(
+            state.native_automation_error.as_deref(),
+            Some("mouse asleep")
+        );
+        assert_eq!(state.pending_native_restores, 2);
+    }
+
     #[tokio::test]
     async fn failed_native_join_does_not_publish_unowned_stale_completion() {
         let bridge = service(BridgeConfig::default());
@@ -1693,7 +2331,10 @@ mod tests {
                 .reconcile_native_with(move |_| {
                     started_tx.send(()).unwrap();
                     release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                    (Some("retained completion".into()), 1)
+                    NativePass::Ran {
+                        error: Some("retained completion".into()),
+                        pending: 1,
+                    }
                 })
                 .await
         });
@@ -1747,7 +2388,10 @@ mod tests {
                     desired.is_none(),
                     "disabled profile must never reach the native writer"
                 );
-                (None, 0)
+                NativePass::Ran {
+                    error: None,
+                    pending: 0,
+                }
             })
             .await;
     }
@@ -1772,7 +2416,10 @@ mod tests {
                     checked.inner.try_write().is_err(),
                     "configuration must not change during the bounded HID operation"
                 );
-                (Some("unsupported acknowledged readback".into()), 1)
+                NativePass::Ran {
+                    error: Some("unsupported acknowledged readback".into()),
+                    pending: 1,
+                }
             })
             .await;
         let snapshot = bridge.snapshot().await;
@@ -2366,6 +3013,7 @@ mod tests {
                     dpi: None,
                     polling_rate_hz: None,
                     switch_mode: None,
+                    ..Default::default()
                 })
                 .await
                 .unwrap()
@@ -2380,6 +3028,7 @@ mod tests {
                     dpi: None,
                     polling_rate_hz: None,
                     switch_mode: None,
+                    ..Default::default()
                 })
                 .await
                 .unwrap()
@@ -2399,6 +3048,7 @@ mod tests {
                 dpi: Some(800),
                 polling_rate_hz: Some(1000),
                 switch_mode: Some("Hybrid".into()),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -2412,6 +3062,7 @@ mod tests {
                 dpi: None,
                 polling_rate_hz: None,
                 switch_mode: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -2426,6 +3077,532 @@ mod tests {
         assert_eq!(battery.dpi, Some(800));
         assert_eq!(battery.polling_rate_hz, Some(1000));
         assert_eq!(battery.switch_mode.as_deref(), Some("Hybrid"));
+    }
+
+    fn reading(id: &str, name: &str, percent: u8) -> BatteryReading {
+        BatteryReading {
+            device_id: id.into(),
+            device_name: name.into(),
+            percent,
+            charging: false,
+            dpi: Some(1600),
+            polling_rate_hz: None,
+            switch_mode: None,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_mouse_with_a_battery_reading_is_remembered_across_restarts() {
+        let path = temp_config_path();
+        let first = BridgeService::new(BridgeConfig::default(), path.clone());
+        first
+            .record_battery(reading("Logitech:G Pro", "G Pro", 72))
+            .await
+            .unwrap();
+        let known = first.snapshot().await.known_devices;
+        assert_eq!(known.len(), 1);
+        assert!(known[0].connected);
+        assert_eq!(known[0].percent, Some(72));
+
+        // A new service on the same config path, as after a restart: nothing
+        // is connected yet, but the mouse and its last reading are still there.
+        let second = BridgeService::new(BridgeConfig::default(), path);
+        let snapshot = second.snapshot().await;
+        assert!(snapshot.batteries.is_empty(), "no live reading yet");
+        assert_eq!(snapshot.known_devices.len(), 1);
+        assert_eq!(snapshot.known_devices[0].name, "G Pro");
+        assert_eq!(snapshot.known_devices[0].percent, Some(72));
+        assert_eq!(snapshot.known_devices[0].dpi, Some(1600));
+    }
+
+    #[tokio::test]
+    async fn made_up_battery_devices_cannot_grow_memory_without_bound() {
+        let bridge = BridgeService::new(BridgeConfig::default(), temp_config_path());
+        let long = "x".repeat(MAX_BATTERY_TEXT_BYTES + 1);
+        let error = bridge
+            .record_panel_battery(reading(&long, "Mouse", 50))
+            .await
+            .expect_err("an oversized id is refused");
+        assert!(
+            error
+                .downcast_ref::<crate::local_targets::InvalidInput>()
+                .is_some()
+        );
+        assert!(
+            bridge
+                .record_panel_battery(reading("", "Mouse", 50))
+                .await
+                .is_err()
+        );
+
+        for index in 0..MAX_BATTERY_ENTRIES + 10 {
+            bridge
+                .record_battery(reading(&format!("Fake:{index}"), "Mouse", 50))
+                .await
+                .unwrap();
+        }
+        let state = bridge.inner.read().await;
+        assert_eq!(state.battery.len(), MAX_BATTERY_ENTRIES);
+        assert!(
+            state
+                .battery
+                .contains_key(&format!("Fake:{}", MAX_BATTERY_ENTRIES + 9)),
+            "the newest reading is kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mouse_not_seen_for_a_while_is_remembered_but_not_connected() {
+        let path = temp_config_path();
+        let old = devices::unix_now() - 3 * 60 * 60;
+        std::fs::write(
+            DeviceStore::path_for(&path),
+            format!(
+                r#"{{"version":1,"devices":[{{"id":"Razer:x","name":"Razer X","lastSeen":{old},"percent":40}}]}}"#
+            ),
+        )
+        .unwrap();
+        let bridge = BridgeService::new(BridgeConfig::default(), path);
+        let known = bridge.snapshot().await.known_devices;
+        assert_eq!(known.len(), 1);
+        assert!(!known[0].connected);
+        assert!(known[0].last_seen_seconds_ago >= 3 * 60 * 60);
+        assert_eq!(known[0].percent, Some(40));
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_mouse_removes_it_from_devices_json() {
+        let path = temp_config_path();
+        let bridge = BridgeService::new(BridgeConfig::default(), path.clone());
+        bridge
+            .record_battery(reading("Razer:x", "Razer X", 50))
+            .await
+            .unwrap();
+        assert!(bridge.forget_battery("Razer:x").await);
+        assert!(bridge.snapshot().await.known_devices.is_empty());
+        let reloaded = BridgeService::new(BridgeConfig::default(), path);
+        assert!(reloaded.snapshot().await.known_devices.is_empty());
+    }
+
+    #[test]
+    fn detected_mice_are_remembered_unless_their_brand_is_already_covered() {
+        let path = temp_config_path();
+        let mut known = DeviceStore::load(DeviceStore::path_for(&path));
+        let mouse = |id: &str, name: &str| drivers::DetectedMouse {
+            device_id: id.into(),
+            name: name.into(),
+            ..Default::default()
+        };
+        remember_detected(&mut known, &[mouse("Pulsar:1234", "Pulsar X2")]);
+        assert_eq!(known.devices().len(), 1);
+
+        // The control panel's id for the same Logitech mouse is already known,
+        // so the discovery-shaped id adds no second row.
+        remember_known(
+            &mut known,
+            KnownDevice {
+                id: "Logitech:G Pro".into(),
+                name: "G Pro".into(),
+                last_seen: devices::unix_now(),
+                percent: Some(60),
+                charging: Some(false),
+                dpi: None,
+                polling_rate_hz: None,
+                switch_mode: None,
+                ..Default::default()
+            },
+        );
+        remember_detected(&mut known, &[mouse("Logitech:046d:c547", "USB Receiver")]);
+        assert_eq!(known.devices().len(), 2);
+    }
+
+    fn receiver(id: &str, name: &str, vendor_id: u16, product_id: u16) -> drivers::DetectedMouse {
+        drivers::DetectedMouse {
+            device_id: id.into(),
+            name: name.into(),
+            vendor_id,
+            product_id,
+        }
+    }
+
+    fn state_of(known: &[KnownDeviceStatus], id: &str) -> Option<KnownDeviceState> {
+        known
+            .iter()
+            .find(|device| device.id == id)
+            .map(|device| device.state)
+    }
+
+    #[tokio::test]
+    async fn a_mouse_read_through_its_receiver_replaces_it_and_sleeps_and_wakes() {
+        let bridge = BridgeService::new(BridgeConfig::default(), temp_config_path());
+        let dongle = receiver("Logitech:375D35803234", "USB Receiver", 0x046d, 0xc54d);
+        {
+            let mut state = bridge.inner.write().await;
+            remember_detected(&mut state.known, std::slice::from_ref(&dongle));
+            state.detected = Some(vec![dongle.clone()]);
+        }
+        let known = bridge.snapshot().await.known_devices;
+        assert_eq!(
+            state_of(&known, &dongle.device_id),
+            Some(KnownDeviceState::Connected)
+        );
+
+        let native = BatteryReading {
+            via: Some(dongle.device_id.clone()),
+            native: true,
+            ..reading("Logitech:PRO X SUPERLIGHT 2c", "PRO X SUPERLIGHT 2c", 77)
+        };
+        bridge.record_battery(native.clone()).await.unwrap();
+        let known = bridge.snapshot().await.known_devices;
+        assert_eq!(
+            known.len(),
+            1,
+            "the receiver is shown as its mouse: {known:?}"
+        );
+        assert_eq!(
+            state_of(&known, &native.device_id),
+            Some(KnownDeviceState::Connected)
+        );
+
+        // Later scans see the receiver again: still no row of its own.
+        {
+            let mut state = bridge.inner.write().await;
+            remember_detected(&mut state.known, std::slice::from_ref(&dongle));
+            let asleep = unanswered_mice(state.known.devices(), &dongle.device_id, None);
+            assert_eq!(asleep, std::slice::from_ref(&native.device_id));
+            state.asleep.extend(asleep);
+        }
+        let known = bridge.snapshot().await.known_devices;
+        assert_eq!(known.len(), 1);
+        assert_eq!(
+            state_of(&known, &native.device_id),
+            Some(KnownDeviceState::Asleep)
+        );
+        assert!(!known[0].connected);
+
+        // It answers again.
+        bridge.record_battery(native.clone()).await.unwrap();
+        let known = bridge.snapshot().await.known_devices;
+        assert_eq!(
+            state_of(&known, &native.device_id),
+            Some(KnownDeviceState::Connected)
+        );
+
+        // An older entry from before links (here the Linux per-mouse node
+        // Bridge used to scan) no longer borrows the linked receiver.
+        remember_known(
+            &mut bridge.inner.write().await.known,
+            KnownDevice {
+                id: "Logitech:3e-c2-c5-15".into(),
+                name: "USB Receiver".into(),
+                last_seen: devices::unix_now(),
+                ..KnownDevice::default()
+            },
+        );
+        let known = bridge.snapshot().await.known_devices;
+        assert_eq!(
+            state_of(&known, "Logitech:3e-c2-c5-15"),
+            Some(KnownDeviceState::Disconnected)
+        );
+
+        // The receiver is unplugged.
+        bridge.inner.write().await.detected = Some(vec![]);
+        let known = bridge.snapshot().await.known_devices;
+        assert_eq!(
+            state_of(&known, &native.device_id),
+            Some(KnownDeviceState::Disconnected)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panel_reading_links_a_mouse_whatever_brand_its_dongle_scans_as() {
+        // A Scyrox dongle shares 0x3554 and scans as Teevolution; the panel
+        // reports the mouse as Scyrox. Neither brand nor name matches.
+        let bridge = BridgeService::new(BridgeConfig::default(), temp_config_path());
+        let dongle = receiver("Teevolution:3554:f5f7", "SCYROX 8K Dongle", 0x3554, 0xf5f7);
+        {
+            let mut state = bridge.inner.write().await;
+            remember_detected(&mut state.known, std::slice::from_ref(&dongle));
+            state.detected = Some(vec![dongle.clone()]);
+        }
+        let via = panel_transport(&[(0x3554, 0xf5f7)], std::slice::from_ref(&dongle));
+        assert_eq!(via.as_deref(), Some(dongle.device_id.as_str()));
+        bridge
+            .record_battery(BatteryReading {
+                via,
+                ..reading("Scyrox:Scyrox V8", "Scyrox V8", 80)
+            })
+            .await
+            .unwrap();
+        let known = bridge.snapshot().await.known_devices;
+        assert_eq!(known.len(), 1, "one row for the mouse: {known:?}");
+        assert_eq!(
+            state_of(&known, "Scyrox:Scyrox V8"),
+            Some(KnownDeviceState::Connected)
+        );
+        // Bridge cannot read it itself, so a failed read says nothing about
+        // whether it is asleep.
+        let state = bridge.inner.read().await;
+        assert!(unanswered_mice(state.known.devices(), &dongle.device_id, None).is_empty());
+    }
+
+    #[test]
+    fn a_panel_reading_is_pinned_only_to_a_single_open_device() {
+        let detected = [
+            receiver("Logitech:375D35803234", "USB Receiver", 0x046d, 0xc54d),
+            receiver("Teevolution:3554:f5f7", "SCYROX 8K Dongle", 0x3554, 0xf5f7),
+        ];
+        assert_eq!(
+            panel_transport(&[(0x046d, 0xc54d)], &detected).as_deref(),
+            Some("Logitech:375D35803234")
+        );
+        assert_eq!(
+            panel_transport(&[(0x046d, 0xc54d), (0x3554, 0xf5f7)], &detected),
+            None
+        );
+        assert_eq!(panel_transport(&[], &detected), None);
+        assert_eq!(panel_transport(&[(0x1234, 0x5678)], &detected), None);
+        // An open device the scan missed could be where the reading came from.
+        assert_eq!(
+            panel_transport(&[(0x046d, 0xc54d), (0x1234, 0x5678)], &detected),
+            None
+        );
+    }
+
+    #[test]
+    fn a_native_read_goes_through_the_device_or_its_brand() {
+        let detected = [receiver(
+            "Logitech:375D35803234",
+            "USB Receiver",
+            0x046d,
+            0xc54d,
+        )];
+        assert_eq!(
+            read_through("Logitech:375D35803234", &detected).as_deref(),
+            Some("Logitech:375D35803234")
+        );
+        // A profile's `<brand>:<model>` id: the reader opens that brand's device.
+        assert_eq!(
+            read_through("logitech:PRO X SUPERLIGHT 2c", &detected).as_deref(),
+            Some("Logitech:375D35803234")
+        );
+        assert_eq!(read_through("Razer:Viper", &detected), None);
+        // Two devices of the brand: the reader may open either, so no guess.
+        let two = [
+            receiver("Delux:3719C0531974", "R5 Ultra Mouse 2.4G", 0x373e, 0x0001),
+            receiver("Delux:248a:fa02", "Wireless Receiver", 0x248a, 0xfa02),
+        ];
+        assert_eq!(read_through("Delux:Attack Shark R5 Ultra", &two), None);
+        assert_eq!(read_through("Delux:248a:fa02", &two).as_deref(), None);
+    }
+
+    #[test]
+    fn a_failed_profile_read_marks_the_mouse_behind_its_receiver() {
+        // The profile names the mouse `Delux:…`; its readings were filed as
+        // `Attack Shark:…` through the dongle.
+        let mouse = KnownDevice {
+            id: "Attack Shark:Attack Shark R5 Ultra".into(),
+            name: "Attack Shark R5 Ultra".into(),
+            via: Some("Delux:3719C0531974".into()),
+            native: true,
+            ..KnownDevice::default()
+        };
+        let known = [mouse.clone()];
+        assert!(unanswered_mice(&known, "Delux:Attack Shark R5 Ultra", None).is_empty());
+        assert_eq!(
+            unanswered_mice(
+                &known,
+                "Delux:Attack Shark R5 Ultra",
+                Some("Delux:3719C0531974")
+            ),
+            std::slice::from_ref(&mouse.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_receiver_that_was_read_itself_is_not_forgotten_as_a_link() {
+        let bridge = BridgeService::new(BridgeConfig::default(), temp_config_path());
+        // A device with a reading of its own, which a later reading then
+        // names as its link (a wrong link, or a device that is both).
+        bridge
+            .record_battery(reading("Logitech:375D35803234", "USB Receiver", 70))
+            .await
+            .unwrap();
+        bridge
+            .record_battery(BatteryReading {
+                via: Some("Logitech:375D35803234".into()),
+                native: true,
+                ..reading("Logitech:G Pro", "G Pro", 60)
+            })
+            .await
+            .unwrap();
+        let state = bridge.inner.read().await;
+        assert!(
+            state
+                .known
+                .devices()
+                .iter()
+                .any(|device| device.id == "Logitech:375D35803234"),
+            "a device with its own reading stays remembered"
+        );
+    }
+
+    #[tokio::test]
+    async fn whats_new_is_offered_after_an_update_once_and_never_on_a_first_install() {
+        // A first install: nothing to announce, during or after the first run.
+        let fresh = service(BridgeConfig::default());
+        assert!(!fresh.snapshot().await.whats_new);
+        fresh.acknowledge_tray_hint().await.unwrap();
+        assert!(!fresh.snapshot().await.whats_new);
+
+        // An earlier Bridge ran (hint shown) and never recorded these notes.
+        let updated = service(BridgeConfig {
+            tray_hint_shown: true,
+            ..BridgeConfig::default()
+        });
+        assert!(updated.snapshot().await.whats_new);
+        updated.acknowledge_whats_new().await.unwrap();
+        assert!(!updated.snapshot().await.whats_new);
+
+        // Seen for an older version only.
+        let older = service(BridgeConfig {
+            tray_hint_shown: true,
+            whats_new_seen: Some("0.0.1".into()),
+            ..BridgeConfig::default()
+        });
+        assert!(older.snapshot().await.whats_new);
+    }
+
+    #[tokio::test]
+    async fn connected_follows_the_latest_scan_not_the_age_of_the_last_sighting() {
+        let bridge = BridgeService::new(BridgeConfig::default(), temp_config_path());
+        // Both were seen a moment ago.
+        bridge
+            .record_battery(reading("Logitech:G Pro", "G Pro", 60))
+            .await
+            .unwrap();
+        bridge
+            .record_battery(reading("Razer:Viper", "Viper", 80))
+            .await
+            .unwrap();
+        // Before any scan the recent sighting counts as connected.
+        let before = bridge.snapshot().await.known_devices;
+        assert!(before.iter().all(|device| device.connected));
+
+        // A scan finds only the Logitech, under its scan-shaped id.
+        bridge.inner.write().await.detected = Some(vec![drivers::DetectedMouse {
+            device_id: "Logitech:046d:c547".into(),
+            name: "USB Receiver".into(),
+            ..Default::default()
+        }]);
+        let after = bridge.snapshot().await.known_devices;
+        let find = |id: &str| after.iter().find(|device| device.id == id).unwrap();
+        assert!(find("Logitech:G Pro").connected, "matched by brand");
+        assert!(!find("Razer:Viper").connected, "unplugged: not in the scan");
+    }
+
+    #[test]
+    fn a_sighting_refreshes_the_covering_entry_and_keeps_its_name() {
+        let path = temp_config_path();
+        let mut known = DeviceStore::load(DeviceStore::path_for(&path));
+        let old = devices::unix_now() - 3_600;
+        remember_known(
+            &mut known,
+            KnownDevice {
+                id: "Logitech:G Pro".into(),
+                name: "G Pro".into(),
+                last_seen: old,
+                percent: Some(60),
+                charging: Some(false),
+                dpi: None,
+                polling_rate_hz: None,
+                switch_mode: None,
+                ..Default::default()
+            },
+        );
+        remember_detected(
+            &mut known,
+            &[drivers::DetectedMouse {
+                device_id: "Logitech:046d:c547".into(),
+                name: "USB Receiver".into(),
+                ..Default::default()
+            }],
+        );
+        assert_eq!(known.devices().len(), 1);
+        let device = &known.devices()[0];
+        assert_eq!(device.name, "G Pro");
+        assert!(device.last_seen > old, "touched by the sighting");
+        assert_eq!(device.percent, Some(60), "its reading is kept");
+    }
+
+    #[test]
+    fn a_reading_is_filed_under_the_brand_its_model_name_starts_with() {
+        // Discovery labels the R5 Ultra "Delux" (a shared vendor id); the
+        // control panel files it under "Attack Shark".
+        assert_eq!(
+            canonical_battery_identity("Delux:3719C0531974", "Attack Shark R5 Ultra"),
+            "Attack Shark:Attack Shark R5 Ultra"
+        );
+        // A name with no brand in front keeps the discovery brand.
+        assert_eq!(
+            canonical_battery_identity("Logitech:046d:c547", "PRO X SUPERLIGHT 2c"),
+            "Logitech:PRO X SUPERLIGHT 2c"
+        );
+    }
+
+    #[test]
+    fn names_match_by_their_meaningful_words() {
+        // The bus scan and the control panel name the same mouse differently.
+        assert!(names_match("R5 Ultra Mouse 2.4G", "Attack Shark R5 Ultra"));
+        assert!(names_match(
+            "Attack Shark R5 Ultra",
+            "Attack Shark R5 Ultra Mouse 2.4G"
+        ));
+        // Generic receiver names carry no model, so they never match by name.
+        assert!(!names_match("USB Receiver", "PRO X SUPERLIGHT 2c"));
+        // One shared word is not enough.
+        assert!(!names_match("Pulsar X2", "Razer Viper X"));
+        assert!(!names_match("Wooting 60HE+", "R5 Ultra Mouse 2.4G"));
+    }
+
+    #[tokio::test]
+    async fn one_mouse_seen_under_two_brands_is_one_connected_entry() {
+        let bridge = BridgeService::new(BridgeConfig::default(), temp_config_path());
+        let scan = drivers::DetectedMouse {
+            device_id: "Delux:3719C0531974".into(),
+            name: "R5 Ultra Mouse 2.4G".into(),
+            ..Default::default()
+        };
+        // The bus scan finds it first, as "Delux".
+        {
+            let mut state = bridge.inner.write().await;
+            remember_detected(&mut state.known, std::slice::from_ref(&scan));
+            state.detected = Some(vec![scan.clone()]);
+        }
+        assert_eq!(bridge.snapshot().await.known_devices.len(), 1);
+
+        // Then the control panel reports it as "Attack Shark".
+        bridge
+            .record_battery(reading(
+                "Attack Shark:Attack Shark R5 Ultra",
+                "Attack Shark R5 Ultra",
+                66,
+            ))
+            .await
+            .unwrap();
+        let known = bridge.snapshot().await.known_devices;
+        assert_eq!(known.len(), 1, "the scan-shaped entry is absorbed");
+        assert_eq!(known[0].id, "Attack Shark:Attack Shark R5 Ultra");
+        assert_eq!(known[0].percent, Some(66));
+        assert!(known[0].connected, "the scan still sees it");
+
+        // Later scans refresh that entry instead of adding the scan id back.
+        {
+            let mut state = bridge.inner.write().await;
+            remember_detected(&mut state.known, std::slice::from_ref(&scan));
+        }
+        assert_eq!(bridge.snapshot().await.known_devices.len(), 1);
     }
 
     fn battery_entry(age: Duration) -> BatteryState {
@@ -2527,6 +3704,7 @@ mod tests {
                     dpi: None,
                     polling_rate_hz: None,
                     switch_mode: None,
+                    ..Default::default()
                 })
                 .await
                 .unwrap();
@@ -2741,6 +3919,7 @@ mod tests {
         let detected = |device_id: &str, name: &str| drivers::DetectedMouse {
             device_id: device_id.into(),
             name: name.into(),
+            ..Default::default()
         };
         // No profiles: every discovered mouse is polled.
         assert_eq!(

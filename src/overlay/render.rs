@@ -13,6 +13,9 @@ use vello_cpu::{
     kurbo::{BezPath, RoundedRect, Shape as _},
 };
 
+/// The bundled DM Sans, the same face the panel is set in.
+const FONT_BYTES: &[u8] = include_bytes!("../../assets/fonts/DMSans-Variable.ttf");
+
 const HEIGHT: f64 = 60.0;
 const RADIUS: f64 = 14.0;
 const PADDING: f64 = 18.0;
@@ -38,8 +41,7 @@ pub struct Banner {
 
 /// Renders `title` over `detail` at `scale` physical pixels per point.
 pub fn banner(title: &str, detail: &str, scale: f64) -> Banner {
-    let font =
-        FontRef::new(crate::native_ui::FONT_BYTES).expect("the bundled DM Sans font is valid");
+    let font = FontRef::new(FONT_BYTES).expect("the bundled DM Sans font is valid");
     let text_room = MAX_WIDTH - TEXT_LEFT - PADDING;
     let title = fit(&font, title, TITLE_SIZE, text_room);
     let detail = fit(&font, detail, DETAIL_SIZE, text_room);
@@ -211,7 +213,7 @@ mod tests {
 
     #[test]
     fn long_titles_are_shortened_to_fit() {
-        let font = FontRef::new(crate::native_ui::FONT_BYTES).unwrap();
+        let font = FontRef::new(FONT_BYTES).unwrap();
         let fitted = fit(&font, &"Very Long Game Name ".repeat(10), TITLE_SIZE, 200.0);
         assert!(fitted.ends_with('…'));
         assert!(line_width(&font, &fitted, TITLE_SIZE) <= 200.0);

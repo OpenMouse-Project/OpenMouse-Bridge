@@ -2,116 +2,178 @@ name: Bridge CI
 
 on:
   push:
+    # main as well as dev: the build cache is only shared with pull requests
+    # when it was saved from the default branch.
     branches: [main, dev]
   pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: bridge-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
+  # No incremental artefacts or debug info: CI builds once from a cold cache, so
+  # they only cost compile time and cache size.
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
   # Keep in sync with release.yml's NATIVE_HID_NODE_VERSION.
   NATIVE_HID_NODE_VERSION: v24.18.1
 
 jobs:
-  check:
-    name: Check (${{ matrix.os }})
+  # A pull request that only touches the native-hid pins does not need the Rust
+  # builds, so the heavy jobs skip it.
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      protocol_only: ${{ steps.changes.outputs.result }}
+    steps:
+      - uses: actions/github-script@v7
+        id: changes
+        with:
+          script: |
+            if (context.eventName !== 'pull_request') return false;
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              per_page: 100,
+            });
+            const protocolFiles = new Set([
+              'native-hid/package.json',
+              'native-hid/package-lock.json',
+            ]);
+            return files.length > 0 && files.every(file => protocolFiles.has(file.filename));
+
+  test:
+    name: Test (${{ matrix.os }})
+    needs: changes
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    # Builds and tests run dependency code; only windows-build needs write access.
+    # Builds and tests run dependency code with read-only repository access.
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
       - name: Install Linux HID and GUI dependencies
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev libgtk-3-dev libayatana-appindicator3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libgl1-mesa-dev pkg-config
+        if: runner.os == 'Linux' && needs.changes.outputs.protocol_only != 'true'
+        run: sudo apt-get update && sudo apt-get install -y build-essential clang cmake pkg-config libudev-dev libssl-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libvulkan-dev libgl1-mesa-dev libfontconfig-dev libfreetype-dev libasound2-dev
       - uses: dtolnay/rust-toolchain@stable
+        if: needs.changes.outputs.protocol_only != 'true'
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: Check formatting
-        if: runner.os == 'Linux'
-        run: cargo fmt --check
+        if: needs.changes.outputs.protocol_only != 'true'
+        with:
+          # Pull requests read main's cache but never write their own: each copy is
+          # ~1 GB per OS, and they pushed the repo past its 10 GB cache limit.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Test
+        if: needs.changes.outputs.protocol_only != 'true'
         run: cargo test --locked
-      - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Test installer script
-        if: runner.os == 'Linux'
-        run: |
-          bash -n install-linux.sh
-          bash tests/linux_startup.sh "${{ runner.temp }}"
-          bash install-linux.sh --help
-          bash -c 'export HOME=/root OPENMOUSE_INSTALL_SOURCED=1; source ./install-linux.sh; D=$(mktemp -d); write_udev_rule "$D/rule"; bodies=$(grep -c "SUBSYSTEM" "$D/rule"); vids=$(printf "%s" "$VENDOR_IDS" | wc -w); [ "$bodies" = "$vids" ] || exit 1; write_autostart "$D/a.desktop" "/opt/x/b"; grep -q "Exec=\"/opt/x/b\"" "$D/a.desktop"; write_launcher "$D/l.desktop" "/opt/x/b" "/opt/x/i.png"; grep -q "^Name=OpenMouse Bridge$" "$D/l.desktop"; grep -q "^Terminal=false$" "$D/l.desktop"; for pm in apt dnf pacman zypper apk; do pm_packages "$pm" | grep -q curl || exit 1; done; rm -rf "$D"'
 
-  windows-build:
-    name: Windows release artifact
-    needs: check
-    runs-on: windows-latest
+  clippy:
+    name: Clippy (${{ matrix.os }})
+    needs: changes
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    # Builds and tests run dependency code with read-only repository access.
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Install Linux HID and GUI dependencies
+        if: runner.os == 'Linux' && needs.changes.outputs.protocol_only != 'true'
+        run: sudo apt-get update && sudo apt-get install -y build-essential clang cmake pkg-config libudev-dev libssl-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libvulkan-dev libgl1-mesa-dev libfontconfig-dev libfreetype-dev libasound2-dev
       - uses: dtolnay/rust-toolchain@stable
+        if: needs.changes.outputs.protocol_only != 'true'
+        with:
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+        if: needs.changes.outputs.protocol_only != 'true'
+        with:
+          # Pull requests read main's cache but never write their own: each copy is
+          # ~1 GB per OS, and they pushed the repo past its 10 GB cache limit.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Check formatting
+        if: runner.os == 'Linux' && needs.changes.outputs.protocol_only != 'true'
+        run: cargo fmt --check
+      - name: Clippy
+        if: needs.changes.outputs.protocol_only != 'true'
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  helper:
+    name: Helper and scripts (${{ matrix.os }})
+    needs: changes
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    # Builds and tests run dependency code with read-only repository access.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
         with:
           node-version: 24
           cache: npm
           cache-dependency-path: native-hid/package-lock.json
-      - name: Build
-        run: cargo build --release --locked
-      - name: Prepare native-hid (deps + bundled Node.js runtime)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          npm ci --prefix native-hid --omit=dev
-          # Trim node-hid's other-platform prebuilt bindings — this archive
-          # only ever runs on win32-x64.
-          Get-ChildItem native-hid/node_modules/node-hid/prebuilds -Directory |
-            Where-Object { $_.Name -ne "HID-win32-x64" } |
-            Remove-Item -Recurse -Force
-          Invoke-WebRequest -Uri "https://nodejs.org/dist/$env:NATIVE_HID_NODE_VERSION/node-$env:NATIVE_HID_NODE_VERSION-win-x64.zip" -OutFile node.zip
-          Expand-Archive node.zip -DestinationPath node-extracted
-          New-Item -ItemType Directory -Force -Path native-hid/node | Out-Null
-          Copy-Item "node-extracted/node-$env:NATIVE_HID_NODE_VERSION-win-x64/node.exe" native-hid/node/node.exe
-      - name: Package
-        shell: pwsh
-        run: |
-          Copy-Item assets/fonts/DM-Sans-OFL.txt DM-Sans-OFL.txt
-          Compress-Archive -Path target/release/openmouse-bridge.exe,README.md,DM-Sans-OFL.txt,native-hid -DestinationPath openmouse-bridge-windows-x64.zip
-          (Get-FileHash openmouse-bridge-windows-x64.zip -Algorithm SHA256).Hash.ToLower() + "  openmouse-bridge-windows-x64.zip" | Set-Content openmouse-bridge-windows-x64.zip.sha256
-      - uses: actions/upload-artifact@v4
+      - uses: actions/cache@v5
+        id: native-hid-cache
         with:
-          name: openmouse-bridge-windows-x64
-          path: |
-            openmouse-bridge-windows-x64.zip
-            openmouse-bridge-windows-x64.zip.sha256
-          if-no-files-found: error
-      - name: Publish rolling development release
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: pwsh
+          path: native-hid/node_modules
+          key: native-hid-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('native-hid/package.json', 'native-hid/package-lock.json') }}
+      - name: Install native HID helper dependencies
+        if: steps.native-hid-cache.outputs.cache-hit != 'true'
+        run: npm ci --prefix native-hid
+      - name: Test native HID helper
+        run: npm test --prefix native-hid
+      - name: Test release scripts
+        if: runner.os == 'Linux' && needs.changes.outputs.protocol_only != 'true'
+        run: node --test ".github/scripts/*.test.mjs"
+      - name: Test installer script
+        if: runner.os == 'Linux' && needs.changes.outputs.protocol_only != 'true'
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # Deleting the release and pushing the tag race: gh may still see
-          # the old release when create runs (the tag push recreates the
-          # association server-side). Poll until the release is really gone.
-          gh release delete dev-build --cleanup-tag --yes
-          for ($i = 0; $i -lt 30; $i++) {
-            try { gh release view dev-build 2>$null | Out-Null; Start-Sleep -Seconds 10 }
-            catch { break }
-          }
-          git tag -f dev-build
-          git push origin dev-build --force
-          for ($i = 0; $i -lt 30; $i++) {
-            try { gh release create dev-build --prerelease --title "Development build" --notes "Automatic Windows build from main at $env:GITHUB_SHA." openmouse-bridge-windows-x64.zip openmouse-bridge-windows-x64.zip.sha256; break }
-            catch { Start-Sleep -Seconds 10 }
-          }
-          gh release view dev-build --json tagName | Out-Null
+          bash -n install-linux.sh
+          bash tests/linux_startup.sh "${{ runner.temp }}"
+          bash install-linux.sh --help
+          bash -c 'export HOME=/root OPENMOUSE_INSTALL_SOURCED=1; source ./install-linux.sh; D=$(mktemp -d); write_udev_rule "$D/rule"; write_udev_helper "$D/helper"; grep -q "PROGRAM=\"/bin/sh $UDEV_HELPER %S%p\"" "$D/rule"; sh -n "$D/helper"; write_autostart "$D/a.desktop" "/opt/x/b"; grep -q "Exec=\"/opt/x/b\"" "$D/a.desktop"; write_launcher "$D/l.desktop" "/opt/x/b" "/opt/x/i.png"; grep -q "^Name=OpenMouse Bridge$" "$D/l.desktop"; grep -q "^Terminal=false$" "$D/l.desktop"; for pm in apt dnf pacman zypper apk; do pm_packages "$pm" | grep -q curl || exit 1; done; rm -rf "$D"'
+
+  # The required status checks are named "Check (<os>)". They gate on the jobs
+  # above, which run side by side instead of one after another.
+  check:
+    name: Check (${{ matrix.os }})
+    needs: [changes, test, clippy, helper]
+    if: always()
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every job to pass
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "$RESULTS"
+          case " $RESULTS " in *" failure "*|*" cancelled "*) exit 1;; esac
