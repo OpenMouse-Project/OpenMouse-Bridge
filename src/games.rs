@@ -360,7 +360,10 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("openmouse-wine-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let loader = directory.join("wine64-preloader");
-        std::fs::copy("/bin/sleep", &loader).unwrap();
+        let sleep = std::env::var_os("OPENMOUSE_TEST_SLEEP")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| "/bin/sleep".into());
+        std::fs::copy(sleep, &loader).unwrap();
         let mut child = std::process::Command::new(&loader)
             .arg0(r"Z:\home\me\Steam\steamapps\common\Overwatch\Overwatch.exe")
             .arg("30")
