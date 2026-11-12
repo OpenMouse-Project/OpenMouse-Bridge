@@ -25,7 +25,16 @@ const READ_TIMEOUT_MS: i32 = 100;
 const SHARED_READ_IDLE: std::time::Duration = std::time::Duration::from_millis(2);
 const MICROSOFT_VENDOR_ID: u16 = 0x045E;
 const RAZER_VENDOR_ID: u16 = 0x1532;
+/// FIDO Alliance usage page: security keys (U2F/CTAP). Never offered over the
+/// WebSocket, like the browser's own WebHID blocklist, so a page cannot talk
+/// to a security key through Bridge.
+const FIDO_USAGE_PAGE: u16 = 0xF1D0;
 const RAZER_FEATURE_BUFFER_LEN: usize = 91;
+const THERMALTAKE_VENDOR_ID: u16 = 0x264A;
+/// The Iris's config collection holds only constant items, so Windows gives it
+/// no caps and hidapi's rebuilt descriptor declares none of its 2052-byte
+/// feature reports. Reads use this buffer (report id plus 2052 bytes) instead.
+const THERMALTAKE_FEATURE_BUFFER_LEN: usize = 2053;
 const RESUME_WATCH_STEP: Duration = Duration::from_secs(2);
 /// A step that overshoots by this much means the machine was suspended.
 const RESUME_GAP_THRESHOLD: Duration = Duration::from_secs(15);
@@ -429,7 +438,6 @@ impl Drop for OpenDevice {
 struct HidSession {
     session_id: u64,
     api: HidApi,
-    next_key: u64,
     device_keys: HashMap<Vec<u8>, String>,
     last_device_keys: Option<Vec<String>>,
     candidates: HashMap<String, Candidate>,
@@ -442,9 +450,7 @@ impl HidSession {
     fn new(session_id: u64, input_tx: InputSender) -> Result<Self, String> {
         Ok(Self {
             session_id,
-            api: HidApi::new()
-                .map_err(|error| format!("could not initialize native HID: {error}"))?,
-            next_key: 1,
+            api: new_api().map_err(|error| format!("could not initialize native HID: {error}"))?,
             device_keys: HashMap::new(),
             last_device_keys: None,
             candidates: HashMap::new(),
@@ -567,8 +573,7 @@ impl HidSession {
             return Err("too many HID vendor ids were requested".into());
         }
         let vendors: HashSet<u16> = vendor_ids.into_iter().collect();
-        self.api
-            .refresh_devices()
+        refresh_api(&mut self.api)
             .map_err(|error| format!("could not refresh HID devices: {error}"))?;
 
         // Reconcile against the full inventory, not the requested vendor filter:
@@ -580,9 +585,14 @@ impl HidSession {
             return Ok(Vec::new());
         }
 
-        let mut by_device = HashMap::<Vec<u8>, Vec<hidapi::DeviceInfo>>::new();
+        // Ordered, so devices are keyed and listed the same way every time.
+        let mut by_device = std::collections::BTreeMap::<Vec<u8>, Vec<hidapi::DeviceInfo>>::new();
+        let blocked = security_key_paths(&self.api);
         for info in self.api.device_list() {
-            if vendors.contains(&info.vendor_id()) {
+            if vendors.contains(&info.vendor_id())
+                && !blocked.contains(info.path())
+                && !is_receiver_child(info.path())
+            {
                 by_device
                     .entry(device_group_key(info))
                     .or_default()
@@ -595,8 +605,7 @@ impl HidSession {
             let key = if let Some(key) = self.device_keys.get(&device_id) {
                 key.clone()
             } else {
-                let key = format!("hid-{}", self.next_key);
-                self.next_key += 1;
+                let key = self.unused_key(stable_device_key(&device_id));
                 self.device_keys.insert(device_id, key.clone());
                 key
             };
@@ -630,6 +639,19 @@ impl HidSession {
         }
         summaries.sort_by(|left, right| left.key.cmp(&right.key));
         Ok(summaries)
+    }
+
+    /// `key`, or with a counter appended when another device in this session
+    /// already has it (two identical devices with no serial).
+    fn unused_key(&self, key: String) -> String {
+        let taken = |candidate: &str| self.device_keys.values().any(|used| used == candidate);
+        if !taken(&key) {
+            return key;
+        }
+        (2..)
+            .map(|count| format!("{key}-{count}"))
+            .find(|candidate| !taken(candidate))
+            .unwrap_or(key)
     }
 
     fn reconcile_inventory(&mut self, present: &HashSet<Vec<u8>>) -> Result<(), String> {
@@ -750,7 +772,7 @@ impl HidSession {
     fn handle_resume(&mut self) {
         let keys = self.open_devices.keys().cloned().collect::<Vec<_>>();
         if keys.is_empty() {
-            let _ = self.api.refresh_devices();
+            let _ = refresh_api(&mut self.api);
             return;
         }
         for key in keys {
@@ -775,8 +797,7 @@ impl HidSession {
     /// fresh inventory, and reopens it.
     fn recover(&mut self, key: &str) -> Result<(), String> {
         self.close(key)?;
-        self.api
-            .refresh_devices()
+        refresh_api(&mut self.api)
             .map_err(|error| format!("could not refresh HID devices: {error}"))?;
         let identity = self
             .device_keys
@@ -784,10 +805,11 @@ impl HidSession {
             .find(|(_, device_key)| device_key.as_str() == key)
             .map(|(identity, _)| identity.clone())
             .ok_or_else(|| "the selected HID interface is no longer available".to_owned())?;
+        let blocked = security_key_paths(&self.api);
         let infos = self
             .api
             .device_list()
-            .filter(|info| device_group_key(info) == identity)
+            .filter(|info| device_group_key(info) == identity && !blocked.contains(info.path()))
             .cloned()
             .collect::<Vec<_>>();
         if infos.is_empty() {
@@ -1037,6 +1059,7 @@ impl HidSession {
                 Ok(length) => length,
                 Err(_) if open.vendor_id == RAZER_VENDOR_ID => RAZER_FEATURE_BUFFER_LEN,
                 Err(_) if open.vendor_id == MICROSOFT_VENDOR_ID => 64,
+                Err(_) if open.vendor_id == THERMALTAKE_VENDOR_ID => THERMALTAKE_FEATURE_BUFFER_LEN,
                 Err(_) => continue,
             };
             available = true;
@@ -1080,10 +1103,169 @@ impl HidSession {
 /// The bytes after the report-id byte of a read into `data`. hidapi on Windows
 /// adds one to the count when the first byte is 0 (an unnumbered report), so a
 /// read that fills the buffer reports one byte more than the buffer holds.
-fn report_payload(data: &[u8], size: usize) -> Vec<u8> {
+pub(crate) fn report_payload(data: &[u8], size: usize) -> Vec<u8> {
     data.get(1..size.min(data.len()))
         .unwrap_or_default()
         .to_vec()
+}
+
+/// hidapi enumerates devices outside its own initialisation lock, and on macOS
+/// every enumeration shares one IOHIDManager and run loop, so two threads
+/// enumerating at once can crash the process with SIGTRAP. Bridge enumerates
+/// from the control-panel session, the battery poll, the 5-second device scan
+/// and the tests, so every enumeration goes through this lock.
+static ENUMERATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// hidapi's macOS backend schedules its IOHIDManager on the run loop of the
+/// thread that first initialises it. When that thread exits (a test thread, or
+/// a pool thread that went idle) the run loop goes with it, and the next
+/// enumeration from any other thread traps. So the one-time initialisation runs
+/// on a thread that lives as long as the process.
+#[cfg(target_os = "macos")]
+fn initialise_on_a_permanent_thread() {
+    static INITIALISED: std::sync::Once = std::sync::Once::new();
+    INITIALISED.call_once(|| {
+        let (done, wait) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("openmouse-hid-init".into())
+            .spawn(move || {
+                let _ = HidApi::new();
+                let _ = done.send(());
+                loop {
+                    std::thread::park();
+                }
+            });
+        if spawned.is_ok() {
+            let _ = wait.recv();
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn initialise_on_a_permanent_thread() {}
+
+/// A new HID context (which enumerates), serialised with every other one.
+pub(crate) fn new_api() -> hidapi::HidResult<HidApi> {
+    let _guard = ENUMERATION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    initialise_on_a_permanent_thread();
+    HidApi::new()
+}
+
+/// Refreshes a context's device list, serialised with every other enumeration.
+pub(crate) fn refresh_api(api: &mut HidApi) -> hidapi::HidResult<()> {
+    let _guard = ENUMERATION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    api.refresh_devices()
+}
+
+/// The interfaces of one device that declare a feature report, opened for a
+/// native driver that talks to the mouse itself rather than through a control
+/// panel session.
+pub(crate) struct FeatureInterfaces {
+    // Keeps the HID library initialised while the devices are open.
+    _api: HidApi,
+    pub interfaces: Vec<FeatureInterface>,
+}
+
+pub(crate) struct FeatureInterface {
+    pub device: HidDevice,
+    pub product_id: u16,
+    /// Buffer size to read the feature report into, report id byte included.
+    pub buffer_len: usize,
+}
+
+/// Opens every vendor-defined interface (usage page `0xff00` and up) of the
+/// given products whose report descriptor declares feature report `report_id`.
+/// Standard mouse, keyboard and consumer interfaces are never opened.
+pub(crate) fn feature_interfaces(
+    vendor_id: u16,
+    product_ids: &[u16],
+    report_id: u8,
+) -> Result<FeatureInterfaces, String> {
+    let api = new_api().map_err(|error| error.to_string())?;
+    let mut seen = HashSet::new();
+    let mut interfaces = Vec::new();
+    for info in api.device_list() {
+        if info.vendor_id() != vendor_id
+            || !product_ids.contains(&info.product_id())
+            || info.usage_page() < 0xff00
+            || !seen.insert(info.path().to_bytes().to_vec())
+        {
+            continue;
+        }
+        let Ok(device) = api.open_path(info.path()) else {
+            continue;
+        };
+        let mut descriptor = vec![0; MAX_REPORT_DESCRIPTOR_SIZE];
+        let Ok(size) = device.get_report_descriptor(&mut descriptor) else {
+            continue;
+        };
+        let Ok((_, layout)) = parse_report_descriptor(&descriptor[..size]) else {
+            continue;
+        };
+        if let Ok(buffer_len) = layout.feature_buffer_len(report_id) {
+            interfaces.push(FeatureInterface {
+                device,
+                product_id: info.product_id(),
+                buffer_len,
+            });
+        }
+    }
+    Ok(FeatureInterfaces {
+        _api: api,
+        interfaces,
+    })
+}
+
+/// Whether `path` is a hidraw node the Linux kernel made for a device paired
+/// through a Logitech receiver (`hid-logitech-dj`), rather than the receiver
+/// itself. Windows and macOS have no such node, so the control panel never
+/// expects one: it reported the receiver's name ("USB Receiver"), was tried
+/// first, and its HID++ probes went unanswered for 10-20 s before the panel
+/// fell back to the real receiver. The panel reaches paired mice through the
+/// receiver, as on the other platforms, so these nodes are left out. Bridge's
+/// own bus scan leaves them out too: the receiver stands for its mice.
+#[cfg(target_os = "linux")]
+pub(crate) fn is_receiver_child(path: &std::ffi::CStr) -> bool {
+    let Some(node) = path
+        .to_str()
+        .ok()
+        .and_then(|path| path.strip_prefix("/dev/"))
+    else {
+        return false;
+    };
+    std::fs::read_to_string(format!("/sys/class/hidraw/{node}/device/uevent"))
+        .is_ok_and(|uevent| is_receiver_child_uevent(&uevent))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn is_receiver_child(_path: &std::ffi::CStr) -> bool {
+    false
+}
+
+/// The `uevent` side of [`is_receiver_child`]: the per-device HID++ driver,
+/// on a physical path with the receiver's device index appended
+/// (`usb-0000:00:14.0-9/input2:1`). Wired and Bluetooth mice on the same
+/// driver have no such suffix.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn is_receiver_child_uevent(uevent: &str) -> bool {
+    let field = |name: &str| {
+        uevent
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
+    };
+    field("DRIVER") == Some("logitech-hidpp-device")
+        && field("HID_PHYS")
+            .and_then(|phys| phys.rsplit_once('/'))
+            .and_then(|(_, interface)| interface.split_once(':'))
+            .is_some_and(|(input, index)| {
+                input.starts_with("input")
+                    && !index.is_empty()
+                    && index.bytes().all(|byte| byte.is_ascii_digit())
+            })
 }
 
 fn grouped_device_key(
@@ -1109,6 +1291,54 @@ fn grouped_device_key(
     key.extend_from_slice(&(identity.len() as u64).to_le_bytes());
     key.extend_from_slice(identity);
     key
+}
+
+/// The key a device is listed under: the same for the same device across
+/// sessions, page reloads and Bridge restarts, so the control panel can
+/// remember what it learned about it (that a receiver carries a mouse, and
+/// that mouse's name). Before, keys were numbered per session in no fixed
+/// order, so a reload forgot all of it.
+///
+/// `hid-<vendor><product>-<hash>`, where the hash covers the device's
+/// grouping identity (vendor, product and serial, or the interface or path
+/// without one). The serial itself is never sent: WebHID does not give pages
+/// serial numbers, and Bridge should not either.
+fn stable_device_key(identity: &[u8]) -> String {
+    // FNV-1a: fixed, unlike `HashMap`'s randomly seeded hasher.
+    let hash = identity
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+    let id = |at: usize| {
+        u16::from_le_bytes([
+            identity.get(at).copied().unwrap_or(0),
+            identity.get(at + 1).copied().unwrap_or(0),
+        ])
+    };
+    let (vendor, product) = (id(0), id(2));
+    format!(
+        "hid-{vendor:04x}{product:04x}-{:08x}",
+        hash as u32 ^ (hash >> 32) as u32
+    )
+}
+
+/// The paths that carry a FIDO collection. A path is blocked whole, since one
+/// hidraw node can hold a security key's collection beside others.
+fn security_key_paths(api: &HidApi) -> HashSet<std::ffi::CString> {
+    security_key_paths_in(
+        api.device_list()
+            .map(|info| (info.path(), info.usage_page())),
+    )
+}
+
+fn security_key_paths_in<'a>(
+    interfaces: impl Iterator<Item = (&'a std::ffi::CStr, u16)>,
+) -> HashSet<std::ffi::CString> {
+    interfaces
+        .filter(|(_, usage_page)| *usage_page == FIDO_USAGE_PAGE)
+        .map(|(path, _)| path.to_owned())
+        .collect()
 }
 
 fn device_group_key(info: &hidapi::DeviceInfo) -> Vec<u8> {
@@ -1228,6 +1458,11 @@ struct CollectionNode {
     parent: Option<usize>,
 }
 
+/// Deepest collection nesting accepted. Real devices nest a handful deep; a
+/// descriptor from a hostile device could otherwise nest ~1,400 deep and
+/// drive the recursive tree building and serialization.
+const MAX_COLLECTION_DEPTH: usize = 64;
+
 fn parse_report_descriptor(bytes: &[u8]) -> Result<(Vec<CollectionInfo>, ReportLayout), String> {
     let mut globals = GlobalState::default();
     let mut global_stack = Vec::new();
@@ -1286,6 +1521,9 @@ fn parse_report_descriptor(bytes: &[u8]) -> Result<(Vec<CollectionInfo>, ReportL
                 (u32::from(globals.usage_page) << 16) | (value & 0xffff)
             }),
             (0, 10) => {
+                if collections.len() >= MAX_COLLECTION_DEPTH {
+                    return Err("HID descriptor nests collections too deep".into());
+                }
                 let usage = usages.first().copied().unwrap_or(0);
                 let index = nodes.len();
                 let parent = collections.last().copied();
@@ -1445,6 +1683,14 @@ impl Drop for ActiveSessionGuard {
     }
 }
 
+/// Counts as an open control-panel HID session until dropped. The counter is
+/// process-wide, so callers hold `drivers::TEST_NATIVE` alongside it to keep
+/// other native tests from observing the session.
+#[cfg(test)]
+pub(crate) fn hold_client_session() -> impl Sized {
+    ActiveSessionGuard::new()
+}
+
 pub async fn serve(mut socket: WebSocket) {
     let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
     let Ok(_active) = tokio::task::spawn_blocking(ActiveSessionGuard::new).await else {
@@ -1555,6 +1801,72 @@ async fn send_json(socket: &mut impl HidSocket, value: &impl Serialize) -> Resul
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn device_keys_are_stable_and_never_carry_the_serial() {
+        let receiver = grouped_device_key(0x046d, 0xc54d, b"/dev/hidraw2", Some("375D35803234"));
+        let key = stable_device_key(&receiver);
+        // Same device, another session or interface path: same key.
+        assert_eq!(
+            stable_device_key(&grouped_device_key(
+                0x046d,
+                0xc54d,
+                b"/dev/hidraw4",
+                Some("375D35803234")
+            )),
+            key
+        );
+        assert!(key.starts_with("hid-046dc54d-"), "{key}");
+        assert!(!key.contains("375D35803234"));
+        // Another receiver of the same model.
+        assert_ne!(
+            stable_device_key(&grouped_device_key(
+                0x046d,
+                0xc54d,
+                b"/dev/hidraw2",
+                Some("0000AAAA")
+            )),
+            key
+        );
+    }
+
+    #[test]
+    fn a_taken_key_gets_a_counter() {
+        let (input_tx, _, _) = input_channel();
+        let mut session = HidSession::new(u64::MAX - 41_140, input_tx).unwrap();
+        session
+            .device_keys
+            .insert(b"a".to_vec(), "hid-12345678-00000001".into());
+        assert_eq!(
+            session.unused_key("hid-12345678-00000001".into()),
+            "hid-12345678-00000001-2"
+        );
+        assert_eq!(session.unused_key("hid-other".into()), "hid-other");
+    }
+
+    #[test]
+    fn only_the_kernels_receiver_children_are_left_out() {
+        use super::is_receiver_child_uevent as child;
+        // A mouse paired through a Logitech receiver, split out by hid-logitech-dj.
+        assert!(child(
+            "DRIVER=logitech-hidpp-device\nHID_ID=0003:0000046D:000040B7\n\
+             HID_NAME=Logitech PRO X 2c\nHID_PHYS=usb-0000:00:14.0-9/input2:1\n"
+        ));
+        // The receiver itself.
+        assert!(!child(
+            "DRIVER=logitech-djreceiver\nHID_ID=0003:0000046D:0000C54D\n\
+             HID_PHYS=usb-0000:00:14.0-9/input2\n"
+        ));
+        // A wired Logitech mouse on the same driver.
+        assert!(!child(
+            "DRIVER=logitech-hidpp-device\nHID_PHYS=usb-0000:00:14.0-3/input1\n"
+        ));
+        // A Bluetooth one: the physical path is an address.
+        assert!(!child(
+            "DRIVER=logitech-hidpp-device\nHID_ID=0005:0000046D:0000B023\n\
+             HID_PHYS=aa:bb:cc:dd:ee:ff\n"
+        ));
+    }
+
     /// macOS seizes devices opened in exclusive mode, which stops a mouse's
     /// pointer collection from moving the cursor while Bridge holds it.
     #[cfg(target_os = "macos")]
@@ -1565,7 +1877,7 @@ mod tests {
         if std::env::var_os("OPENMOUSE_SKIP_IOHID_TEST").is_some() {
             return;
         }
-        let api = HidApi::new().expect("HID subsystem should initialize");
+        let api = new_api().expect("HID subsystem should initialize");
         assert!(!api.get_open_exclusive());
     }
 
@@ -1719,6 +2031,25 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_enumeration_does_not_crash() {
+        // Unserialised hidapi enumeration crashes macOS with SIGTRAP, only now
+        // and then, so this hammers it from several threads.
+        let threads: Vec<_> = (0..6)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..12 {
+                        let mut api = new_api().expect("HID subsystem should initialize");
+                        refresh_api(&mut api).expect("refresh");
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("enumeration thread");
+        }
+    }
+
+    #[test]
     fn report_payload_never_reads_past_the_buffer() {
         // A full unnumbered Razer read: hidapi on Windows reports 92 bytes.
         let full = [0; RAZER_FEATURE_BUFFER_LEN];
@@ -1857,5 +2188,35 @@ mod tests {
             collections[0].children[0].input_reports[0].items[0].report_size,
             1
         );
+    }
+
+    #[test]
+    fn descriptor_nesting_is_capped() {
+        let nested = |depth: usize| {
+            let mut descriptor = vec![0x06, 0x00, 0xff, 0x09, 0x01];
+            descriptor.extend(std::iter::repeat_n([0xa1, 0x02], depth).flatten());
+            descriptor.extend(std::iter::repeat_n(0xc0, depth));
+            descriptor
+        };
+        assert!(parse_report_descriptor(&nested(MAX_COLLECTION_DEPTH)).is_ok());
+        assert!(parse_report_descriptor(&nested(MAX_COLLECTION_DEPTH + 1)).is_err());
+        assert!(parse_report_descriptor(&nested(1_400)).is_err());
+    }
+
+    #[test]
+    fn a_path_with_a_security_key_collection_is_blocked_whole() {
+        let key = c"/dev/hidraw3";
+        let mouse = c"/dev/hidraw1";
+        let blocked = security_key_paths_in(
+            [
+                (mouse, 0x0001),
+                (mouse, 0xff00),
+                (key, 0x0001),
+                (key, FIDO_USAGE_PAGE),
+            ]
+            .into_iter(),
+        );
+        assert!(blocked.contains(key));
+        assert!(!blocked.contains(mouse));
     }
 }

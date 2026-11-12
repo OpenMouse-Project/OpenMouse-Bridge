@@ -1,0 +1,540 @@
+//! The window: a GPUI tray panel.
+//!
+//! `BackgroundServer` owns the service, its HTTP API and HID on its own thread
+//! and hands this module snapshot, update, notice and panel-request channels,
+//! which are polled on a timer. See docs/gpui-migration.md.
+
+mod ascii;
+mod panel;
+mod theme;
+mod tray;
+
+use std::{
+    panic::{self, AssertUnwindSafe},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
+    time::{Duration, Instant, SystemTime},
+};
+
+use anyhow::Result;
+use gpui_kit::*;
+use panel::{CoreLinks, PanelView};
+
+use crate::runtime::{
+    BackgroundServer, RELAUNCH_DELAY, WINDOW_HEIGHT, WINDOW_WIDTH, current_relaunch_generation,
+    next_relaunch_generation, panic_message, restart_bridge, resume_gap,
+};
+
+/// How often the channels from the core are drained; a tray click waits at
+/// most this long.
+const POLL: Duration = Duration::from_millis(200);
+
+/// How long a newly opened layer-shell panel gets to be mapped before it is
+/// activated with the tray click's token.
+#[cfg(target_os = "linux")]
+const LAYER_MAP_DELAY: Duration = Duration::from_millis(150);
+
+/// Set when the process is asked to stop (SIGTERM, SIGINT or SIGHUP), so the
+/// app quits the way its Quit button does: the runtime stops and cleans up,
+/// unloading the KWin focus script among other things. Without a handler
+/// those signals ended the process on the spot.
+#[cfg(unix)]
+static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+fn watch_stop_signals() {
+    let watcher = thread::Builder::new()
+        .name("openmouse-bridge-signals".into())
+        .spawn(|| {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            runtime.block_on(async {
+                use tokio::signal::unix::{SignalKind, signal};
+                let (Ok(mut terminate), Ok(mut interrupt), Ok(mut hangup)) = (
+                    signal(SignalKind::terminate()),
+                    signal(SignalKind::interrupt()),
+                    signal(SignalKind::hangup()),
+                ) else {
+                    return;
+                };
+                loop {
+                    tokio::select! {
+                        _ = terminate.recv() => {}
+                        _ = interrupt.recv() => {}
+                        _ = hangup.recv() => {}
+                    }
+                    if STOP_REQUESTED.swap(true, Ordering::SeqCst) {
+                        // Asked again while still quitting: stop now.
+                        std::process::exit(143);
+                    }
+                    tracing::info!("asked to stop; quitting");
+                }
+            });
+        });
+    if let Err(error) = watcher {
+        tracing::warn!(%error, "could not watch for stop signals");
+    }
+}
+
+pub fn run() -> Result<()> {
+    tracing::info!("starting the GPUI shell");
+    #[cfg(unix)]
+    watch_stop_signals();
+    let (notice_tx, notices) = mpsc::channel();
+    let Some((server, snapshots, commands, updates, panel_requests, show_panel)) =
+        BackgroundServer::start(notice_tx)?
+    else {
+        return Ok(());
+    };
+    let exit = ExitFlags::default();
+    let app_exit = exit.clone();
+    let gui_started = Instant::now();
+
+    // A panic in the window must not take the whole app down for good: it is
+    // caught here so the relaunch below can run.
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        application().with_assets(assets::AllAssets).run(move |cx| {
+            init(cx);
+            theme::apply(cx);
+            crate::runtime::configure_tray_only_application();
+
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                    None,
+                    size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)),
+                    cx,
+                ))),
+                titlebar: None,
+                // X11 PopUp is override-redirect: the WM cannot minimize it
+                // or provide the taskbar recovery path used by the Linux tray.
+                kind: if cfg!(target_os = "linux") {
+                    WindowKind::Normal
+                } else {
+                    WindowKind::PopUp
+                },
+                #[cfg(target_os = "linux")]
+                app_id: Some("io.openmouse.bridge".into()),
+                // The panel draws its own header, close button and drag area,
+                // as on macOS and Windows; without this the window manager
+                // adds a second title bar with its own controls above it.
+                window_decorations: cfg!(target_os = "linux").then_some(WindowDecorations::Client),
+                is_resizable: false,
+                is_minimizable: cfg!(target_os = "linux"),
+                ..Default::default()
+            };
+            let view_exit = app_exit.clone();
+            let (handle, view) = open_window(options, cx, move |_, cx| {
+                cx.new(|cx| {
+                    PanelView::new(
+                        CoreLinks {
+                            snapshots,
+                            commands,
+                            updates,
+                            notices,
+                            panel_requests,
+                        },
+                        view_exit,
+                        show_panel,
+                        cx.focus_handle(),
+                    )
+                })
+            })
+            .expect("failed to open the Bridge panel");
+
+            // The panel opens at launch on a first run, and when asked to by the
+            // environment.
+            let show_panel =
+                show_panel || std::env::var_os("OPENMOUSE_BRIDGE_SHOW_WINDOW").is_some();
+            let (tray_commands, mut tray_handle) = match tray::install(cx, handle) {
+                Some((commands, tray)) => (Some(commands), Some(tray)),
+                None => (None, None),
+            };
+            #[cfg(target_os = "linux")]
+            let handle = {
+                close_hides_or_quits(cx, handle, app_exit.clone());
+                // On Wayland a normal window can neither place itself by the
+                // tray nor be hidden, so with a tray (and a compositor that has
+                // layer-shell) the panel is a surface pinned to the tray's
+                // corner instead, opened when shown and closed when hidden.
+                let layer = tray_commands.is_some()
+                    && cx
+                        .update_window(handle, |_, window, _| {
+                            raw_window_handle::HasDisplayHandle::display_handle(window).is_ok_and(
+                                |display| tray::wayland_layer_shell_available(display.as_raw()),
+                            )
+                        })
+                        .unwrap_or(false);
+                if layer {
+                    tray::set_layer_panel(true);
+                    // Closing the panel must not end the app.
+                    cx.set_quit_mode(QuitMode::Explicit);
+                    let _ = cx.update_window(handle, |_, window, _| window.remove_window());
+                    if show_panel {
+                        open_layer_panel(cx, &view, None, app_exit.clone()).unwrap_or(handle)
+                    } else {
+                        handle
+                    }
+                } else {
+                    handle
+                }
+            };
+            #[cfg(target_os = "linux")]
+            if tray::layer_panel() {
+                if show_panel {
+                    cx.activate(true);
+                }
+            } else if !show_panel && tray_commands.is_some() {
+                let _ = cx.update_window(handle, |_, window, _| tray::hide(window));
+            } else {
+                cx.activate(true);
+            }
+            #[cfg(not(target_os = "linux"))]
+            if !show_panel && tray_commands.is_some() {
+                let _ = cx.update_window(handle, |_, window, _| tray::hide(window));
+            } else {
+                // Shown at launch (the first run): beside the tray, not mid-screen.
+                if tray_commands.is_some() {
+                    let _ = cx.update_window(handle, |_, window, _| tray::place(window, None));
+                }
+                cx.activate(true);
+            }
+
+            // Kept strong: a closed layer-shell panel drops its window, and the
+            // next show reopens one around this same view.
+            #[cfg(target_os = "linux")]
+            let panel_view = view.clone();
+            #[cfg(target_os = "linux")]
+            let layer_exit = app_exit.clone();
+            #[cfg(target_os = "linux")]
+            let mut handle = handle;
+            let view = view.downgrade();
+            cx.spawn(async move |cx| {
+                let mut wait = POLL;
+                let mut last_anchor: Option<tray::Anchor> = None;
+                let mut last_tick = SystemTime::now();
+                loop {
+                    cx.background_executor().timer(wait).await;
+                    // This loop runs several times a second, so a long
+                    // wall-clock gap means the PC slept or hibernated and the
+                    // tray icon may be gone.
+                    let now = SystemTime::now();
+                    if let Some(gap) = resume_gap(std::mem::replace(&mut last_tick, now), now) {
+                        tracing::info!(?gap, "Resumed from sleep; recreating the tray icon");
+                        if let Some(tray) = tray_handle.as_mut() {
+                            tray.recreate();
+                        }
+                    }
+                    let tray_requests: Vec<tray::Command> = tray_commands
+                        .as_ref()
+                        .map(|commands| commands.try_iter().collect())
+                        .unwrap_or_default();
+                    let Ok((drained, tray_battery)) =
+                        view.update(cx, |view: &mut PanelView, cx| {
+                            let drained = view.drain();
+                            if drained.changed {
+                                cx.notify();
+                            }
+                            (drained, view.tray_battery())
+                        })
+                    else {
+                        break;
+                    };
+                    let (panel_wanted, overlay_delay) =
+                        (drained.panel_requested, drained.overlay_delay);
+                    if let Some(tray) = tray_handle.as_mut() {
+                        tray.show_battery(tray_battery);
+                    }
+                    if drained.quit_for_update {
+                        // The updater has staged the new version and started its
+                        // helper, which waits for this process to exit, installs,
+                        // and relaunches. Exiting without a restart of our own.
+                        tracing::info!("exiting so the staged update can be installed");
+                        cx.update(|cx| app_exit.quit(cx));
+                        break;
+                    }
+                    #[cfg(unix)]
+                    if STOP_REQUESTED.load(Ordering::SeqCst) {
+                        cx.update(|cx| app_exit.quit(cx));
+                        break;
+                    }
+                    // A fading banner needs a frame every ~16 ms; otherwise idle.
+                    wait = overlay_delay.map_or(POLL, |delay| delay.min(POLL));
+                    // The newest click says where the icon is; a request with no
+                    // click (the API, a second launch) reuses where it last was.
+                    let clicked_at = tray_requests
+                        .iter()
+                        .rev()
+                        .find_map(|command| match command {
+                            tray::Command::Show(anchor) | tray::Command::Toggle(anchor) => {
+                                Some(*anchor)
+                            }
+                            _ => None,
+                        });
+                    if let Some(Some(anchor)) = clicked_at {
+                        last_anchor = Some(anchor);
+                    }
+                    // A closed layer-shell panel is hidden even if nothing
+                    // hid it (the compositor can close the surface itself).
+                    #[cfg(target_os = "linux")]
+                    let shown = tray::shown()
+                        && !(tray::layer_panel()
+                            && cx.update_window(handle, |_, _, _| ()).is_err());
+                    #[cfg(not(target_os = "linux"))]
+                    let shown = tray::shown();
+                    let wanted = panel_wanted_after(shown, panel_wanted, &tray_requests);
+                    if wanted == Some(false) && shown {
+                        tracing::debug!("hiding the panel from a tray click");
+                        let _ = cx.update_window(handle, |_, window, _| tray::hide(window));
+                    }
+                    let show = wanted == Some(true);
+                    if show {
+                        tracing::debug!(panel_wanted, "showing the panel");
+                        let anchor = last_anchor;
+                        #[cfg(target_os = "linux")]
+                        if tray::layer_panel() && cx.update_window(handle, |_, _, _| ()).is_err() {
+                            let opened = cx.update(|cx| {
+                                open_layer_panel(cx, &panel_view, anchor, layer_exit.clone())
+                            });
+                            if let Some(opened) = opened {
+                                handle = opened;
+                                // KWin ignores an activation for a surface it has
+                                // not mapped yet, which left the new panel without
+                                // keyboard focus (Escape did nothing). Let the first
+                                // configure and frame land before using the token.
+                                cx.background_executor().timer(LAYER_MAP_DELAY).await;
+                            }
+                        }
+                        let _ = cx.update_window(handle, |_, window, _| tray::show(window, anchor));
+                    }
+                    for command in tray_requests {
+                        match command {
+                            tray::Command::Show(_) | tray::Command::Toggle(_) => {}
+                            tray::Command::Restart => {
+                                cx.update(|cx| app_exit.restart(cx));
+                            }
+                            tray::Command::Quit => {
+                                cx.update(|cx| app_exit.quit(cx));
+                            }
+                        }
+                    }
+                }
+            })
+            .detach();
+        });
+    }));
+
+    let stopped = server.stop();
+    if let Err(payload) = &outcome {
+        tracing::error!(error = %panic_message(payload), "the GPUI shell panicked");
+    }
+    if exit.restart.load(Ordering::Relaxed) {
+        restart_bridge(current_relaunch_generation())?;
+        return stopped;
+    }
+    // The window ended and nobody asked it to (a quit, a restart or an update
+    // all set `deliberate`): start Bridge again, unless it keeps dying at once.
+    let deliberate = exit.deliberate.load(Ordering::Relaxed);
+    if let Some(generation) = next_relaunch_generation(
+        current_relaunch_generation(),
+        gui_started.elapsed(),
+        !deliberate,
+    ) {
+        if outcome.is_err() {
+            thread::sleep(RELAUNCH_DELAY);
+        }
+        tracing::info!(
+            generation,
+            "relaunching Bridge after its window stopped unexpectedly"
+        );
+        restart_bridge(generation)?;
+        return Ok(());
+    }
+    stopped
+}
+
+/// Whether the panel should end up shown (`Some(true)`) or hidden
+/// (`Some(false)`) after this poll's requests, or `None` when nothing asked.
+/// Requests apply in order: an API or second-launch request and the tray's
+/// Show open it, and each click on the icon flips what the one before left.
+fn panel_wanted_after(shown: bool, api_request: bool, commands: &[tray::Command]) -> Option<bool> {
+    let mut wanted = api_request.then_some(true);
+    for command in commands {
+        match command {
+            tray::Command::Show(_) => wanted = Some(true),
+            tray::Command::Toggle(_) => wanted = Some(!wanted.unwrap_or(shown)),
+            tray::Command::Restart | tray::Command::Quit => {}
+        }
+    }
+    wanted
+}
+
+/// Makes the window's close button hide the panel to the tray, or quit when
+/// there is no tray to bring it back from.
+#[cfg(target_os = "linux")]
+fn close_hides_or_quits(cx: &mut App, handle: AnyWindowHandle, exit: ExitFlags) {
+    let _ = cx.update_window(handle, |_, window, cx| {
+        window.on_window_should_close(cx, move |window, cx| {
+            if tray::can_hide() {
+                tray::hide(window);
+            } else {
+                exit.quit(cx);
+            }
+            false
+        });
+    });
+}
+
+/// Opens the panel as a layer-shell surface in the screen corner nearest the
+/// tray click (see [`tray::layer_corner`]).
+#[cfg(target_os = "linux")]
+fn open_layer_panel(
+    cx: &mut App,
+    view: &Entity<PanelView>,
+    anchor: Option<tray::Anchor>,
+    exit: ExitFlags,
+) -> Option<AnyWindowHandle> {
+    let screens: Vec<_> = cx
+        .displays()
+        .iter()
+        .map(|display| display.bounds())
+        .collect();
+    let screen = tray::layer_screen(anchor, &screens);
+    let corner = tray::layer_corner(anchor, screen);
+    let work_area = tray::x11_work_area();
+    let margins = tray::layer_margins(screen, work_area);
+    tracing::debug!(
+        ?anchor,
+        ?screen,
+        ?work_area,
+        ?corner,
+        ?margins,
+        "opening the layer-shell panel"
+    );
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+            point(px(0.), px(0.)),
+            size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)),
+        ))),
+        titlebar: None,
+        kind: WindowKind::LayerShell(tray::layer_options(corner, margins)),
+        app_id: Some("io.openmouse.bridge".into()),
+        is_resizable: false,
+        ..Default::default()
+    };
+    let view = view.clone();
+    match open_window(options, cx, move |_, _| view) {
+        Ok((handle, _)) => {
+            close_hides_or_quits(cx, handle, exit);
+            Some(handle)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Could not open the layer-shell panel");
+            None
+        }
+    }
+}
+
+/// Why the app is ending. A window that ends without `deliberate` set ended
+/// unexpectedly, and Bridge relaunches itself.
+#[derive(Clone, Default)]
+pub struct ExitFlags {
+    pub restart: Arc<AtomicBool>,
+    pub deliberate: Arc<AtomicBool>,
+}
+
+impl ExitFlags {
+    /// Quits on purpose.
+    pub fn quit(&self, cx: &mut App) {
+        self.deliberate.store(true, Ordering::Relaxed);
+        cx.quit();
+    }
+
+    /// Quits on purpose, and Bridge starts again once it has stopped.
+    pub fn restart(&self, cx: &mut App) {
+        self.restart.store(true, Ordering::Relaxed);
+        self.quit(cx);
+    }
+}
+
+/// An empty snapshot for tests of the shell's pieces.
+#[cfg(test)]
+pub(crate) fn test_snapshot() -> openmouse_bridge::service::BridgeSnapshot {
+    openmouse_bridge::service::BridgeSnapshot {
+        version: "test",
+        platform: "test",
+        linux_distribution: None,
+        uptime_seconds: 0,
+        active_games: vec![],
+        games: vec![],
+        tracked_game_count: 0,
+        battery_threshold_percent: 20,
+        tray_battery_style: "glyph".to_owned(),
+        hybrid_mode: true,
+        device_mode: "onboard".to_owned(),
+        autostart_enabled: false,
+        automatic_updates: false,
+        notification_sound: true,
+        notification_volume: 60,
+        foreground_application: None,
+        active_profile: None,
+        active_profile_is_default: false,
+        native_automation_error: None,
+        pending_native_restores: 0,
+        visible_application_count: 0,
+        profile_count: 0,
+        client_connected: false,
+        active_devices: vec![],
+        batteries: vec![],
+        known_devices: vec![],
+        blocked_hid_devices: vec![],
+        whats_new: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{panel_wanted_after, tray::Command};
+
+    #[test]
+    fn a_tray_click_toggles_the_panel_and_other_requests_open_it() {
+        // Nothing asked: leave the panel as it is.
+        assert_eq!(panel_wanted_after(true, false, &[]), None);
+        // A click hides a shown panel and shows a hidden one.
+        assert_eq!(
+            panel_wanted_after(true, false, &[Command::Toggle(None)]),
+            Some(false)
+        );
+        assert_eq!(
+            panel_wanted_after(false, false, &[Command::Toggle(None)]),
+            Some(true)
+        );
+        // Two clicks in one poll cancel out.
+        assert_eq!(
+            panel_wanted_after(
+                false,
+                false,
+                &[Command::Toggle(None), Command::Toggle(None)]
+            ),
+            Some(false)
+        );
+        // The menu's Open and API requests only ever show it.
+        assert_eq!(
+            panel_wanted_after(true, false, &[Command::Show(None)]),
+            Some(true)
+        );
+        assert_eq!(panel_wanted_after(true, true, &[]), Some(true));
+        // A click after an API request in the same poll flips the opened panel.
+        assert_eq!(
+            panel_wanted_after(false, true, &[Command::Toggle(None)]),
+            Some(false)
+        );
+    }
+}

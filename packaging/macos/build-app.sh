@@ -35,7 +35,7 @@ if [ -n "$(find "$app" -type l)" ]; then
   exit 1
 fi
 
-# 1.0.0-beta.19 -> short version as-is, build number numeric.
+# 1.0.0-beta.19 -> short version as-is, build number numeric (1.0.0).
 build="${version%%-*}"
 sed -e "s/@VERSION@/$version/" -e "s/@BUILD@/$build/" \
   "$here/Info.plist" > "$app/Contents/Info.plist"

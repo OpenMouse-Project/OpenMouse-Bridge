@@ -691,23 +691,6 @@ fn release(version: &str) -> Release {
 }
 
 #[test]
-fn newer_stable_release_is_selected() {
-    if platform_archive_name().is_err() {
-        return;
-    }
-    let update = select_update(release("2.0.0"), "1.9.0")
-        .expect("release should parse")
-        .expect("new release should be selected");
-    assert_eq!(update.version, "2.0.0");
-}
-
-#[test]
-fn current_or_older_release_is_ignored() {
-    assert!(select_update(release("1.3.2"), "1.3.2").unwrap().is_none());
-    assert!(select_update(release("1.2.9"), "1.3.2").unwrap().is_none());
-}
-
-#[test]
 fn stub_completion_accepts_the_running_version_but_not_an_older_release() {
     if platform_archive_name().is_err() {
         return;
@@ -747,8 +730,60 @@ fn updates_use_the_full_package_not_the_legacy_bridge_archive() {
         ],
     };
     if name != legacy {
-        assert!(select_update(release, "1.9.0").is_err());
+        assert!(select_completion(release, "1.9.0").is_err());
     }
+}
+
+/// Runs the AppImage helper's swap against throwaway files: the new image
+/// replaces the old, and every failure keeps the old one and leaves a note.
+#[cfg(unix)]
+#[test]
+fn appimage_swap_installs_or_keeps_the_current_image() {
+    let root = fixture();
+    let run = |staged: &str, target: &str| {
+        let script = format!(
+            "log=\"$1/update.log\"\nfailure=\"$1/failed.txt\"\n{UNIX_LOGGING}{APPIMAGE_SWAP}swap_appimage \"$2\" \"$3\"\n"
+        );
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .arg("sh")
+            .arg(&root)
+            .arg(staged)
+            .arg(target)
+            .status()
+            .unwrap()
+    };
+    let target = root.join("Bridge.AppImage");
+    let staged = root.join(".update.AppImage");
+
+    fs::write(&target, b"old").unwrap();
+    fs::write(&staged, b"new").unwrap();
+    assert!(run(staged.to_str().unwrap(), target.to_str().unwrap()).success());
+    assert_eq!(fs::read(&target).unwrap(), b"new");
+    assert!(!staged.exists());
+    assert!(!root.join("Bridge.AppImage.previous").exists());
+    assert!(!root.join("failed.txt").exists());
+
+    // The download vanished: the current image stays and the failure is noted.
+    assert!(!run(staged.to_str().unwrap(), target.to_str().unwrap()).success());
+    assert_eq!(fs::read(&target).unwrap(), b"new");
+    let failure = fs::read_to_string(root.join("failed.txt")).unwrap();
+    assert!(failure.contains("kept the current version"), "{failure}");
+    fs::remove_file(root.join("failed.txt")).unwrap();
+
+    // The target cannot be moved aside: nothing changes, the download goes.
+    fs::write(&staged, b"newer").unwrap();
+    let missing = root.join("gone/Bridge.AppImage");
+    assert!(!run(staged.to_str().unwrap(), missing.to_str().unwrap()).success());
+    assert!(!staged.exists());
+    assert!(root.join("failed.txt").exists());
+    assert!(
+        fs::read_to_string(root.join("update.log"))
+            .unwrap()
+            .contains("Installed the new AppImage")
+    );
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1022,4 +1057,122 @@ fn canonical_staging_parent_is_a_plain_drive_path() {
     let text = parent.to_str().unwrap();
     assert!(!text.starts_with(r"\\?\"), "{text}");
     assert!(parent.is_dir());
+}
+
+#[test]
+fn download_progress_reports_a_fraction_only_when_the_size_is_known() {
+    let unknown = DownloadProgress {
+        downloaded: 500,
+        total: None,
+    };
+    assert_eq!(unknown.fraction(), None);
+    assert!(!unknown.is_complete());
+
+    let half = DownloadProgress {
+        downloaded: 500,
+        total: Some(1000),
+    };
+    assert_eq!(half.fraction(), Some(0.5));
+    assert!(!half.is_complete());
+
+    let done = DownloadProgress {
+        downloaded: 1000,
+        total: Some(1000),
+    };
+    assert_eq!(done.fraction(), Some(1.0));
+    assert!(done.is_complete());
+
+    // More bytes than announced cannot push the bar past the end.
+    let over = DownloadProgress {
+        downloaded: 1500,
+        total: Some(1000),
+    };
+    assert_eq!(over.fraction(), Some(1.0));
+}
+
+/// Serves `body` once over HTTP, in pieces, and returns its address.
+fn serve_once(body: Vec<u8>) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0u8; 1024];
+        let _ = stream.read(&mut request);
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        // In pieces, so the download sees more than one chunk.
+        for piece in body.chunks(25_000) {
+            stream.write_all(piece).unwrap();
+            stream.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+    (address, server)
+}
+
+// One test, not two: the progress counter is shared by the whole process, so
+// separate tests would overwrite each other's numbers.
+#[tokio::test]
+async fn only_a_tracked_download_moves_the_progress() {
+    DOWNLOADED.store(0, Ordering::Relaxed);
+    DOWNLOAD_TOTAL.store(0, Ordering::Relaxed);
+
+    // A tracked download records its announced size and every byte.
+    let (address, server) = serve_once(vec![7u8; 100_000]);
+    let response = reqwest::Client::new()
+        .get(format!("http://{address}/archive.zip"))
+        .send()
+        .await
+        .unwrap();
+    let bytes = read_bounded(response, 1_000_000, true).await.unwrap();
+    server.join().unwrap();
+    assert_eq!(bytes.len(), 100_000);
+    let progress = download_progress();
+    assert_eq!(progress.downloaded, 100_000);
+    assert_eq!(progress.total, Some(100_000));
+    assert!(progress.is_complete());
+    assert_eq!(progress.fraction(), Some(1.0));
+
+    // A later download that is not tracked (the checksum) leaves it alone.
+    let (address, server) = serve_once(b"abcd".to_vec());
+    let response = reqwest::Client::new()
+        .get(format!("http://{address}/checksum"))
+        .send()
+        .await
+        .unwrap();
+    let bytes = read_bounded(response, 1_000, false).await.unwrap();
+    server.join().unwrap();
+    assert_eq!(bytes, b"abcd");
+    assert_eq!(download_progress(), progress);
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_download_cleanup_removes_only_matching_entries() {
+    let root = fixture();
+    let keep = root.join("OpenMouse-Bridge.AppImage");
+    let stale = root.join(format!("{APPIMAGE_STAGING_PREFIX}0123.AppImage"));
+    let elsewhere = root.join("elsewhere");
+    fs::write(&keep, b"installed").unwrap();
+    fs::write(&stale, b"staged").unwrap();
+    fs::create_dir(&elsewhere).unwrap();
+    fs::write(elsewhere.join("precious"), b"x").unwrap();
+    // A link with a staging name is never followed or removed.
+    let link = root.join(format!("{APPIMAGE_STAGING_PREFIX}link.AppImage"));
+    std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+
+    remove_matching(&root, |name, _| {
+        name.starts_with(APPIMAGE_STAGING_PREFIX) && name.ends_with(".AppImage")
+    });
+    assert!(keep.exists());
+    assert!(!stale.exists());
+    assert!(fs::symlink_metadata(&link).is_ok());
+    assert!(elsewhere.join("precious").exists());
+    fs::remove_dir_all(root).unwrap();
 }

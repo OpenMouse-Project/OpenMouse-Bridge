@@ -14,19 +14,39 @@ env:
   NATIVE_HID_NODE_VERSION: v24.18.1
 
 jobs:
+  preflight:
+    name: Check the version and changelog
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      # Fails in a minute, before an hour of builds, when the tag, Cargo.toml
+      # and CHANGELOG.md disagree.
+      - name: Verify tag matches Cargo version
+        run: test "v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" = "${{ github.ref_name }}"
+      - name: Verify CHANGELOG.md has an entry for this version
+        run: |
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            import { changelogEntry, versionFromTag } from "./.github/scripts/make-release-files.mjs";
+            changelogEntry(readFileSync("CHANGELOG.md", "utf8"), versionFromTag(process.argv[1]));
+          ' "${{ github.ref_name }}"
   windows:
     name: Windows x64
+    needs: preflight
     runs-on: windows-latest
     env:
       WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
       WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 24
           cache: npm
@@ -35,6 +55,10 @@ jobs:
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo build --release --locked
+      - name: Test native HID helper
+        run: |
+          npm ci --prefix native-hid
+          npm test --prefix native-hid
       - name: Sign executable
         if: env.WINDOWS_CERTIFICATE_BASE64 != ''
         shell: pwsh
@@ -76,10 +100,25 @@ jobs:
           Set-Content "$stage/native-hid/node/node.exe" "Placeholder: Bridge replaces this with the real Node.js runtime on first launch."
           Compress-Archive -Path "$stage/*" -DestinationPath openmouse-bridge-windows-x64.zip -CompressionLevel Optimal
           $size = (Get-Item openmouse-bridge-windows-x64.zip).Length
-          Write-Host "openmouse-bridge-windows-x64.zip: $size bytes (limit 16252928)"
-          if ($size -gt 16252928) { throw "bridge archive is over the older updaters' 16 MiB read budget" }
+          Write-Host "openmouse-bridge-windows-x64.zip: $size bytes"
           (Get-FileHash openmouse-bridge-windows-x64.zip -Algorithm SHA256).Hash.ToLower() + "  openmouse-bridge-windows-x64.zip" | Set-Content openmouse-bridge-windows-x64.zip.sha256
-      - uses: actions/upload-artifact@v4
+      - name: Build and smoke test Windows installer
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP 'bridge-windows-installer-package'
+          Expand-Archive openmouse-bridge-windows-x64-full.zip -DestinationPath $stage
+          ./packaging/windows/build-installer.ps1 -Stage $stage -OutputDirectory .
+      - name: Sign Windows installer
+        if: env.WINDOWS_CERTIFICATE_BASE64 != ''
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $certificate = Join-Path $env:RUNNER_TEMP 'openmouse-bridge.pfx'
+          & signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificate /p $env:WINDOWS_CERTIFICATE_PASSWORD OpenMouse-Bridge-windows-x64-setup.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Installer signing failed' }
+          $checksum = (Get-FileHash OpenMouse-Bridge-windows-x64-setup.exe -Algorithm SHA256).Hash.ToLower() + '  OpenMouse-Bridge-windows-x64-setup.exe' + "`n"
+          [IO.File]::WriteAllText('OpenMouse-Bridge-windows-x64-setup.exe.sha256', $checksum, [Text.UTF8Encoding]::new($false))
+      - uses: actions/upload-artifact@v6
         with:
           name: bridge-windows
           path: |
@@ -87,10 +126,13 @@ jobs:
             openmouse-bridge-windows-x64.zip.sha256
             openmouse-bridge-windows-x64-full.zip
             openmouse-bridge-windows-x64-full.zip.sha256
+            OpenMouse-Bridge-windows-x64-setup.exe
+            OpenMouse-Bridge-windows-x64-setup.exe.sha256
 
   macos:
     name: macOS universal
-    runs-on: macos-14
+    needs: preflight
+    runs-on: macos-15
     # Signing and notarization are automatic when these secrets exist;
     # without them the app is ad-hoc signed.
     env:
@@ -101,13 +143,13 @@ jobs:
       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
       APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 24
           cache: npm
@@ -119,6 +161,10 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo build --release --locked --target aarch64-apple-darwin
       - run: cargo build --release --locked --target x86_64-apple-darwin
+      - name: Test native HID helper
+        run: |
+          npm ci --prefix native-hid
+          npm test --prefix native-hid
       - name: Prepare native-hid (deps + bundled Node.js runtime)
         run: |
           set -euo pipefail
@@ -127,8 +173,8 @@ jobs:
           # silicon and Intel since the Bridge binary itself is universal.
           find native-hid/node_modules/node-hid/prebuilds -mindepth 1 -maxdepth 1 -type d \
             ! -name HID-darwin-arm64 ! -name HID-darwin-x64 -exec rm -rf {} +
-          curl -fsSL "https://nodejs.org/dist/$NATIVE_HID_NODE_VERSION/node-$NATIVE_HID_NODE_VERSION-darwin-arm64.tar.gz" | tar -xz
-          curl -fsSL "https://nodejs.org/dist/$NATIVE_HID_NODE_VERSION/node-$NATIVE_HID_NODE_VERSION-darwin-x64.tar.gz" | tar -xz
+          curl -fsSL --retry 5 --retry-delay 5 --retry-max-time 120 "https://nodejs.org/dist/$NATIVE_HID_NODE_VERSION/node-$NATIVE_HID_NODE_VERSION-darwin-arm64.tar.gz" | tar -xz
+          curl -fsSL --retry 5 --retry-delay 5 --retry-max-time 120 "https://nodejs.org/dist/$NATIVE_HID_NODE_VERSION/node-$NATIVE_HID_NODE_VERSION-darwin-x64.tar.gz" | tar -xz
           mkdir -p native-hid/node/bin
           lipo -create \
             "node-$NATIVE_HID_NODE_VERSION-darwin-arm64/bin/node" \
@@ -198,7 +244,7 @@ jobs:
           test -d "$RUNNER_TEMP/dmg/OpenMouse Bridge.app"
           codesign --verify --deep --strict "$RUNNER_TEMP/dmg/OpenMouse Bridge.app"
           hdiutil detach "$RUNNER_TEMP/dmg"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: bridge-macos
           path: |
@@ -211,16 +257,19 @@ jobs:
             OpenMouse-Bridge-macos-universal.dmg
   linux:
     name: Linux x64
-    runs-on: ubuntu-24.04
+    needs: preflight
+    # The oldest runner image on offer, so the AppImage runs on any distro
+    # whose glibc is at least that old (as in gpui-build.yml).
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Linux HID and GUI dependencies
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev libgtk-3-dev libayatana-appindicator3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libgl1-mesa-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y build-essential clang cmake pkg-config libudev-dev libssl-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libvulkan-dev libgl1-mesa-dev libfontconfig-dev libfreetype-dev libasound2-dev appstream
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 24
           cache: npm
@@ -229,6 +278,10 @@ jobs:
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo build --release --locked
+      - name: Test native HID helper
+        run: |
+          npm ci --prefix native-hid
+          npm test --prefix native-hid
       - name: Prepare native-hid (deps + bundled Node.js runtime)
         run: |
           set -euo pipefail
@@ -237,7 +290,7 @@ jobs:
           # ever runs on linux-x64.
           find native-hid/node_modules/node-hid/prebuilds -mindepth 1 -maxdepth 1 -type d \
             ! -name HID-linux-x64 -exec rm -rf {} +
-          curl -fsSL "https://nodejs.org/dist/$NATIVE_HID_NODE_VERSION/node-$NATIVE_HID_NODE_VERSION-linux-x64.tar.xz" | tar -xJ
+          curl -fsSL --retry 5 --retry-delay 5 --retry-max-time 120 "https://nodejs.org/dist/$NATIVE_HID_NODE_VERSION/node-$NATIVE_HID_NODE_VERSION-linux-x64.tar.xz" | tar -xJ
           mkdir -p native-hid/node/bin
           cp "node-$NATIVE_HID_NODE_VERSION-linux-x64/bin/node" native-hid/node/bin/node
           chmod +x native-hid/node/bin/node
@@ -253,7 +306,72 @@ jobs:
           packaging/bridge/build-bridge-package.sh openmouse-bridge openmouse-bridge-linux-x64.zip openmouse-app-icon.png
           rm openmouse-bridge openmouse-app-icon.png
           sha256sum openmouse-bridge-linux-x64.zip > openmouse-bridge-linux-x64.zip.sha256
-      - uses: actions/upload-artifact@v4
+      # The AppImage is the Linux install the in-app updater updates. Same
+      # steps as gpui-build.yml; keep them in sync.
+      - name: Assemble the AppDir
+        run: |
+          set -euo pipefail
+          appdir=AppDir
+          # Bridge finds native-hid next to its executable, so they sit together.
+          install -Dm755 target/release/openmouse-bridge "$appdir/usr/bin/openmouse-bridge"
+          cp -R native-hid "$appdir/usr/bin/native-hid"
+          cp assets/fonts/DM-Sans-OFL.txt README.md "$appdir/usr/bin/"
+          cp assets/openmouse-app-icon.png "$appdir/io.openmouse.bridge.png"
+          cp assets/openmouse-app-icon.png "$appdir/.DirIcon"
+          install -Dm644 packaging/linux/io.openmouse.bridge.appdata.xml \
+            "$appdir/usr/share/metainfo/io.openmouse.bridge.appdata.xml"
+          cat > "$appdir/io.openmouse.bridge.desktop" <<'DESKTOP'
+          [Desktop Entry]
+          Type=Application
+          Name=OpenMouse Bridge
+          Comment=Local companion for the OpenMouse control panel
+          Exec=openmouse-bridge
+          Icon=io.openmouse.bridge
+          Categories=Utility;
+          Terminal=false
+          DESKTOP
+          install -Dm644 "$appdir/io.openmouse.bridge.desktop" \
+            "$appdir/usr/share/applications/io.openmouse.bridge.desktop"
+          install -Dm644 assets/openmouse-app-icon.png \
+            "$appdir/usr/share/icons/hicolor/512x512/apps/io.openmouse.bridge.png"
+          cat > "$appdir/AppRun" <<'APPRUN'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/openmouse-bridge" "$@"
+          APPRUN
+          chmod +x "$appdir/AppRun"
+          appstreamcli validate --no-net "$appdir/usr/share/metainfo/io.openmouse.bridge.appdata.xml"
+      - name: Build the AppImage
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Pinned and checksummed; fetched with the workflow token (not anonymously),
+          # retrying because the release CDN has been returning 504s.
+          for attempt in 1 2 3 4 5 6; do
+            gh release download 1.9.1 --repo AppImage/appimagetool --pattern appimagetool-x86_64.AppImage --output appimagetool --clobber && break
+            [ "$attempt" -lt 6 ] || { echo "appimagetool download failed" >&2; exit 1; }
+            sleep $((attempt * 10))
+          done
+          echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool" | sha256sum -c -
+          chmod +x appimagetool
+          # Runners have no FUSE, so the tool unpacks itself and runs from there.
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run AppDir OpenMouse-Bridge-linux-x86_64.AppImage
+          sha256sum OpenMouse-Bridge-linux-x86_64.AppImage > OpenMouse-Bridge-linux-x86_64.AppImage.sha256
+      - name: Check the AppImage contents
+        run: |
+          set -euo pipefail
+          chmod +x OpenMouse-Bridge-linux-x86_64.AppImage
+          ./OpenMouse-Bridge-linux-x86_64.AppImage --appimage-extract > /dev/null
+          test -x squashfs-root/usr/bin/openmouse-bridge
+          test -x squashfs-root/usr/bin/native-hid/node/bin/node
+          test -f squashfs-root/usr/bin/native-hid/src/apply.mjs
+          test -f squashfs-root/usr/bin/DM-Sans-OFL.txt
+          test -f squashfs-root/usr/share/metainfo/io.openmouse.bridge.appdata.xml
+          test -f squashfs-root/usr/share/applications/io.openmouse.bridge.desktop
+          # Every shared library the binary needs must resolve on this machine.
+          ! ldd squashfs-root/usr/bin/openmouse-bridge | grep 'not found'
+      - uses: actions/upload-artifact@v6
         with:
           name: bridge-linux
           path: |
@@ -261,32 +379,46 @@ jobs:
             openmouse-bridge-linux-x64.zip.sha256
             openmouse-bridge-linux-x64-full.zip
             openmouse-bridge-linux-x64-full.zip.sha256
+            OpenMouse-Bridge-linux-x86_64.AppImage
+            OpenMouse-Bridge-linux-x86_64.AppImage.sha256
+          if-no-files-found: error
   release:
     name: Publish stable release
     needs: [windows, macos, linux]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Verify tag matches Cargo version
-        run: test "v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" = "${{ github.ref_name }}"
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v7
         with:
           path: artifacts
           merge-multiple: true
-      - name: Publish changelog and artifacts
+      - name: Write latest.json and the release notes
+        # latest.json is what the in-app updater reads
+        # (releases/latest/download/latest.json): the version, its
+        # CHANGELOG.md entry, and each platform's asset with its SHA-256.
+        run: |
+          set -euo pipefail
+          mkdir release
+          node .github/scripts/make-release-files.mjs "${{ github.ref_name }}" "${{ github.repository }}" artifacts release
+          cat release/latest.json
+      - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Re-cutting a tag replaces the assets of the existing release
-          # instead of deleting it, so the release is never missing.
+          # Re-cutting a tag replaces the assets and notes of the existing
+          # release instead of deleting it, so the release is never missing.
           if gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release upload "${{ github.ref_name }}" --repo "${{ github.repository }}" --clobber artifacts/*
+            gh release upload "${{ github.ref_name }}" --repo "${{ github.repository }}" --clobber artifacts/* release/latest.json
+            gh release edit "${{ github.ref_name }}" --repo "${{ github.repository }}" --notes-file release/notes.md
           else
             gh release create "${{ github.ref_name }}" \
               --repo "${{ github.repository }}" \
               --verify-tag \
-              --generate-notes \
+              --notes-file release/notes.md \
               --latest \
-              artifacts/*
+              artifacts/* release/latest.json
           fi

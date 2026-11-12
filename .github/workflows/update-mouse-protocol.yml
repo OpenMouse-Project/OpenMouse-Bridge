@@ -1,0 +1,77 @@
+name: Update mouse protocol
+
+on:
+  schedule:
+    - cron: '17 9 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check automation token
+        env:
+          PROTOCOL_UPDATE_TOKEN: ${{ secrets.PROTOCOL_UPDATE_TOKEN }}
+        run: |
+          if [ -z "$PROTOCOL_UPDATE_TOKEN" ]; then
+            echo 'Set the PROTOCOL_UPDATE_TOKEN repository secret to a scoped GitHub App or personal token.' >&2
+            exit 1
+          fi
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: native-hid/package-lock.json
+      - name: Find newest protocol release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$(gh api repos/OpenMouse-Project/mouse-protocol/releases/latest --jq .tag_name)"
+          test -n "$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Update pinned protocol and lockfile
+        env:
+          PROTOCOL_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = 'native-hid/package.json';
+          const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
+          const tag = process.env.PROTOCOL_TAG;
+          if (!/^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(tag)) {
+            throw new Error(`Unexpected protocol tag: ${tag}`);
+          }
+          const prefix = 'github:OpenMouse-Project/mouse-protocol#';
+          if (pkg.dependencies['@openmouse/protocol'] === prefix + tag) process.exit(0);
+          pkg.dependencies['@openmouse/protocol'] = prefix + tag;
+          for (const key of Object.keys(pkg.allowScripts ?? {})) {
+            if (key.startsWith(prefix + 'v')) delete pkg.allowScripts[key];
+          }
+          pkg.allowScripts[prefix + tag] = true;
+          fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
+          NODE
+          npm install --prefix native-hid --package-lock-only
+      - uses: peter-evans/create-pull-request@v7
+        id: pr
+        with:
+          token: ${{ secrets.PROTOCOL_UPDATE_TOKEN }}
+          branch: automation/update-mouse-protocol
+          delete-branch: true
+          title: 'chore: update mouse protocol to ${{ steps.release.outputs.tag }}'
+          body: 'Updates the bundled mouse protocol. This PR merges automatically after the required macOS, Windows, and Linux checks pass.'
+          commit-message: 'chore: update mouse protocol to ${{ steps.release.outputs.tag }}'
+          add-paths: |
+            native-hid/package.json
+            native-hid/package-lock.json
+      - name: Merge when required checks pass
+        if: steps.pr.outputs.pull-request-number != ''
+        env:
+          GH_TOKEN: ${{ secrets.PROTOCOL_UPDATE_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.pull-request-number }}
+        run: gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash --delete-branch

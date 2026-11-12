@@ -1,5 +1,45 @@
 # OpenMouse Bridge
 
+> [!WARNING]
+> **Work in progress.** This is the new OpenMouse Bridge,
+> rebuilt on [GPUI](https://www.gpui.rs/). It is version 1.0.0 and not released yet. See
+> [docs/gpui-migration.md](docs/gpui-migration.md) for the plan and what has and
+> has not been checked.
+
+## Where it stands
+
+GPUI is the only window: there is no other shell. CI builds macOS, Linux, and
+Windows artifacts. Windows tray and panel behavior still need testing on a
+Windows desktop. The Linux tray has been run on KDE Plasma (Wayland); X11,
+GNOME and other desktops still need testing.
+
+- [x] A panel in Desktop's dark look with its ASCII background: Home, Settings
+      and a Bridge info page, opening beside the tray icon
+- [x] The tray icon shows the connected mouse's battery
+- [x] Remembered mice (`devices.json`), found by scanning the HID bus every 5
+      seconds
+- [x] Low-battery and game-profile alerts on the on-screen overlay and chime
+- [x] The Attack Shark R5 Ultra's battery, read natively
+- [x] Updates with an update card and a progress bar
+- [x] First-run behaviour, Escape and the close button hide the panel, the tray
+      icon is recreated after sleep, and Bridge relaunches after a crash
+- [x] Windows: build and test a portable x64 ZIP in CI
+- [x] Windows: build and smoke test a per-user installer in CI
+- [ ] Windows: run the tray app on a desktop
+- [x] Linux: build and verify the AppImage in CI
+- [x] Linux: add a tray icon
+- [ ] The in-app updater with `latest.json`, replacing the zip-swap one
+- [ ] Moving installs of earlier versions across
+
+```sh
+cargo run
+```
+
+Bridge is a separate app from OpenMouse Desktop; Desktop is only a reference
+for patterns.
+
+---
+
 OpenMouse Bridge is a small per-user companion process for the OpenMouse web
 control panel on Windows, macOS, and Linux. Its core and loopback protocol remain
 portable so additional desktop adapters do not require changes to the web app.
@@ -33,7 +73,7 @@ The initial service provides:
   over live, with Bridge restoring the stored settings and reading the
   battery again on disconnect; without a saved profile Bridge leaves the
   mouse's own onboard memory untouched and just monitors it;
-- discovery of visible applications and the foreground application (on Linux, foreground detection needs X11; on Wayland every entry reports `foreground: false`);
+- discovery of visible applications and the foreground application (on Linux, X11 windows are found directly and KDE Plasma's Wayland session reports focus through a KWin script; on other Wayland desktops native Wayland windows report `foreground: false`);
 - persistent application profiles tied to a specific mouse;
 - low-battery notifications with a configurable threshold and cooldown, from
   battery levels Bridge reads itself every five minutes for the mice in saved
@@ -57,22 +97,38 @@ Install stable Rust, then run:
 cargo run
 ```
 
-On Linux, install the system libraries for the tray icon and window first
-(Ubuntu 24.04):
+On Linux, install the system libraries for the window first (Ubuntu 22.04 or
+24.04):
 
 ```sh
-sudo apt-get update && sudo apt-get install -y libudev-dev libgtk-3-dev libayatana-appindicator3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libgl1-mesa-dev pkg-config
+sudo apt-get update && sudo apt-get install -y build-essential clang cmake pkg-config libudev-dev libssl-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libvulkan-dev libgl1-mesa-dev libfontconfig-dev libfreetype-dev libasound2-dev
 ```
 
-Linux notes: the tray icon needs a StatusNotifier/AppIndicator host (stock
-GNOME shows nothing without an AppIndicator extension; the panel still opens
-with `OPENMOUSE_BRIDGE_SHOW_WINDOW=1`), the overlay banner and foreground
-detection need X11 (on Wayland the banner falls back to a system notification
-and `foreground` is always false), and the chime needs `paplay` or `aplay`.
-With no `WAYLAND_DISPLAY` or `DISPLAY` (servers, SSH sessions), or with
-`OPENMOUSE_BRIDGE_HEADLESS=1` / `--headless`, Bridge skips the tray panel
-and serves its HTTP API, HID, and game profiles headless (Ctrl-C stops it).
-Startup at login writes `~/.config/autostart/io.openmouse.bridge.desktop`.
+Linux notes: the tray uses StatusNotifierItem/DBusMenu on the session bus
+(KDE Plasma and other compatible hosts; GNOME needs an AppIndicator/SNI
+extension). It shows the battery glyph, charge colour and the same battery
+tooltip as the other platforms. A click or the menu's Open action restores the
+panel, raised with the activation token the tray host sends with the click;
+the menu also offers Restart and Quit. The panel draws its own header and close
+button, without a window-manager title bar. On Wayland compositors with
+layer-shell (KDE Plasma, wlroots-based desktops) the panel opens in the screen
+corner nearest the tray icon, clear of the desktop's panel bar, and closing or
+Escape removes it until the tray brings it back. Elsewhere (X11, GNOME) it is
+a normal window that closing or Escape minimizes while a tray host is
+available, keeping its taskbar entry for recovery. Without a session bus or
+compatible tray host, the panel stays visible and closing it quits. If the
+host disappears, Bridge restores the panel and re-registers the icon when the
+host returns. No GTK or AppIndicator shared libraries are needed in the
+AppImage. The overlay banner needs X11 (on Wayland it falls back to a system
+notification). Foreground detection uses X11, and on KDE Plasma 6 Wayland a
+KWin script Bridge loads at startup and unloads on exit reports the focused
+window over D-Bus (process ids only, no window titles); on other Wayland
+desktops native Wayland windows are never foreground. The chime needs
+`paplay` or `aplay`. With no
+`WAYLAND_DISPLAY` or `DISPLAY` (servers, SSH sessions), or with
+`OPENMOUSE_BRIDGE_HEADLESS=1` / `--headless`, Bridge skips the window and serves
+its HTTP API, HID, and game profiles headless (Ctrl-C stops it). Startup at
+login writes `~/.config/autostart/io.openmouse.bridge.desktop`.
 
 Bridge creates `config.json` in the operating system's per-user application
 configuration directory. At startup it refreshes the tracked-game catalog from
@@ -217,27 +273,37 @@ control panel. A selected profile is not proof that a hardware write succeeded.
 
 ## Tray panel
 
-The native tray panel uses OpenMouse's lit surfaces, inset controls, raised
-actions, trailing switches, Emerald palette and embedded DM Sans. Home starts at
-360 by 280 logical points; Settings is 360 by 420. Real content can grow Home up
-to 340 points high. Extended connection and battery reports live behind the info
-controls rather than filling the default view.
-Home separates the Bridge service, browser connection, live HID sessions, saved
-profile selection, and battery readings instead of treating them as one status.
-Settings keeps startup, battery alerts, notification sound, updates, and logs in
-one scrollable view.
+The panel is a small borderless GPUI window in OpenMouse's dark look: near-black
+surfaces, the green accent, and a field of ASCII characters behind it. It has
+three views, all under the same title bar (drag the title to move it; the
+buttons are settings and close):
 
-Drag the header beside the OpenMouse name, or beside the Settings title, to move
-the borderless window. Settings and Back leave its position unchanged. Clicking
-the tray icon opens the panel near that icon, constrained to the monitor work
-area on Windows. The titlebar minimize and close controls hide to the tray;
-background operation continues. Escape also dismisses the panel. Quit Bridge
-stops the process.
+- **Home** lists the service, the active profile ("Default" unless a game's
+  profile is active), and every mouse Bridge has seen, with its battery and DPI
+  while it is plugged in or when it was last seen. An update card appears when
+  one is available, and a note on the first launch says the app lives in the
+  tray. A failed native write is shown under the card in red.
+- **Settings** has run on start, hybrid mode, the tray icon style (battery or
+  number), the low-battery alert level, notification sound and volume, update
+  automatically and check for updates, a test notification, open logs, and a
+  link to the info page.
+- **Info** shows the version, platform, address, uptime, whether the control
+  panel is connected, the device mode, and the config and log paths.
 
-`OPENMOUSE_BRIDGE_TEST_POSITION=x,y` starts the panel at an explicit logical
-position without requesting focus, for isolated secondary-monitor UI checks.
+Clicking the tray icon (a left click, a double-click, or on macOS a right click)
+opens the panel beside it: centred under the icon below the menu bar on macOS,
+above a bottom taskbar on Windows; Linux lets the compositor place it.
+Closing it, or pressing Escape, hides it to the tray on macOS/Windows and
+minimizes it on Linux while a tray host is available. Bridge keeps running;
+Quit stops the process. The first launch
+opens the panel and later launches start hidden (`OPENMOUSE_BRIDGE_SHOW_WINDOW=1`
+opens it anyway, and `OPENMOUSE_BRIDGE_START_VIEW=settings|info` opens straight
+onto a view, for development).
+
 Use `OPENMOUSE_BRIDGE_CONFIG` with a disposable configuration and set
-`autostartConfigured` to `true` to avoid first-run startup registration in tests.
+`autostartConfigured` to `true` to avoid first-run startup registration in
+tests. Turning the "Run on start" switch on or off in a development build
+changes the real login item, so leave it alone there.
 
 ## Verify
 
@@ -255,6 +321,14 @@ no Terminal window. `packaging/macos/` holds the scripts that build the app
 bundle and DMG; the release workflow signs and notarizes them when the
 `MACOS_CERTIFICATE_BASE64`, `MACOS_CERTIFICATE_PASSWORD`, `MACOS_SIGN_IDENTITY`,
 `APPLE_ID`, `APPLE_TEAM_ID` and `APPLE_APP_PASSWORD` secrets are set.
+
+## Install on Windows
+
+Download `OpenMouse-Bridge-windows-x64-setup.exe` from a build artifact or a
+future stable release and run it. The installer puts Bridge and its bundled
+native HID helper in your user profile, adds a Start menu shortcut, and offers
+an optional desktop shortcut. It does not need administrator access. The
+portable `OpenMouse-Bridge-windows-x64.zip` remains available in build artifacts.
 
 ## Install on Linux
 
@@ -274,13 +348,30 @@ to `/opt/openmouse-bridge` with a `/usr/local/bin` symlink), `--no-deps`
 `--no-launcher` (skip those steps), `--start` (launch after installing),
 `--uninstall` (remove), `--yes` (non-interactive package install).
 
-Every successful push to `main` updates the rolling `dev-build` prerelease with a
-Windows x64 zip and checksum. The same files remain available as workflow
-artifacts for individual runs.
+Without the udev rule (an AppImage, a source build, or `--no-udev`), the
+`/dev/hidraw*` nodes are root-only and opening a mouse fails with "Permission
+denied". Bridge checks for this: while a USB mouse or receiver is plugged in
+that it cannot open, the panel shows a **Fix permissions** card that installs
+the same rule (`/etc/udev/rules.d/69-openmouse-bridge.rules`, plus its helper
+`/etc/udev/openmouse-bridge-is-mouse`) through `pkexec`, the desktop's password
+prompt, and applies it to plugged-in devices.
+
+The rule is not a list of vendors. It gives the signed-in user (udev's
+`uaccess`, not world-readable) every hidraw node of any USB device that has a
+mouse interface, meaning a boot-protocol mouse or a report descriptor with a
+Generic Desktop Mouse collection. That includes the vendor interface where
+settings are read and written, so new brands need no rule change. If `pkexec` is
+missing or fails, the card offers the equivalent `sudo` command to copy. The
+blocked nodes are also listed in `/v1/status` as `blockedHidDevices`.
+
+Development builds remain available as workflow artifacts for individual runs.
 
 Pushing a stable version tag such as `v1.0.0` publishes it as the latest GitHub
-release with generated changelog notes, Windows x64, universal macOS, and Linux
-x64 archives, and SHA-256 checksums. Windows signing is automatic when the
-repository has `WINDOWS_CERTIFICATE_BASE64` and
+release with its `CHANGELOG.md` entry as the notes, a Windows x64 installer and
+archives, a macOS DMG and archives, a Linux AppImage and archives, SHA-256
+checksums, and `latest.json`, which the in-app updater reads. The tag must
+match `Cargo.toml`'s version and `CHANGELOG.md` must have an entry for it, or
+the release stops before building. Windows signing
+is automatic when the repository has `WINDOWS_CERTIFICATE_BASE64` and
 `WINDOWS_CERTIFICATE_PASSWORD` secrets; unsigned development builds continue
 to work without those secrets.

@@ -1,10 +1,15 @@
 pub mod api;
 pub mod applications;
 pub mod buttons;
+pub mod changelog;
 pub mod config;
+pub mod devices;
 pub mod drivers;
 pub mod games;
 mod hid;
+pub mod hid_access;
+#[cfg(target_os = "linux")]
+pub mod kwin_focus;
 pub mod local_targets;
 pub mod platform;
 pub mod remote_image;
