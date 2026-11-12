@@ -76,6 +76,10 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         if: needs.changes.outputs.protocol_only != 'true'
+        with:
+          # Pull requests read main's cache but never write their own: each copy is
+          # ~1 GB per OS, and they pushed the repo past its 10 GB cache limit.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Test
         if: needs.changes.outputs.protocol_only != 'true'
         run: cargo test --locked
@@ -104,6 +108,10 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         if: needs.changes.outputs.protocol_only != 'true'
+        with:
+          # Pull requests read main's cache but never write their own: each copy is
+          # ~1 GB per OS, and they pushed the repo past its 10 GB cache limit.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check formatting
         if: runner.os == 'Linux' && needs.changes.outputs.protocol_only != 'true'
         run: cargo fmt --check
