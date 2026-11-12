@@ -290,7 +290,7 @@ impl Tray for LinuxTray {
             right: f64::from(x),
             bottom: f64::from(y),
         });
-        let _ = self.sender.send(Command::Show(anchor));
+        let _ = self.sender.send(Command::Toggle(anchor));
     }
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         use ksni::menu::StandardItem;
@@ -459,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn activation_and_menu_queue_panel_and_exit_commands() {
+    fn clicks_toggle_the_panel_and_the_menu_opens_it_or_exits() {
         let (sender, receiver) = mpsc::channel();
         let (icon, tooltip) = presentation(None).unwrap();
         let mut tray = LinuxTray {
@@ -470,14 +470,14 @@ mod tests {
         tray.activate(100, 200);
         assert!(matches!(
             receiver.try_recv(),
-            Ok(Command::Show(Some(super::super::Anchor {
+            Ok(Command::Toggle(Some(super::super::Anchor {
                 left: 100.0,
                 top: 200.0,
                 ..
             })))
         ));
         tray.activate(0, 0);
-        assert!(matches!(receiver.try_recv(), Ok(Command::Show(None))));
+        assert!(matches!(receiver.try_recv(), Ok(Command::Toggle(None))));
         for item in tray.menu() {
             if let ksni::MenuItem::Standard(item) = item {
                 (item.activate)(&mut tray);

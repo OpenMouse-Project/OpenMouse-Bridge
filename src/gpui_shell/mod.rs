@@ -273,13 +273,28 @@ pub fn run() -> Result<()> {
                         .iter()
                         .rev()
                         .find_map(|command| match command {
-                            tray::Command::Show(anchor) => Some(*anchor),
+                            tray::Command::Show(anchor) | tray::Command::Toggle(anchor) => {
+                                Some(*anchor)
+                            }
                             _ => None,
                         });
                     if let Some(Some(anchor)) = clicked_at {
                         last_anchor = Some(anchor);
                     }
-                    let show = panel_wanted || clicked_at.is_some();
+                    // A closed layer-shell panel is hidden even if nothing
+                    // hid it (the compositor can close the surface itself).
+                    #[cfg(target_os = "linux")]
+                    let shown = tray::shown()
+                        && !(tray::layer_panel()
+                            && cx.update_window(handle, |_, _, _| ()).is_err());
+                    #[cfg(not(target_os = "linux"))]
+                    let shown = tray::shown();
+                    let wanted = panel_wanted_after(shown, panel_wanted, &tray_requests);
+                    if wanted == Some(false) && shown {
+                        tracing::debug!("hiding the panel from a tray click");
+                        let _ = cx.update_window(handle, |_, window, _| tray::hide(window));
+                    }
+                    let show = wanted == Some(true);
                     if show {
                         tracing::debug!(panel_wanted, "showing the panel");
                         let anchor = last_anchor;
@@ -301,7 +316,7 @@ pub fn run() -> Result<()> {
                     }
                     for command in tray_requests {
                         match command {
-                            tray::Command::Show(_) => {}
+                            tray::Command::Show(_) | tray::Command::Toggle(_) => {}
                             tray::Command::Restart => {
                                 cx.update(|cx| app_exit.restart(cx));
                             }
@@ -343,6 +358,22 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
     stopped
+}
+
+/// Whether the panel should end up shown (`Some(true)`) or hidden
+/// (`Some(false)`) after this poll's requests, or `None` when nothing asked.
+/// Requests apply in order: an API or second-launch request and the tray's
+/// Show open it, and each click on the icon flips what the one before left.
+fn panel_wanted_after(shown: bool, api_request: bool, commands: &[tray::Command]) -> Option<bool> {
+    let mut wanted = api_request.then_some(true);
+    for command in commands {
+        match command {
+            tray::Command::Show(_) => wanted = Some(true),
+            tray::Command::Toggle(_) => wanted = Some(!wanted.unwrap_or(shown)),
+            tray::Command::Restart | tray::Command::Quit => {}
+        }
+    }
+    wanted
 }
 
 /// Makes the window's close button hide the panel to the tray, or quit when
@@ -465,5 +496,45 @@ pub(crate) fn test_snapshot() -> openmouse_bridge::service::BridgeSnapshot {
         known_devices: vec![],
         blocked_hid_devices: vec![],
         whats_new: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{panel_wanted_after, tray::Command};
+
+    #[test]
+    fn a_tray_click_toggles_the_panel_and_other_requests_open_it() {
+        // Nothing asked: leave the panel as it is.
+        assert_eq!(panel_wanted_after(true, false, &[]), None);
+        // A click hides a shown panel and shows a hidden one.
+        assert_eq!(
+            panel_wanted_after(true, false, &[Command::Toggle(None)]),
+            Some(false)
+        );
+        assert_eq!(
+            panel_wanted_after(false, false, &[Command::Toggle(None)]),
+            Some(true)
+        );
+        // Two clicks in one poll cancel out.
+        assert_eq!(
+            panel_wanted_after(
+                false,
+                false,
+                &[Command::Toggle(None), Command::Toggle(None)]
+            ),
+            Some(false)
+        );
+        // The menu's Open and API requests only ever show it.
+        assert_eq!(
+            panel_wanted_after(true, false, &[Command::Show(None)]),
+            Some(true)
+        );
+        assert_eq!(panel_wanted_after(true, true, &[]), Some(true));
+        // A click after an API request in the same poll flips the opened panel.
+        assert_eq!(
+            panel_wanted_after(false, true, &[Command::Toggle(None)]),
+            Some(false)
+        );
     }
 }
