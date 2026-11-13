@@ -5,6 +5,28 @@ the version in `Cargo.toml` and the release tag. The release workflow
 publishes the entry as the release notes and in `latest.json` (what Bridge's
 update check shows), and refuses to release a version without one.
 
+## 1.0.1
+
+### New
+
+- Route Scyrox to its own client and open only its config collection.
+
+### Fixes
+
+- Never offer FIDO security keys over the HID WebSocket.
+- Line up a mouse's name with its reading on Home.
+- Linux: Don't open the panel with its close button highlighted.
+- Trust the Vite dev origins only in debug builds.
+- Bound what PUT /v1/battery can make Bridge hold.
+- Linux: Give hidraw to the installing account, not everyone, without logind.
+- Clicking the tray icon again hides the panel.
+- Read the Tt eSPORTS Iris config reports.
+- Linux: Use system notifications on Wayland instead of the XWayland overlay.
+- Images from a URL can no longer reach your local network through older IPv6 ranges.
+- Release builds never load the HID helper from the build machine's checkout path.
+- Show the battery right away when the mouse shows up just after Bridge starts.
+- Bridge still starts when it can't save the downloaded game list.
+
 ## 1.0.0
 
 - A new Bridge, rebuilt from the ground up: a tray panel in OpenMouse's dark
