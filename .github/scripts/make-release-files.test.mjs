@@ -113,5 +113,6 @@ test("this repository's changelog has an entry for Cargo.toml's version", () => 
   const cargo = readFileSync(path.join(root, "Cargo.toml"), "utf8");
   const version = cargo.match(/^version = "(.+)"$/m)[1];
   const entry = changelogEntry(readFileSync(path.join(root, "CHANGELOG.md"), "utf8"), version);
-  assert.ok(entry.startsWith("- "));
+  // Entries are bullets, or bullets under `###` headings (New, Improvements, Fixes).
+  assert.ok(/^(- |### )/.test(entry));
 });
