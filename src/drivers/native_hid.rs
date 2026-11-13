@@ -289,11 +289,32 @@ fn locate_apply_script() -> Result<PathBuf> {
     ));
     packaged
         .filter(|path| path.is_file())
-        .or_else(|| development.is_file().then_some(development))
+        .or_else(|| {
+            (development_checkout_allowed() && development.is_file()).then_some(development)
+        })
         .context(
             "could not find native-hid/src/apply.mjs next to the Bridge executable \
              or in the source checkout",
         )
+}
+
+/// Whether the checkout Bridge was built from may supply the helper scripts.
+/// A release binary carries the build machine's checkout path (a CI runner's
+/// `D:\a\...` on Windows), which another account could create and fill on the
+/// user's machine; so a release build only uses it when it runs from inside
+/// that checkout (`cargo build --release` then `target/release/...`).
+fn development_checkout_allowed() -> bool {
+    cfg!(debug_assertions) || runs_inside(Path::new(env!("CARGO_MANIFEST_DIR")))
+}
+
+fn runs_inside(checkout: &Path) -> bool {
+    let (Ok(exe), Ok(checkout)) = (
+        std::env::current_exe().and_then(|exe| exe.canonicalize()),
+        checkout.canonicalize(),
+    ) else {
+        return false;
+    };
+    exe.starts_with(checkout)
 }
 
 /// Finds the Node.js runtime a packaged Bridge release bundles at
@@ -536,5 +557,15 @@ mod tests {
         let status = parse_status(staged).expect("staged status parses");
         assert_eq!(status.dpi, Some(400));
         assert_eq!(status.switch_mode, None);
+    }
+
+    #[test]
+    fn a_release_build_uses_the_checkout_only_from_inside_it() {
+        let exe = std::env::current_exe().unwrap();
+        assert!(runs_inside(exe.parent().unwrap()));
+        assert!(!runs_inside(Path::new(
+            "/no/such/checkout/openmouse-bridge"
+        )));
+        assert!(cfg!(not(debug_assertions)) || development_checkout_allowed());
     }
 }
