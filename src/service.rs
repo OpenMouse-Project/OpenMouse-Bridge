@@ -1573,10 +1573,7 @@ impl BridgeService {
                     .iter()
                     .map(|mouse| mouse.device_id.clone())
                     .collect();
-                let appeared = previous
-                    .as_ref()
-                    .is_some_and(|before| ids.iter().any(|id| !before.contains(id)));
-                let recheck = {
+                let (recheck, have_reading) = {
                     let mut state = service.inner.write().await;
                     remember_detected(&mut state.known, &detected);
                     // A mouse whose receiver left is disconnected, not asleep.
@@ -1588,9 +1585,18 @@ impl BridgeService {
                         })
                     });
                     state.detected = Some(detected);
-                    !state.asleep.is_empty() && last_recheck.elapsed() >= ASLEEP_RECHECK
+                    (
+                        !state.asleep.is_empty() && last_recheck.elapsed() >= ASLEEP_RECHECK,
+                        !state.battery.is_empty(),
+                    )
                 };
-                if appeared || recheck {
+                // A read started now would be dropped by the running poll's
+                // guard, so judge this scan after that poll ends: `previous`
+                // stays put and the first scan sees the startup poll's result.
+                if service.battery_polling.load(Ordering::Acquire) {
+                    continue;
+                }
+                if scan_wants_read(previous.as_ref(), &ids, have_reading) || recheck {
                     last_recheck = Instant::now();
                     tokio::spawn(poll_batteries(service.clone()));
                 }
@@ -1958,6 +1964,20 @@ fn remember_detected(known: &mut DeviceStore, discovered: &[drivers::DetectedMou
                 ..KnownDevice::default()
             },
         );
+    }
+}
+
+/// Whether a device scan should read the batteries now: a mouse appeared on
+/// the bus since the last scan, or, on the first scan, a mouse is on the bus
+/// but the startup poll left no reading (#79).
+fn scan_wants_read(
+    previous: Option<&HashSet<String>>,
+    ids: &HashSet<String>,
+    have_reading: bool,
+) -> bool {
+    match previous {
+        Some(before) => ids.iter().any(|id| !before.contains(id)),
+        None => !have_reading && !ids.is_empty(),
     }
 }
 
@@ -3231,6 +3251,20 @@ mod tests {
             .iter()
             .find(|device| device.id == id)
             .map(|device| device.state)
+    }
+
+    #[test]
+    fn the_first_scan_reads_a_mouse_already_on_the_bus_when_no_reading_landed() {
+        let ids: HashSet<String> = ["Logitech:046d:c547".to_string()].into();
+        let none = HashSet::new();
+        // #79: the dongle is on the bus at the first scan but the
+        // startup poll got nothing, so the tray stayed blank for 5 minutes.
+        assert!(scan_wants_read(None, &ids, false));
+        assert!(!scan_wants_read(None, &ids, true));
+        assert!(!scan_wants_read(None, &none, false));
+        // Later scans: only a newly appeared mouse triggers a read.
+        assert!(scan_wants_read(Some(&none), &ids, true));
+        assert!(!scan_wants_read(Some(&ids), &ids, false));
     }
 
     #[tokio::test]
