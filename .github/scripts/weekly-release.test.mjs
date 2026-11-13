@@ -1,29 +1,38 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { addEntry, bullets, bumpManifest, nextPatch } from "./weekly-release.mjs";
+import { addEntry, bumpManifest, nextPatch, sections } from "./weekly-release.mjs";
 
 test("nextPatch bumps the patch number", () => {
   assert.equal(nextPatch("1.0.9"), "1.0.10");
   assert.throws(() => nextPatch("1.0.0-beta.1"));
 });
 
-test("bullets keep user-facing commits and drop the rest", () => {
-  assert.deepEqual(
-    bullets([
+test("sections group user-facing commits and drop the rest", () => {
+  assert.equal(
+    sections([
       "fix(linux): use system notifications on Wayland (#101)",
       "ci: retry downloads (#96)",
+      "fix(hid): never offer FIDO security keys",
+      "feat(native-hid): add a thing!",
+      "perf: faster start",
+      "revert: undo it",
       "docs: update the readme",
-      "feat: add a thing!",
       "not conventional",
+      "fix(linux): use system notifications on Wayland (#102)",
     ]),
-    ["- Linux: Use system notifications on Wayland.", "- Add a thing!"],
+    [
+      "### New\n\n- Add a thing!",
+      "### Improvements\n\n- Faster start.",
+      "### Fixes\n\n- Linux: Use system notifications on Wayland.\n- Never offer FIDO security keys.",
+      "### Other\n\n- Undo it.",
+    ].join("\n\n"),
   );
-  assert.deepEqual(bullets(["ci: x", "chore: y"]), []);
+  assert.equal(sections(["ci: x", "chore: y"]), "");
 });
 
 test("addEntry goes above the newest entry", () => {
-  const out = addEntry("# Changelog\n\nintro\n\n## 1.0.0\n\n- a\n", "1.0.1", ["- b."]);
-  assert.match(out, /intro\n\n## 1\.0\.1\n\n- b\.\n\n## 1\.0\.0\n\n- a/);
+  const out = addEntry("# Changelog\n\nintro\n\n## 1.0.0\n\n- a\n", "1.0.1", "### Fixes\n\n- b.");
+  assert.match(out, /intro\n\n## 1\.0\.1\n\n### Fixes\n\n- b\.\n\n## 1\.0\.0\n\n- a/);
 });
 
 test("bumpManifest touches only Bridge's own version", () => {

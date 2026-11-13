@@ -20,27 +20,48 @@ export function nextPatch(version) {
   return `${match[1]}.${match[2]}.${Number(match[3]) + 1}`;
 }
 
-/** Changelog bullets for the user-facing commit subjects, oldest first. */
-export function bullets(subjects) {
-  const seen = new Set();
-  const lines = [];
-  for (const subject of subjects) {
-    const match = /^(\w+)(?:\(([^)]*)\))?!?:\s*(.+?)(?:\s+\(#\d+\))?$/.exec(subject.trim());
-    if (!match || HIDDEN.has(match[1])) continue;
-    const [, , scope, text] = match;
-    const sentence = text.charAt(0).toUpperCase() + text.slice(1);
-    const line = `- ${scope ? `${scope[0].toUpperCase()}${scope.slice(1)}: ` : ""}${sentence}${/[.!?]$/.test(sentence) ? "" : "."}`;
-    if (!seen.has(line)) {
-      seen.add(line);
-      lines.push(line);
-    }
-  }
-  return lines;
+/** The section each user-facing commit type goes under, in the order shown. */
+const CATEGORIES = [
+  ["New", ["feat"]],
+  ["Improvements", ["perf"]],
+  ["Fixes", ["fix"]],
+];
+
+/** Scopes worth showing to users: a platform. Others (hid, api, tray) are internal names. */
+const PLATFORMS = { linux: "Linux", macos: "macOS", windows: "Windows" };
+
+/** The changelog line for one commit subject, as `{ type, line }`, or null when it is not user-facing. */
+function bullet(subject) {
+  const match = /^(\w+)(?:\(([^)]*)\))?!?:\s*(.+?)(?:\s+\(#\d+\))?$/.exec(subject.trim());
+  if (!match || HIDDEN.has(match[1])) return null;
+  const [, type, scope, text] = match;
+  const sentence = text.charAt(0).toUpperCase() + text.slice(1);
+  const platform = PLATFORMS[scope?.toLowerCase()];
+  const end = /[.!?]$/.test(sentence) ? "" : ".";
+  return { type, line: `- ${platform ? `${platform}: ` : ""}${sentence}${end}` };
 }
 
-/** `changelog` with `## <version>` added above the newest entry. */
-export function addEntry(changelog, version, lines) {
-  const entry = `## ${version}\n\n${lines.join("\n")}\n\n`;
+/**
+ * The entry body for the user-facing commit subjects: bullets under `###`
+ * headings (New, Improvements, Fixes, then Other for any other type), oldest
+ * first within a heading. Empty when nothing is user-facing.
+ */
+export function sections(subjects) {
+  const known = new Set(CATEGORIES.flatMap(([, types]) => types));
+  const groups = [...CATEGORIES.map(([title, types]) => [title, (type) => types.includes(type)])];
+  groups.push(["Other", (type) => !known.has(type)]);
+  const bullets = subjects.map(bullet).filter(Boolean);
+  const out = [];
+  for (const [title, wants] of groups) {
+    const lines = [...new Set(bullets.filter((b) => wants(b.type)).map((b) => b.line))];
+    if (lines.length > 0) out.push(`### ${title}\n\n${lines.join("\n")}`);
+  }
+  return out.join("\n\n");
+}
+
+/** `changelog` with `## <version>` and its body added above the newest entry. */
+export function addEntry(changelog, version, body) {
+  const entry = `## ${version}\n\n${body}\n\n`;
   const at = changelog.search(/^## /m);
   if (at < 0) return `${changelog.trimEnd()}\n\n${entry}`;
   return changelog.slice(0, at) + entry + changelog.slice(at);
@@ -60,12 +81,12 @@ export function bumpManifest(toml, lock, version) {
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const [tag, subjectsFile] = process.argv.slice(2);
   const subjects = readFileSync(subjectsFile, "utf8").split("\n").filter(Boolean);
-  const lines = bullets(subjects);
-  if (lines.length === 0) {
+  const body = sections(subjects);
+  if (!body) {
     console.error("No user-facing changes since", tag);
   } else {
     const version = nextPatch(tag.replace(/^v/, ""));
-    writeFileSync("CHANGELOG.md", addEntry(readFileSync("CHANGELOG.md", "utf8"), version, lines));
+    writeFileSync("CHANGELOG.md", addEntry(readFileSync("CHANGELOG.md", "utf8"), version, body));
     const { toml, lock } = bumpManifest(
       readFileSync("Cargo.toml", "utf8"),
       readFileSync("Cargo.lock", "utf8"),
