@@ -379,28 +379,46 @@ pub async fn load_with_catalog() -> Result<(BridgeConfig, PathBuf)> {
     let (mut config, path) = load_or_create()?;
     match crate::games::fetch_catalog().await {
         Ok(games) => {
-            let cached_games = std::mem::replace(&mut config.games, games);
-            config = config.normalized();
-            let changed = config.games != cached_games;
-            if changed {
-                save(&path, &config)?;
-            }
-            tracing::info!(
-                url = %crate::games::catalog_url(),
-                games = config.games.len(),
-                changed,
-                "game catalog loaded"
-            );
+            apply_fetched_catalog(&path, &mut config, games);
         }
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                cached_games = config.games.len(),
-                "game catalog unavailable; using cached catalog"
-            );
-        }
+        Err(error) => log_catalog_unavailable(&error, &config),
     }
     Ok((config, path))
+}
+
+/// Puts a freshly fetched game catalog in `config`, normalized the way a load
+/// normalizes it, and saves config.json when it changed. A failed save only
+/// logs: the fetched catalog is still used for this run and is written with
+/// the next settings change. Returns whether the catalog changed.
+pub fn apply_fetched_catalog(
+    path: &std::path::Path,
+    config: &mut BridgeConfig,
+    mut games: Vec<GameConfig>,
+) -> bool {
+    normalize_games(&mut games, &CATALOG_LIMITS);
+    let changed = config.games != games;
+    config.games = games;
+    if changed && let Err(error) = save(path, config) {
+        tracing::warn!(
+            error = %format!("{error:#}"),
+            "could not save the fetched game catalog; using it for this run"
+        );
+    }
+    tracing::info!(
+        url = %crate::games::catalog_url(),
+        games = config.games.len(),
+        changed,
+        "game catalog loaded"
+    );
+    changed
+}
+
+pub fn log_catalog_unavailable(error: &anyhow::Error, config: &BridgeConfig) {
+    tracing::warn!(
+        error = %format!("{error:#}"),
+        cached_games = config.games.len(),
+        "game catalog unavailable; using cached catalog"
+    );
 }
 
 pub fn save(path: &std::path::Path, config: &BridgeConfig) -> Result<()> {
@@ -483,6 +501,60 @@ fn default_origins() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn catalog_game(name: &str) -> GameConfig {
+        GameConfig {
+            name: name.into(),
+            executables: vec![format!("{}.exe", name.to_ascii_lowercase())],
+        }
+    }
+
+    #[test]
+    fn a_catalog_that_cannot_be_saved_is_still_used() {
+        // A regular file where the config's parent directory should be makes
+        // every save fail.
+        let blocker = std::env::temp_dir().join(format!(
+            "openmouse-catalog-save-blocker-{}",
+            std::process::id()
+        ));
+        fs::write(&blocker, b"not a directory").unwrap();
+        let path = blocker.join("config.json");
+        let mut config = BridgeConfig::default();
+
+        let changed = apply_fetched_catalog(&path, &mut config, vec![catalog_game("Beta")]);
+
+        let _ = fs::remove_file(&blocker);
+        assert!(changed);
+        assert_eq!(config.games, vec![catalog_game("Beta")]);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn an_unchanged_catalog_is_not_saved_again() {
+        let directory = std::env::temp_dir().join(format!(
+            "openmouse-catalog-unchanged-{}",
+            std::process::id()
+        ));
+        let path = directory.join("config.json");
+        let mut config = BridgeConfig {
+            games: vec![catalog_game("Alpha"), catalog_game("Beta")],
+            ..BridgeConfig::default()
+        };
+
+        // Same games, other order and case of an executable: normalized equal.
+        let mut fetched = vec![catalog_game("Beta"), catalog_game("Alpha")];
+        fetched[0].executables = vec!["BETA.EXE".into()];
+        let changed = apply_fetched_catalog(&path, &mut config, fetched);
+
+        assert!(!changed);
+        assert!(!path.exists(), "nothing changed, so nothing was written");
+
+        let changed = apply_fetched_catalog(&path, &mut config, vec![catalog_game("Gamma")]);
+        let saved = fs::read(&path).map(|bytes| serde_json::from_slice::<BridgeConfig>(&bytes));
+        let _ = fs::remove_dir_all(&directory);
+        assert!(changed);
+        assert_eq!(saved.unwrap().unwrap().games, vec![catalog_game("Gamma")]);
+    }
 
     #[test]
     fn names_that_differ_only_in_case_are_one_game_wherever_they_sort() {
