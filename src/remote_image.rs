@@ -62,6 +62,8 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
         || ip.is_multicast()
         || first & 0xfe00 == 0xfc00 // unique local
         || first & 0xffc0 == 0xfe80 // link-local
+        || first & 0xffc0 == 0xfec0 // site-local (deprecated, still routed on some LANs)
+        || (first == 0x64 && segments[1] == 0xff9b && segments[2] == 1) // local-use NAT64, 64:ff9b:1::/48
         || (first == 0x2001 && segments[1] == 0) // Teredo
         || (first == 0x2001 && segments[1] == 0x0db8)) // documentation
 }
@@ -191,6 +193,8 @@ mod tests {
             "fc00::1",
             "fd12::1",
             "fe80::1",
+            "fec0::1",
+            "64:ff9b:1::a00:1",
             "ff02::1",
             "::ffff:192.168.0.5",
             "::ffff:127.0.0.1",
