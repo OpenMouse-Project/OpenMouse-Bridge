@@ -291,6 +291,157 @@ export function candidateDevices(vendorId, hints = {}, list = devices) {
   });
 }
 
+/** Whether Bridge parsed the path's descriptor: it declares some report. */
+function declaresReports(path) {
+  return ["inputReports", "outputReports", "featureReports"].some((kind) => Object.keys(path[kind] ?? {}).length > 0);
+}
+
+/** A collection only the operating system may read: a standard mouse or
+ * keyboard (see candidateDevices()). */
+function isStandardOnly(path) {
+  return (
+    path.collections.length > 0 &&
+    path.collections.every((collection) => collection.usagePage === 1 && [1, 2, 6].includes(collection.usage))
+  );
+}
+
+/**
+ * One device as Bridge described it (src/hid.rs, `DescribedDevice`): the
+ * WebHID view the control panel would get — the same grouping and the
+ * collections parsed from the report descriptors — plus each collection's
+ * path and the payload size of every report it declares.
+ *
+ * Unlike HidDeviceAdapter it sends a report down only the path whose
+ * descriptor declares it, padded to the declared size as Chrome's WebHID
+ * does (Windows refuses a feature report of the wrong length), and reads a
+ * feature report at its declared size. A path with no declared reports
+ * (Razer, whose descriptors Bridge does not read) gets HidDeviceAdapter's
+ * behaviour: any path, a generous read buffer.
+ */
+export class DescribedDeviceAdapter extends HidDeviceAdapter {
+  /**
+   * @param {object} described - one entry of the request's `devices`.
+   * @param {{ onlyUsagePage?: number, Handle?: typeof HID }} [options] -
+   *   `onlyUsagePage` opens only the paths with a collection on that page,
+   *   for receivers that stop answering while a sibling collection is read
+   *   (Scyrox, see candidateDevices()).
+   */
+  constructor(described, { onlyUsagePage, Handle = HID } = {}) {
+    const usable = described.paths.filter((path) => !isStandardOnly(path));
+    const narrowed =
+      onlyUsagePage === undefined
+        ? usable
+        : usable.filter((path) => path.collections.some((collection) => collection.usagePage === onlyUsagePage));
+    const paths = narrowed.length > 0 ? narrowed : usable;
+    super(
+      paths.map((path) => ({
+        path: path.path,
+        vendorId: described.vendorId,
+        productId: described.productId,
+        product: described.productName,
+      })),
+      null,
+      Handle,
+    );
+    this.vendorId = described.vendorId;
+    this.productId = described.productId;
+    this.productName = described.productName ?? "";
+    this.collections = described.collections ?? [];
+    this._paths = paths;
+    /** Open handles, each with the path it belongs to. */
+    this._open = [];
+  }
+
+  async open() {
+    if (this.opened) return;
+    let lastError = null;
+    for (const path of this._paths) {
+      try {
+        const device = new this._Handle(path.path, OPEN_OPTIONS);
+        // Listening starts node-hid's read loop. On a path that declares
+        // reports but no input report (the OP1 8k's feature-only 0xff01
+        // collection) Windows fails every read, and node-hid gives up on the
+        // handle, taking the feature reports down with it.
+        if (!declaresReports(path) || Object.keys(path.inputReports ?? {}).length > 0) {
+          device.on("data", this._onData);
+        }
+        device.on("error", this._onError);
+        this._open.push({ path, device });
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    if (this._open.length === 0) {
+      throw lastError ?? new Error("Could not open any HID device path");
+    }
+    this._devices = this._open.map(({ device }) => device);
+    this.opened = true;
+  }
+
+  async close() {
+    await super.close();
+    this._open = [];
+  }
+
+  async sendReport(reportId, data) {
+    this._send(reportId, data, "outputReports", (device, frame) => device.write(frame));
+  }
+
+  async sendFeatureReport(reportId, data) {
+    this._send(reportId, data, "featureReports", (device, frame) => device.sendFeatureReport(frame));
+  }
+
+  async receiveFeatureReport(reportId) {
+    this._requireOpen();
+    const declaring = this._declaring(reportId, "featureReports");
+    const targets = declaring.length > 0 ? declaring : this._open;
+    let lastError;
+    for (const { path, device } of targets) {
+      // The declared payload plus the id byte; 91 covers Razer's 90-byte
+      // reports where nothing is declared (see HidDeviceAdapter).
+      const length = declaring.length > 0 ? path.featureReports[reportId] + 1 : 91;
+      try {
+        const raw = Uint8Array.from(device.getFeatureReport(reportId, length));
+        // A declared report's first byte is its id slot, whatever hidapi left
+        // in it (the OP1 8k's 0xa0 comes back as 0x00 on Windows), as Bridge's
+        // own transport treats it (`report_payload` in src/hid.rs).
+        const payload =
+          declaring.length > 0 || (raw.length > 1 && raw[0] === reportId) ? raw.subarray(1) : raw;
+        return new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError ?? new Error("No HID interface answered the feature report request.");
+  }
+
+  /** The open paths whose descriptor declares `reportId` of `kind`. */
+  _declaring(reportId, kind) {
+    return this._open.filter(({ path }) => path[kind]?.[reportId] !== undefined);
+  }
+
+  /** Sends to the first declaring path that takes the report (any path when
+   * none declares it), so a command reaches the device once. */
+  _send(reportId, data, kind, write) {
+    this._requireOpen();
+    const declaring = this._declaring(reportId, kind);
+    const targets = declaring.length > 0 ? declaring : this._open;
+    let lastError;
+    for (const { path, device } of targets) {
+      const frame = this._frame(reportId, data);
+      const declared = path[kind]?.[reportId];
+      while (declared !== undefined && frame.length < declared + 1) frame.push(0);
+      try {
+        write(device, frame);
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError ?? new Error("No HID interface accepted the report.");
+  }
+}
+
 export async function probeVerifiedDevice(info, identity, probe, Handle = HID) {
   const device = new HidDeviceAdapter([info], identity, Handle);
   try {

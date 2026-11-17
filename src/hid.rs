@@ -1400,31 +1400,8 @@ fn inspect_candidate(
     let mut collections = Vec::new();
     let mut paths = Vec::with_capacity(unique_paths.len());
     for path in unique_paths {
-        let parsed = inspect_descriptors
-            .then(|| {
-                api.open_path(&path).ok().and_then(|device| {
-                    let mut descriptor = vec![0; MAX_REPORT_DESCRIPTOR_SIZE];
-                    let size = device.get_report_descriptor(&mut descriptor).ok()?;
-                    parse_report_descriptor(&descriptor[..size]).ok()
-                })
-            })
-            .flatten();
-        let layout = if let Some((mut path_collections, path_layout)) = parsed {
-            collections.append(&mut path_collections);
-            path_layout
-        } else {
-            collections.extend(
-                infos
-                    .iter()
-                    .filter(|info| info.path() == path.as_c_str())
-                    .map(|info| CollectionInfo {
-                        usage_page: info.usage_page(),
-                        usage: info.usage(),
-                        ..CollectionInfo::default()
-                    }),
-            );
-            ReportLayout::default()
-        };
+        let (mut path_collections, layout) = inspect_path(api, &path, infos, inspect_descriptors);
+        collections.append(&mut path_collections);
         paths.push(CandidatePath { path, layout });
     }
 
@@ -1442,6 +1419,230 @@ fn inspect_candidate(
             collections,
         },
     })
+}
+
+/// The collections and report layout of one path, parsed from its report
+/// descriptor. When the descriptor is not read (`read_descriptor` false, as
+/// for Razer) or cannot be, each collection the platform enumerated for the
+/// path stands in with its usage page and usage only.
+fn inspect_path(
+    api: &HidApi,
+    path: &CString,
+    infos: &[hidapi::DeviceInfo],
+    read_descriptor: bool,
+) -> (Vec<CollectionInfo>, ReportLayout) {
+    let parsed = read_descriptor
+        .then(|| {
+            api.open_path(path).ok().and_then(|device| {
+                let mut descriptor = vec![0; MAX_REPORT_DESCRIPTOR_SIZE];
+                let size = device.get_report_descriptor(&mut descriptor).ok()?;
+                parse_report_descriptor(&descriptor[..size]).ok()
+            })
+        })
+        .flatten();
+    parsed.unwrap_or_else(|| (enumerated_collections(infos, path), ReportLayout::default()))
+}
+
+fn enumerated_collections(infos: &[hidapi::DeviceInfo], path: &CString) -> Vec<CollectionInfo> {
+    infos
+        .iter()
+        .filter(|info| info.path() == path.as_c_str())
+        .map(|info| CollectionInfo {
+            usage_page: info.usage_page(),
+            usage: info.usage(),
+            ..CollectionInfo::default()
+        })
+        .collect()
+}
+
+/// A device filter in the shape OpenMouse passes to
+/// `navigator.hid.requestDevice` (`SUPPORTED_HID_FILTERS`): a device matches
+/// when its vendor and product match and one of its top-level collections has
+/// the usage page and usage, each part only when the filter names it.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct HidFilter {
+    pub vendor_id: u16,
+    pub product_id: Option<u16>,
+    pub usage_page: Option<u16>,
+    pub usage: Option<u16>,
+}
+
+impl HidFilter {
+    fn matches_product(&self, vendor_id: u16, product_id: u16) -> bool {
+        self.vendor_id == vendor_id && self.product_id.is_none_or(|id| id == product_id)
+    }
+
+    fn matches_usage(&self, usage_page: u16, usage: u16) -> bool {
+        self.usage_page.is_none_or(|page| page == usage_page)
+            && self.usage.is_none_or(|id| id == usage)
+    }
+
+    fn matches_info(&self, info: &hidapi::DeviceInfo) -> bool {
+        self.matches_product(info.vendor_id(), info.product_id())
+            && self.matches_usage(info.usage_page(), info.usage())
+    }
+
+    fn matches_device(&self, device: &DescribedDevice) -> bool {
+        self.matches_product(device.vendor_id, device.product_id)
+            && device
+                .collections
+                .iter()
+                .any(|collection| self.matches_usage(collection.usage_page, collection.usage))
+    }
+}
+
+/// One device on the bus as the native helper sees it: what WebHID would give
+/// the control panel for it (the same grouping and parsed collections as the
+/// panel's own Bridge transport), plus the path of each of its collections and
+/// the size of every report each declares, so the helper can send a report
+/// down the path that declares it, sized the way Windows requires.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DescribedDevice {
+    pub key: String,
+    pub vendor_id: u16,
+    pub product_id: u16,
+    pub product_name: String,
+    collections: Vec<CollectionInfo>,
+    paths: Vec<DescribedPath>,
+    /// For Bridge's own device ids only; the helper never sees serials.
+    #[serde(skip)]
+    pub serial: String,
+    /// False when the device was listed from enumeration alone, during a
+    /// control panel session, and its descriptors are still to be read.
+    #[serde(skip)]
+    complete: bool,
+}
+
+impl DescribedDevice {
+    pub(crate) fn described_fully(&self) -> bool {
+        self.complete
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DescribedPath {
+    path: String,
+    collections: Vec<CollectionInfo>,
+    /// Payload bytes (report id excluded) of each declared report, by id.
+    input_reports: std::collections::BTreeMap<u8, usize>,
+    output_reports: std::collections::BTreeMap<u8, usize>,
+    feature_reports: std::collections::BTreeMap<u8, usize>,
+}
+
+fn report_bytes(bits: &HashMap<u8, usize>) -> std::collections::BTreeMap<u8, usize> {
+    bits.iter()
+        .map(|(id, bits)| (*id, bits.div_ceil(8)))
+        .collect()
+}
+
+/// Devices already described, by grouping key. A device is opened to read its
+/// descriptors only when it first appears or its paths change, not on every
+/// scan.
+static DESCRIBED: Mutex<Option<HashMap<Vec<u8>, DescribedDevice>>> = Mutex::new(None);
+
+/// Every device on the bus that one of `filters` matches, described for the
+/// native helper. Only matching collections' devices are opened, and only to
+/// read their report descriptors; security keys and Logitech receiver child
+/// nodes are left out, as the control panel's own listing leaves them out.
+///
+/// While the control panel holds a session no device is opened: one that has
+/// not been described yet is listed from enumeration alone (usage pages, no
+/// reports) and described properly once the session ends.
+pub(crate) fn describe_devices(filters: &[HidFilter]) -> Result<Vec<DescribedDevice>, String> {
+    let api = new_api().map_err(|error| error.to_string())?;
+    let blocked = security_key_paths(&api);
+    let mut wanted = HashSet::new();
+    let mut groups = std::collections::BTreeMap::<Vec<u8>, Vec<hidapi::DeviceInfo>>::new();
+    for info in api.device_list() {
+        if blocked.contains(info.path()) || is_receiver_child(info.path()) {
+            continue;
+        }
+        let group = device_group_key(info);
+        if filters.iter().any(|filter| filter.matches_info(info)) {
+            wanted.insert(group.clone());
+        }
+        groups.entry(group).or_default().push(info.clone());
+    }
+    groups.retain(|group, _| wanted.contains(group));
+
+    let mut cache = DESCRIBED.lock().unwrap_or_else(PoisonError::into_inner);
+    let cache = cache.get_or_insert_with(HashMap::new);
+    cache.retain(|group, _| groups.contains_key(group));
+    let may_open = !client_session_active();
+    let mut described = Vec::with_capacity(groups.len());
+    for (group, infos) in groups {
+        let paths: std::collections::BTreeSet<String> = infos
+            .iter()
+            .map(|info| info.path().to_string_lossy().into_owned())
+            .collect();
+        let cached = cache.get(&group).filter(|device| {
+            device.paths.len() == paths.len()
+                && device.paths.iter().all(|path| paths.contains(&path.path))
+        });
+        let device = match cached {
+            Some(device) => device.clone(),
+            None => {
+                let device = describe_group(&api, &group, &infos, may_open);
+                if may_open {
+                    cache.insert(group, device.clone());
+                }
+                device
+            }
+        };
+        if filters.iter().any(|filter| filter.matches_device(&device)) {
+            described.push(device);
+        }
+    }
+    Ok(described)
+}
+
+fn describe_group(
+    api: &HidApi,
+    group: &[u8],
+    infos: &[hidapi::DeviceInfo],
+    open: bool,
+) -> DescribedDevice {
+    let primary = &infos[0];
+    let read_descriptor = open && primary.vendor_id() != RAZER_VENDOR_ID;
+    let mut seen = HashSet::new();
+    let mut collections = Vec::new();
+    let mut paths = Vec::new();
+    for info in infos {
+        let path = info.path().to_owned();
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let (path_collections, layout) = inspect_path(api, &path, infos, read_descriptor);
+        collections.extend(path_collections.iter().cloned());
+        paths.push(DescribedPath {
+            path: path.to_string_lossy().into_owned(),
+            collections: path_collections,
+            input_reports: report_bytes(&layout.input_bits),
+            output_reports: report_bytes(&layout.output_bits),
+            feature_reports: report_bytes(&layout.feature_bits),
+        });
+    }
+    DescribedDevice {
+        key: stable_device_key(group),
+        vendor_id: primary.vendor_id(),
+        product_id: primary.product_id(),
+        product_name: infos
+            .iter()
+            .find_map(|info| info.product_string().filter(|name| !name.is_empty()))
+            .unwrap_or_default()
+            .to_owned(),
+        collections,
+        paths,
+        serial: infos
+            .iter()
+            .find_map(|info| info.serial_number().filter(|serial| !serial.is_empty()))
+            .unwrap_or_default()
+            .to_owned(),
+        complete: open,
+    }
 }
 
 #[derive(Clone, Default)]
@@ -1800,7 +2001,57 @@ async fn send_json(socket: &mut impl HidSocket, value: &impl Serialize) -> Resul
 }
 
 #[cfg(test)]
+impl DescribedDevice {
+    /// A described device with one collection per `(usage_page, usage)`.
+    pub(crate) fn for_test(
+        key: &str,
+        vendor_id: u16,
+        product_id: u16,
+        serial: &str,
+        usages: &[(u16, u16)],
+    ) -> Self {
+        Self {
+            key: key.into(),
+            vendor_id,
+            product_id,
+            product_name: String::new(),
+            collections: usages
+                .iter()
+                .map(|(usage_page, usage)| CollectionInfo {
+                    usage_page: *usage_page,
+                    usage: *usage,
+                    ..CollectionInfo::default()
+                })
+                .collect(),
+            paths: Vec::new(),
+            serial: serial.into(),
+            complete: true,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    #[test]
+    fn a_filter_matches_a_device_by_product_and_any_collection_usage() {
+        use super::{DescribedDevice, HidFilter};
+        let filter = |product_id, usage_page, usage| HidFilter {
+            vendor_id: 0x3434,
+            product_id,
+            usage_page,
+            usage,
+        };
+        let receiver =
+            DescribedDevice::for_test("k", 0x3434, 0xd05a, "", &[(0x01, 0x02), (0xffc1, 0x01)]);
+        assert!(filter(Some(0xd05a), Some(0xffc1), Some(0x01)).matches_device(&receiver));
+        assert!(filter(None, Some(0xffc1), None).matches_device(&receiver));
+        assert!(filter(None, None, None).matches_device(&receiver));
+        assert!(!filter(Some(0xd05b), None, None).matches_device(&receiver));
+        assert!(!filter(None, Some(0xff0a), None).matches_device(&receiver));
+        // The usage page and usage must be one collection's.
+        assert!(!filter(None, Some(0xffc1), Some(0x02)).matches_device(&receiver));
+    }
+
     #[test]
     fn device_keys_are_stable_and_never_carry_the_serial() {
         let receiver = grouped_device_key(0x046d, 0xc54d, b"/dev/hidraw2", Some("375D35803234"));

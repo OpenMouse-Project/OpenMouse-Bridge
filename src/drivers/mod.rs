@@ -29,6 +29,7 @@ pub mod delux;
 mod lamzu;
 mod native_hid;
 pub mod pulsar;
+mod registry;
 
 pub use native_hid::{NativeBattery, NativeStatus, spawn_button_listener};
 
@@ -45,6 +46,9 @@ pub struct DetectedMouse {
     pub product_id: u16,
 }
 
+/// Discovery's fallback for when the protocol registry cannot be loaded (see
+/// [`detect_mice`]), and the brand prefixes [`brand_in_name`] recognises.
+///
 /// Brand keys and vendor ids, mirroring the helper's `native-hid/src/brands.mjs`
 /// (the same drivers the web panel drives, and the same normalization
 /// `apply.mjs` gives `device.id` prefixes: trim + lowercase). When several
@@ -141,13 +145,58 @@ fn discovered_brand(info: &hidapi::DeviceInfo) -> Option<&'static str> {
         .map(|(brand, _)| *brand)
 }
 
-/// Every HID interface on the bus whose vendor id belongs to a brand with a
-/// Bridge driver, deduplicated to one entry per physical mouse (several
+/// Every mouse on the bus Bridge can drive, one entry per physical mouse.
+///
+/// Which devices are mice, and their brands, comes from the control panel's
+/// own driver registry (see `registry`). A device is opened only the first
+/// time it appears, to read its report descriptors, and only if it matches
+/// the registry's filters. When the registry cannot be reached (no Node.js),
+/// discovery falls back to Bridge's vendor-id table.
+pub fn detect_mice() -> Vec<DetectedMouse> {
+    let Some(devices) = registry::devices() else {
+        return detect_by_vendor();
+    };
+    let mut mice = mice_from_registry(devices);
+    // Pulsar has a Rust driver of its own, which reads models the registry
+    // may not list; those are still found by vendor id.
+    for mouse in detect_by_vendor() {
+        if mouse.vendor_id == pulsar::VENDOR_ID
+            && !mice.iter().any(|known| {
+                known.vendor_id == mouse.vendor_id && known.product_id == mouse.product_id
+            })
+        {
+            mice.push(mouse);
+        }
+    }
+    mice
+}
+
+fn mice_from_registry(devices: Vec<(crate::hid::DescribedDevice, String)>) -> Vec<DetectedMouse> {
+    let mut mice: Vec<DetectedMouse> = Vec::new();
+    for (device, brand) in devices {
+        let tail = identity_tail(&(device.vendor_id, device.product_id, device.serial.as_str()));
+        let device_id = format!("{brand}:{tail}");
+        // Without a serial, Windows lists each interface of a mouse as its
+        // own device; they are one mouse.
+        if mice.iter().any(|mouse| mouse.device_id == device_id) {
+            continue;
+        }
+        mice.push(DetectedMouse {
+            device_id,
+            name: product_name(&device.product_name, &brand),
+            vendor_id: device.vendor_id,
+            product_id: device.product_id,
+        });
+    }
+    mice
+}
+
+/// Every HID interface on the bus whose vendor id belongs to a brand in
+/// [`KNOWN_BRANDS`], deduplicated to one entry per physical mouse (several
 /// interfaces share the same vendor/product/serial).
 ///
-/// Deliberately does not open any device — enumeration only — so it is safe
-/// to call while a web panel session or another driver operation runs.
-pub fn detect_mice() -> Vec<DetectedMouse> {
+/// Enumeration only, no device is opened.
+fn detect_by_vendor() -> Vec<DetectedMouse> {
     let api = match crate::hid::new_api() {
         Ok(api) => api,
         Err(error) => {
@@ -286,10 +335,10 @@ pub fn apply_profile(profile: &ApplicationProfile) -> Result<bool> {
             if delux::apply(profile)? {
                 Ok(true)
             } else {
-                native_hid::apply(profile)
+                native_hid::apply(profile, registry::devices_for(&brand).as_ref())
             }
         }
-        _ => native_hid::apply(profile),
+        _ => native_hid::apply(profile, registry::devices_for(&brand).as_ref()),
     }
 }
 
@@ -344,7 +393,7 @@ pub fn read_status(device_id: &str) -> Result<Option<NativeStatus>> {
     {
         return Ok(Some(status));
     }
-    native_hid::read_status(brand)
+    native_hid::read_status(brand, registry::devices_for(brand).as_ref())
 }
 
 /// local Bridge. Native-only devices use this path when WebHID cannot access
@@ -353,13 +402,41 @@ pub fn apply_settings(brand: &str, dpi: Option<u32>, polling_rate_hz: Option<u32
     let mut access = device_access();
     ensure_native_ownership()?;
     access.invalidate(brand, dpi.is_some(), polling_rate_hz.is_some())?;
-    native_hid::apply_settings(brand, dpi, polling_rate_hz)
+    native_hid::apply_settings(
+        brand,
+        dpi,
+        polling_rate_hz,
+        registry::devices_for(brand).as_ref(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{ProfileApplication, ProfileDevice, ProfileSettings};
+    use crate::hid::DescribedDevice;
+
+    #[test]
+    fn registry_mice_keep_the_device_id_shape_and_merge_a_mouses_interfaces() {
+        let mice = mice_from_registry(vec![
+            (
+                DescribedDevice::for_test("a", 0x3434, 0xd05a, "F5156C34962F36D9", &[]),
+                "Keychron".into(),
+            ),
+            // No serial: Windows lists each interface separately.
+            (
+                DescribedDevice::for_test("b", 0x3367, 0x1964, "", &[]),
+                "Endgame Gear".into(),
+            ),
+            (
+                DescribedDevice::for_test("c", 0x3367, 0x1964, "", &[]),
+                "Endgame Gear".into(),
+            ),
+        ]);
+        let ids: Vec<&str> = mice.iter().map(|mouse| mouse.device_id.as_str()).collect();
+        assert_eq!(ids, ["Keychron:F5156C34962F36D9", "Endgame Gear:3367:1964"]);
+        assert_eq!(mice[1].name, "Endgame Gear Mouse");
+    }
 
     fn profile(device_id: &str) -> ApplicationProfile {
         ApplicationProfile {

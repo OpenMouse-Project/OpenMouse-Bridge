@@ -41,6 +41,7 @@ import { BRAND_DRIVERS, brandKey } from "./brands.mjs";
 import { applyX11PollingRate, x11DeviceInfos } from "./attack-shark-x11.mjs";
 import { candidateDevices, probeVerifiedDevice } from "./hid-device-adapter.mjs";
 import { selectClient } from "./select-client.mjs";
+import { identify, knowsBrand, loadRegistry, registryPairs } from "./registry.mjs";
 import { devices } from "node-hid";
 import { automate } from "./automation.mjs";
 
@@ -69,15 +70,18 @@ function withTimeout(promise, ms, label) {
  * the device) on any failure, so the caller can move on to the next
  * candidate. */
 async function probe(device, candidate) {
-  const module = await import(candidate.module);
-  const Client = module[candidate.exportName];
-  const client = new Client(device);
+  // Registry candidates come with their client built; brands.mjs ones name a
+  // class to import.
+  const client = candidate.client ?? new (await import(candidate.module))[candidate.exportName](device);
   try {
     await withTimeout(client.open(), PROBE_TIMEOUT_MS, `${candidate.exportName}.open()`);
     // Every SupportedClient implements readStatus() (mouse-protocol's
     // shared client contract) — a cheap, read-only way to confirm this is
     // really the right class for this interface before writing anything.
     const status = await withTimeout(client.readStatus(), PROBE_TIMEOUT_MS, `${candidate.exportName}.readStatus()`);
+    if (candidate.requireBrand !== undefined && brandKey(status?.brand ?? "") !== candidate.requireBrand) {
+      throw new Error(`reports itself as ${status?.brand ?? "an unknown brand"}`);
+    }
     return { client, status };
   } catch (error) {
     await device.close().catch(() => undefined);
@@ -87,6 +91,23 @@ async function probe(device, candidate) {
 
 async function main() {
   const input = JSON.parse(await readStdin());
+
+  // ── Device registry ─────────────────────────────────────────────────
+  // Bridge asks once for the filters that decide which devices it may open,
+  // then, whenever the devices on the bus change, which brand the registry
+  // files each of them under.
+  if (input.action === "filters") {
+    const { filters } = await loadRegistry();
+    process.stdout.write(JSON.stringify({ filters }));
+    process.exit(EXIT_APPLIED);
+  }
+  if (input.action === "identify") {
+    const { drivers } = await loadRegistry();
+    const described = Array.isArray(input.devices) ? input.devices : [];
+    process.stdout.write(JSON.stringify({ devices: identify(drivers, described) }));
+    process.exit(EXIT_APPLIED);
+  }
+
   const brand = typeof input.brand === "string" ? input.brand : "";
   const normalizedBrand = brandKey(brand);
   const entry = BRAND_DRIVERS[normalizedBrand];
@@ -98,7 +119,11 @@ async function main() {
     process.stdout.write(JSON.stringify(reply));
     process.exit(EXIT_APPLIED);
   }
-  if (!entry) {
+  // With `devices`, Bridge described the bus and the registry picks the
+  // driver; without them (an older request shape) brands.mjs does.
+  const registry = Array.isArray(input.devices) ? await loadRegistry() : null;
+  const knownBrand = registry ? knowsBrand(registry.drivers, brand) || Boolean(entry) : Boolean(entry);
+  if (!knownBrand && !input.matchStatusBrand) {
     console.error(`[native-hid] no driver registered for brand "${brand}"`);
     process.exit(EXIT_NO_DRIVER);
   }
@@ -116,11 +141,17 @@ async function main() {
     }
   }
 
-  const pairs = entry.vendorIds.flatMap((vendorId) =>
-    candidateDevices(vendorId, entry).flatMap((device) => entry.classes.map((candidate) => ({ device, candidate }))),
-  );
+  const pairs = registry
+    ? registryPairs(registry.drivers, input.devices, brand, { matchStatusBrand: input.matchStatusBrand === true })
+    : entry.vendorIds.flatMap((vendorId) =>
+        candidateDevices(vendorId, entry).flatMap((device) => entry.classes.map((candidate) => ({ device, candidate }))),
+      );
   const { client, status, attempts } = await selectClient(pairs, probe, { preferBattery: input.action === "status" });
 
+  if (!client && !knownBrand) {
+    console.error(`[native-hid] no device reports itself as ${brand}.`);
+    process.exit(EXIT_NO_DRIVER);
+  }
   if (!client) {
     console.error(
       `[native-hid] no ${brand} device answered.` + (attempts.length ? ` Tried:\n  ${attempts.join("\n  ")}` : " No matching HID interface was found."),
