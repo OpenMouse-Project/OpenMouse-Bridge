@@ -40,6 +40,7 @@ globalThis.window ??= globalThis;
 import { BRAND_DRIVERS, brandKey } from "./brands.mjs";
 import { applyX11PollingRate, x11DeviceInfos } from "./attack-shark-x11.mjs";
 import { candidateDevices, probeVerifiedDevice } from "./hid-device-adapter.mjs";
+import { selectClient } from "./select-client.mjs";
 import { devices } from "node-hid";
 import { automate } from "./automation.mjs";
 
@@ -115,21 +116,10 @@ async function main() {
     }
   }
 
-  const attempts = [];
-  let client = null;
-  let status = null;
-  outer: for (const vendorId of entry.vendorIds) {
-    for (const device of candidateDevices(vendorId, entry)) {
-      for (const candidate of entry.classes) {
-        try {
-          ({ client, status } = await probe(device, candidate));
-          break outer;
-        } catch (error) {
-          attempts.push(`${candidate.exportName} on ${device.productName || "unknown device"}: ${error.message}`);
-        }
-      }
-    }
-  }
+  const pairs = entry.vendorIds.flatMap((vendorId) =>
+    candidateDevices(vendorId, entry).flatMap((device) => entry.classes.map((candidate) => ({ device, candidate }))),
+  );
+  const { client, status, attempts } = await selectClient(pairs, probe, { preferBattery: input.action === "status" });
 
   if (!client) {
     console.error(
