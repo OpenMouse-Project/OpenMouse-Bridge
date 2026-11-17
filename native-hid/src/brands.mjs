@@ -1,3 +1,8 @@
+// The fallback dispatch table. Bridge normally sends the devices it described
+// and the protocol package's own registry picks the driver (registry.mjs); this
+// table is used only for a request without them — when the registry could not
+// be loaded, and for Zaunkoenig's acknowledged automation (automation.mjs).
+//
 // Maps a MouseStatus `brand` string (mouse-protocol/src/drivers/mouse-types.ts)
 // to the HID vendor id(s) to enumerate and the candidate driver classes to
 // try constructing against each interface found, in the same order
@@ -5,14 +10,9 @@
 // that brand (first-match-wins there; here, first class whose open() +
 // readStatus() probe succeeds wins — see apply.mjs).
 //
-// Deliberately excluded:
-// - "Pulsar": Bridge has a dependency-free native Rust driver for it
-//   (src/drivers/pulsar.rs) that claims the brand before this helper is ever
-//   invoked — see src/drivers/mod.rs.
-// - G-Wolves: not yet a finished, exported driver in the local mouse-protocol
-//   checkout (untracked src/g-wolves/, src/drivers/g-wolves/, no package.json
-//   export or registry.ts entry as of this writing) — add it here once it
-//   ships upstream.
+// "Pulsar" is left out: Bridge has a dependency-free native Rust driver for it
+// (src/drivers/pulsar.rs) that claims the brand before this helper is ever
+// invoked — see src/drivers/mod.rs.
 //
 // Vendor ids are copied from mouse-protocol/src/drivers/vendors.ts and each
 // driver's own `isSupported()`; class import paths use the package's

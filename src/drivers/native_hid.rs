@@ -24,15 +24,48 @@ use crate::config::ApplicationProfile;
 /// per-candidate probe timeouts (a few seconds each, for a handful of HID
 /// interfaces at most).
 const HELPER_TIMEOUT: Duration = Duration::from_secs(10);
-const HELPER_INPUT_LIMIT: usize = 4096;
+/// Room for the described devices a request carries (their parsed
+/// collections run to a few KiB each).
+const HELPER_INPUT_LIMIT: usize = 1024 * 1024;
 const HELPER_OUTPUT_LIMIT: usize = 64 * 1024;
 
 const EXIT_OK: i32 = 0;
 const EXIT_NO_DRIVER: i32 = 3;
 
+/// The devices a request may use, as Bridge described them (see
+/// `drivers::registry`). Without them the helper falls back to its own
+/// vendor table.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Devices {
+    pub described: Vec<crate::hid::DescribedDevice>,
+    /// None of the devices is filed under the requested brand: the helper
+    /// keeps one whose own status reports the brand.
+    pub match_status_brand: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Target<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    devices: Option<&'a [crate::hid::DescribedDevice]>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    match_status_brand: bool,
+}
+
+impl<'a> Target<'a> {
+    fn of(devices: Option<&'a Devices>) -> Self {
+        Self {
+            devices: devices.map(|devices| devices.described.as_slice()),
+            match_status_brand: devices.is_some_and(|devices| devices.match_status_brand),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct ApplyRequest<'a> {
     brand: &'a str,
+    #[serde(flatten)]
+    target: Target<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dpi: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "pollingRateHz")]
@@ -48,6 +81,8 @@ struct ApplyRequest<'a> {
 struct StatusRequest<'a> {
     brand: &'a str,
     action: &'static str,
+    #[serde(flatten)]
+    target: Target<'a>,
 }
 
 /// The battery fields of `mouse-protocol`'s `MouseStatus`, as `apply.mjs`
@@ -107,21 +142,27 @@ fn coerce_dpi(value: Option<&serde_json::Value>) -> Option<u32> {
 /// no driver for this brand (most devices are still driven by the OpenMouse
 /// web app over WebHID instead), and `Err` when a driver exists but the
 /// apply itself failed (including the helper or Node.js being unavailable).
-pub fn apply(profile: &ApplicationProfile) -> Result<bool> {
+pub fn apply(profile: &ApplicationProfile, devices: Option<&Devices>) -> Result<bool> {
     let brand = profile.device.id.split(':').next().unwrap_or_default();
     apply_settings_with_snapshot(
         brand,
         profile.settings.dpi,
         profile.settings.polling_rate_hz,
         profile.settings.snapshot.as_ref(),
+        devices,
     )
 }
 
 /// Pushes an explicit settings request from the local HTTP API. This shares
 /// the exact helper path used by automatic profiles, so native device control
 /// and profile switching cannot drift into separate protocol implementations.
-pub fn apply_settings(brand: &str, dpi: Option<u32>, polling_rate_hz: Option<u32>) -> Result<bool> {
-    apply_settings_with_snapshot(brand, dpi, polling_rate_hz, None)
+pub fn apply_settings(
+    brand: &str,
+    dpi: Option<u32>,
+    polling_rate_hz: Option<u32>,
+    devices: Option<&Devices>,
+) -> Result<bool> {
+    apply_settings_with_snapshot(brand, dpi, polling_rate_hz, None, devices)
 }
 
 fn apply_settings_with_snapshot(
@@ -129,9 +170,11 @@ fn apply_settings_with_snapshot(
     dpi: Option<u32>,
     polling_rate_hz: Option<u32>,
     settings: Option<&serde_json::Value>,
+    devices: Option<&Devices>,
 ) -> Result<bool> {
     let request = ApplyRequest {
         brand,
+        target: Target::of(devices),
         dpi,
         polling_rate_hz,
         settings,
@@ -142,10 +185,11 @@ fn apply_settings_with_snapshot(
 /// Reads a `brand` mouse's status via the Node helper. `Ok(None)` means
 /// the helper has no driver for the brand or the mouse reports no battery
 /// (a wired mouse); `Err` means a driver exists but no mouse answered.
-pub fn read_status(brand: &str) -> Result<Option<NativeStatus>> {
+pub fn read_status(brand: &str, devices: Option<&Devices>) -> Result<Option<NativeStatus>> {
     let request = StatusRequest {
         brand,
         action: "status",
+        target: Target::of(devices),
     };
     let Some(stdout) = run_helper(&request)? else {
         return Ok(None);

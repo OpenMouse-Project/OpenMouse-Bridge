@@ -24,20 +24,45 @@ duplicated or reimplemented here.
 
 ## How dispatch works
 
-`brands.mjs` maps a `MouseStatus.brand` string (Bridge's saved profile
-`device.id` is `"<brand>:<name>"`, matching what the OpenMouse web app
-writes) to that brand's HID vendor id(s) and its candidate driver class(es),
-in the same order `mouse-protocol/src/drivers/registry.ts` tries them.
+Drivers are chosen the way the control panel chooses them: by
+`@openmouse/protocol`'s own registry (`DEVICE_DRIVERS`, first `supports()`
+match wins), so every brand the panel supports is covered, and a new brand
+in the protocol package needs no change here.
 
-`apply.mjs` doesn't replicate WebHID's report-descriptor-based
-`isSupported()` auto-detection (this adapter reports `collections: []` —
-real report-descriptor parsing isn't implemented). Instead, since Bridge
-already knows the brand from the saved profile, it opens each HID interface
-for that brand's vendor id(s) and tries each candidate class directly:
-`client.open()` then `client.readStatus()` — a cheap, read-only call every
-`SupportedClient` implements — as a probe. The first class that doesn't
-throw is treated as correct, and `setDpi()`/`setPollingRate()` are called on
-it.
+The registry's `supports()` checks need what WebHID gives the panel: each
+device's collections, parsed from its report descriptors. node-hid cannot
+read descriptors, so Bridge does it (`describe_devices` in `src/hid.rs`, the
+same grouping and parser as the panel's own Bridge transport) and sends the
+described devices with each request:
+
+1. Once per run, Bridge asks for the registry's `SUPPORTED_HID_FILTERS`
+   (`{"action": "filters"}`), the filters the panel requests devices with.
+   Bridge only ever opens a device one of them matches, and only to read its
+   descriptors, so hardware that shares a mouse maker's chip vendor id (a
+   motherboard's RGB controller, a touchpad) is never touched.
+2. When the devices on the bus change, Bridge asks which brand the registry
+   files each under (`{"action": "identify", "devices": [...]}`). Those are
+   the mice it lists.
+3. A status or apply request carries the described devices of that brand
+   (`"devices": [...]`). `registry.mjs` builds the registry's client for each
+   on a `DescribedDeviceAdapter`, which sends a report down only the
+   collection whose descriptor declares it, padded to the declared size as
+   Chrome does (Windows refuses a feature report of any other length), and
+   reads feature reports at their declared size. `client.open()` then
+   `client.readStatus()` — a cheap, read-only call every `SupportedClient`
+   implements — probe it before anything is written. When a profile's brand
+   is not the one the registry files its mouse under (`"Attack Shark"` saved
+   for hardware filed as `"Delux"`), Bridge sends `"matchStatusBrand": true`
+   and every supported device, and the helper keeps the one whose status
+   reports the brand.
+
+`select-client.mjs` prefers a device whose status includes a battery, so a
+receiver's battery-less interfaces never hide the mouse's.
+
+Without `devices` in the request (Node.js could not load the registry, or
+Zaunkoenig's acknowledged automation, which identifies its endpoint by
+node-hid path), the helper falls back to `brands.mjs`: a brand's vendor ids
+and candidate classes, every interface tried in turn.
 
 The Attack Shark X11 family is the partial exception. Its settings channel is not
 visible through WebHID, so `apply.mjs` first checks for VID `0x1d57`, PIDs
@@ -48,12 +73,10 @@ fall through to the generic `AttackSharkHidClient` path, which drives the 0x04
 six-stage table for model `0x55` (mouse-protocol #174), preserving the stages
 the request does not touch.
 
-A brand entry can also narrow which interfaces are opened: `productIds` keeps
-only its own products on a shared vendor id, and `usagePage` opens only an
-interface's collections on that page. The Scyrox entry uses both: CompX's
-vendor id `0x3554` carries several brands, and the Scyrox V8's dongle stops
-answering on its `0xff02` config collection on Windows while its sibling
-vendor collections are open and read.
+The Scyrox V8's dongle stops answering on its `0xff02` config collection on
+Windows while its sibling vendor collections are open and read, so only that
+collection is opened for Scyrox (`ONLY_USAGE_PAGE` in `registry.mjs`, and the
+`usagePage` of its `brands.mjs` entry for the fallback).
 
 ## Button listener
 
@@ -122,9 +145,9 @@ runtime first and falls back to `node` on `PATH`, so local development
   read 1,600 DPI and 2,000 Hz, while one on every interface-1 collection got
   no answer. The full `apply.mjs` path still needs a run on that mouse, and
   an `@openmouse/protocol` release with the V8 in its Scyrox catalog.
-- Other adapter and dispatch paths are structurally tested (module resolution,
-  exit codes and control flow) and still require validation on their respective
-  hardware.
-- G-Wolves is deliberately left out of `brands.mjs`: it isn't a finished,
-  exported driver in `mouse-protocol` yet (untracked source, no
-  `package.json` export, no `registry.ts` entry as of this writing).
+- The registry path was hardware-verified on Windows with a Keychron G6 HE
+  8K on its TurboLink 8K receiver (battery, DPI and polling read), an Endgame
+  Gear OP1 8k (DPI and polling read; its `0xa0` config report comes back with
+  `0x00` in the id slot), and a Wooting 60HE+ (identified and read).
+- Other brands are covered by the registry's own `supports()` checks and the
+  adapter's tests, and still require validation on their hardware.
