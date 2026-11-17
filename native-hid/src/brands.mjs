@@ -119,7 +119,13 @@ export const BRAND_DRIVERS = {
   },
   keychron: {
     vendorIds: [0x3434],
-    classes: [client("@openmouse/protocol/drivers/keychron/hid", "KeychronHidClient")],
+    classes: [
+      client("@openmouse/protocol/drivers/keychron/mouse-8k-hid", "Keychron8kHidClient"),
+      client("@openmouse/protocol/drivers/keychron/mouse-1k-hid", "Keychron1kHidClient"),
+      client("@openmouse/protocol/drivers/keychron/mouse-4k-hid", "Keychron4kHidClient"),
+      client("@openmouse/protocol/drivers/keychron/mouse-8k-nordic-hid", "Keychron8kNordicHidClient"),
+      client("@openmouse/protocol/drivers/keychron/nape-hid", "KeychronNapeHidClient"),
+    ],
   },
   fantech: {
     vendorIds: [0x3151],
