@@ -49,6 +49,27 @@ test("the first answer is used when no interface reports a battery", async () =>
   assert.deepEqual(log, ["first", "second", "first"]);
 });
 
+test("after a battery-less answer only that class is tried on other interfaces", async () => {
+  const tried = [];
+  const first = fakeDevice("first");
+  const second = fakeDevice("second");
+  const [a, b] = [candidate("A"), candidate("B")];
+  const result = await selectClient(
+    [
+      { device: first, candidate: a },
+      { device: first, candidate: b },
+      { device: second, candidate: b },
+      { device: second, candidate: a },
+    ],
+    async (device, which) => {
+      tried.push(`${which.exportName}@${device.productName}`);
+      return { client: { close: async () => undefined }, status: { batteryPercent: device === second ? 40 : null } };
+    },
+  );
+  assert.equal(result.status.batteryPercent, 40);
+  assert.deepEqual(tried, ["A@first", "A@second"]);
+});
+
 test("a battery answer stops the search", async () => {
   const log = [];
   await selectClient(

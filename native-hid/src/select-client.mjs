@@ -8,6 +8,11 @@
 // battery wins, and the first answer is only used when none has one (a wired
 // mouse, for instance).
 //
+// Once a class has answered, only that class is tried on the remaining
+// interfaces: the class is known to fit the device, and trying every other
+// class on every interface could take long enough (each failed probe may
+// wait out its timeout) to run past Bridge's limit on the helper.
+//
 // A battery-less answer is closed before probing on rather than held open:
 // some receivers stop answering on one collection while a sibling is read
 // (see candidateDevices()), so it is probed again if it ends up the pick.
@@ -23,6 +28,7 @@ export async function selectClient(pairs, probe) {
   const attempts = [];
   let fallback = null;
   for (const { device, candidate } of pairs) {
+    if (fallback && (candidate.exportName !== fallback.candidate.exportName || device === fallback.device)) continue;
     let found;
     try {
       found = await probe(device, candidate);
