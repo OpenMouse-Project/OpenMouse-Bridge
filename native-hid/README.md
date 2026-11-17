@@ -56,8 +56,9 @@ described devices with each request:
    and every supported device, and the helper keeps the one whose status
    reports the brand.
 
-`select-client.mjs` prefers a device whose status includes a battery, so a
-receiver's battery-less interfaces never hide the mouse's.
+For a status read, `select-client.mjs` prefers a device whose status includes
+a battery, so a receiver's battery-less interfaces never hide the mouse's.
+Settings writes take the first device that answers.
 
 Without `devices` in the request (Node.js could not load the registry, or
 Zaunkoenig's acknowledged automation, which identifies its endpoint by

@@ -177,6 +177,18 @@ test("matching on the status brand offers every claimed device", () => {
   assert.ok(pairs.every(({ candidate }) => candidate.requireBrand === "attack shark"));
 });
 
+test("every helper script parses", async () => {
+  // apply.mjs and the other entry points run main() on import, so no test
+  // loads them; a syntax error there would otherwise only show in Bridge.
+  const { readdirSync } = await import("node:fs");
+  const { spawnSync } = await import("node:child_process");
+  const directory = new URL(".", import.meta.url);
+  for (const file of readdirSync(directory).filter((name) => name.endsWith(".mjs"))) {
+    const result = spawnSync(process.execPath, ["--check", new URL(file, directory).pathname.replace(/^\/([A-Za-z]:)/, "$1")]);
+    assert.equal(result.status, 0, `${file}: ${result.stderr}`);
+  }
+});
+
 test("knowsBrand ignores case", () => {
   assert.ok(knowsBrand(drivers, "endgame gear"));
   assert.ok(!knowsBrand(drivers, "Lamzu"));
