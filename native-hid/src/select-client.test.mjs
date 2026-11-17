@@ -9,6 +9,8 @@ function fakeDevice(name) {
 }
 
 const candidate = (exportName) => ({ exportName });
+const status = { preferBattery: true };
+
 
 /** A probe that answers from `replies`, keyed by device name. */
 function probeFrom(replies, log = []) {
@@ -29,13 +31,14 @@ test("an interface with a battery wins over an earlier one without", async () =>
       { device: vendor, candidate: candidate("A") },
     ],
     probeFrom({ consumer: { batteryPercent: null }, vendor: { batteryPercent: 22 } }),
+    status,
   );
   assert.equal(result.status.batteryPercent, 22);
   // The battery-less interface was let go before the next one was read.
   assert.equal(consumer.closed, 1);
 });
 
-test("the first answer is used when no interface reports a battery", async () => {
+test("the first answer's status is used when no interface reports a battery", async () => {
   const log = [];
   const result = await selectClient(
     [
@@ -43,10 +46,45 @@ test("the first answer is used when no interface reports a battery", async () =>
       { device: fakeDevice("second"), candidate: candidate("A") },
     ],
     probeFrom({ first: { batteryPercent: null, dpi: 800 }, second: { batteryPercent: null, dpi: 1600 } }, log),
+    status,
   );
   assert.equal(result.status.dpi, 800);
-  // Probed again after the others, since it was closed in between.
-  assert.deepEqual(log, ["first", "second", "first"]);
+  // Its status was kept, so it is not read a second time.
+  assert.deepEqual(log, ["first", "second"]);
+});
+
+test("settings writes take the first mouse that answers, battery or not", async () => {
+  const log = [];
+  const result = await selectClient(
+    [
+      { device: fakeDevice("first"), candidate: candidate("A") },
+      { device: fakeDevice("second"), candidate: candidate("A") },
+    ],
+    probeFrom({ first: { batteryPercent: null, dpi: 800 }, second: { batteryPercent: 60, dpi: 1600 } }, log),
+  );
+  assert.equal(result.status.dpi, 800);
+  assert.deepEqual(log, ["first"]);
+});
+
+test("the battery search stops at its budget when a sibling interface stalls", async () => {
+  const started = Date.now();
+  const result = await selectClient(
+    [
+      { device: fakeDevice("first"), candidate: candidate("A") },
+      { device: fakeDevice("stalled"), candidate: candidate("A") },
+      { device: fakeDevice("never"), candidate: candidate("A") },
+    ],
+    async (device) => {
+      if (device.productName === "stalled") return new Promise(() => {});
+      if (device.productName === "never") throw new Error("must not be reached");
+      return { client: { close: async () => undefined }, status: { batteryPercent: null, dpi: 800 } };
+    },
+    { preferBattery: true, batterySearchMs: 50 },
+  );
+  assert.ok(Date.now() - started < 1000);
+  assert.equal(result.status.dpi, 800);
+  assert.match(result.attempts[0], /^A on stalled: no answer within/);
+  assert.equal(result.attempts.length, 1);
 });
 
 test("after a battery-less answer only that class is tried on other interfaces", async () => {
@@ -65,6 +103,7 @@ test("after a battery-less answer only that class is tried on other interfaces",
       tried.push(`${which.exportName}@${device.productName}`);
       return { client: { close: async () => undefined }, status: { batteryPercent: device === second ? 40 : null } };
     },
+    status,
   );
   assert.equal(result.status.batteryPercent, 40);
   assert.deepEqual(tried, ["A@first", "A@second"]);
@@ -78,6 +117,7 @@ test("a battery answer stops the search", async () => {
       { device: fakeDevice("second"), candidate: candidate("A") },
     ],
     probeFrom({ first: { batteryPercent: 50 }, second: { batteryPercent: 60 } }, log),
+    status,
   );
   assert.deepEqual(log, ["first"]);
 });

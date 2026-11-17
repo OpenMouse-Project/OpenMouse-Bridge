@@ -119,7 +119,7 @@ async function main() {
   const pairs = entry.vendorIds.flatMap((vendorId) =>
     candidateDevices(vendorId, entry).flatMap((device) => entry.classes.map((candidate) => ({ device, candidate }))),
   );
-  const { client, status, attempts } = await selectClient(pairs, probe);
+  const { client, status, attempts } = await selectClient(pairs, probe, { preferBattery: input.action === "status" });
 
   if (!client) {
     console.error(
