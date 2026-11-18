@@ -461,9 +461,7 @@ fn switch_message(
                 };
             }
             Some(ApplyOutcome::NoDriver) => {
-                switch.detail =
-                    "Native automation unsupported — acknowledged device readback is required"
-                        .into();
+                switch.detail = "Bridge can't drive this mouse — open OpenMouse to apply".into();
             }
             _ => {}
         }
@@ -1680,7 +1678,9 @@ impl BridgeService {
                 }
             };
             let outcome = match &error {
-                Some(message) if message.contains("unsupported") => Some(ApplyOutcome::NoDriver),
+                Some(message) if crate::drivers::without_no_driver_errors(message).is_none() => {
+                    Some(ApplyOutcome::NoDriver)
+                }
                 Some(_) => Some(ApplyOutcome::Failed),
                 None if has_profile => Some(ApplyOutcome::Applied),
                 None => None,
@@ -2959,7 +2959,7 @@ mod tests {
             switch_message(None, Some(&game), None, Some(ApplyOutcome::NoDriver), false).unwrap();
         assert_eq!(
             unsupported.detail,
-            "Native automation unsupported — acknowledged device readback is required"
+            "Bridge can't drive this mouse — open OpenMouse to apply"
         );
     }
 

@@ -199,6 +199,31 @@ pub fn read_status(brand: &str, devices: Option<&Devices>) -> Result<Option<Nati
     Ok(parse_status(reply))
 }
 
+/// Reads a `brand` mouse's current DPI and polling rate via the Node helper,
+/// battery or not. `Ok(None)` means the helper has no driver for the brand;
+/// either value is `None` when the driver cannot read it.
+pub(super) fn read_settings(
+    brand: &str,
+    devices: Option<&Devices>,
+) -> Result<Option<(Option<u32>, Option<u32>)>> {
+    let request = StatusRequest {
+        brand,
+        action: "status",
+        target: Target::of(devices),
+    };
+    let Some(stdout) = run_helper(&request)? else {
+        return Ok(None);
+    };
+    let reply: StatusReply = serde_json::from_slice(&stdout)
+        .context("the native-hid helper returned an unreadable status")?;
+    Ok(Some((
+        coerce_dpi(reply.dpi.as_ref()),
+        reply
+            .polling_rate_hz
+            .and_then(|rate| u32::try_from(rate.round() as i64).ok()),
+    )))
+}
+
 fn parse_status(reply: StatusReply) -> Option<NativeStatus> {
     let battery = parse_battery(&reply)?;
     Some(NativeStatus {

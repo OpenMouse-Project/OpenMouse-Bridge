@@ -22,8 +22,8 @@ impl AutomationIo for FakeIo {
                 serial_number: "serial".into(),
                 interface: Some(0),
             },
-            dpi: if self.invalid_baseline { 0 } else { 800 },
-            polling_rate_hz: 1000,
+            dpi: Some(if self.invalid_baseline { 0 } else { 800 }),
+            polling_rate_hz: Some(1000),
         })
     }
     fn write(&mut self, id: &str, baseline: &Baseline, settings: &ProfileSettings) -> Result<()> {
@@ -131,7 +131,7 @@ fn failed_restoration_retains_baseline_and_waits_before_retry() {
         );
     }
     assert_eq!(io.calls.len(), 3);
-    assert_eq!(automation.entries["a"].baseline.dpi, 800);
+    assert_eq!(automation.entries["a"].baseline.dpi, Some(800));
     assert_eq!(automation.pending_restores_for(None), 1);
     io.fail_writes = 0;
     automation
@@ -155,7 +155,7 @@ fn restoration_failure_delays_increase_to_cap_without_abandoning_baseline() {
         assert!(automation.reconcile_at(None, &mut io, now).is_err());
         let calls = io.calls.len();
         assert_eq!(calls, index + 3);
-        assert_eq!(automation.entries["a"].baseline.dpi, 800);
+        assert_eq!(automation.entries["a"].baseline.dpi, Some(800));
         assert_eq!(
             automation.entries["a"].baseline.identity.serial_number,
             "serial"
@@ -198,7 +198,7 @@ fn restoration_deadlines_are_independent_per_device() {
     assert_eq!(io.calls.len(), 6);
     assert_eq!(io.calls.last().unwrap(), "write:b:None:Some(1000)");
     assert_eq!(automation.entries.len(), 1);
-    assert_eq!(automation.entries["a"].baseline.dpi, 800);
+    assert_eq!(automation.entries["a"].baseline.dpi, Some(800));
     automation
         .reconcile_at(None, &mut io, now + Duration::from_secs(1))
         .unwrap();
@@ -271,7 +271,7 @@ fn delayed_restoration_retains_all_64_baselines_and_refuses_new_capture() {
         automation
             .entries
             .values()
-            .all(|entry| entry.baseline.dpi == 800)
+            .all(|entry| entry.baseline.dpi == Some(800))
     );
     automation
         .reconcile_at(Some(&desired), &mut io, now + Duration::from_secs(1))
@@ -433,7 +433,7 @@ fn helper_adapter_binds_read_and_write_to_full_profile_and_captured_identity() {
         Ok(Some(serde_json::to_vec(&captured).unwrap()))
     });
     let baseline = io.read("Zaunkoenig:M3K").unwrap();
-    assert_eq!(baseline.dpi, 800);
+    assert_eq!(baseline.dpi, Some(800));
     assert_eq!(requests[0]["deviceId"], "Zaunkoenig:M3K");
     assert_eq!(requests[0]["action"], "automatic-read");
     let mut io = HelperIo(|request: &serde_json::Value| {
@@ -497,7 +497,7 @@ fn captures_before_write_and_restores_original_not_handoff() {
     assert!(automation.entries.is_empty());
 }
 
-const LOGITECH_NO_DRIVER: &str = "Logitech:PRO X SUPERLIGHT 2c: unsupported acknowledged native automation readback for Logitech:PRO X SUPERLIGHT 2c";
+const LOGITECH_NO_DRIVER: &str = "Logitech:PRO X SUPERLIGHT 2c: Bridge has no driver for this mouse (Logitech:PRO X SUPERLIGHT 2c)";
 
 #[test]
 fn a_brand_without_native_automation_is_left_out_of_the_panel() {
@@ -540,4 +540,95 @@ fn an_unaddressable_zaunkoenig_profile_is_a_real_error() {
             Some(message.as_str())
         );
     }
+}
+
+type Calls = std::rc::Rc<std::cell::RefCell<Vec<String>>>;
+
+#[allow(clippy::type_complexity)]
+/// A [`DriverIo`] whose drivers read back `readback` (or have no driver for
+/// the brand when it is `None`) and record every call.
+fn driver_io(
+    readback: Option<Readback>,
+    calls: &Calls,
+) -> DriverIo<
+    impl FnMut(&serde_json::Value) -> Result<Option<Vec<u8>>>,
+    impl FnMut(&str) -> Result<Option<Readback>>,
+    impl FnMut(&str, Option<u32>, Option<u32>) -> Result<bool>,
+> {
+    let (reads, writes) = (calls.clone(), calls.clone());
+    DriverIo {
+        helper: HelperIo(|_: &serde_json::Value| -> Result<Option<Vec<u8>>> {
+            panic!("only Zaunkoenig uses the automatic helper path");
+        }),
+        read: move |id: &str| {
+            reads.borrow_mut().push(format!("read:{id}"));
+            Ok(readback)
+        },
+        write: move |id: &str, dpi: Option<u32>, hz: Option<u32>| {
+            writes
+                .borrow_mut()
+                .push(format!("write:{id}:{dpi:?}:{hz:?}"));
+            Ok(readback.is_some())
+        },
+    }
+}
+
+#[test]
+fn every_brand_with_a_driver_applies_and_restores_a_game_profile() {
+    for id in [
+        "Logitech:PRO X SUPERLIGHT 2c",
+        "Pulsar:X2",
+        "Razer:Viper V3 Pro",
+    ] {
+        let calls = Calls::default();
+        let mut io = driver_io(Some((Some(800), Some(1000))), &calls);
+        let mut automation = NativeAutomation::default();
+        automation
+            .reconcile(Some(&profile(id, Some(1600), Some(4000))), &mut io)
+            .unwrap();
+        automation.reconcile(None, &mut io).unwrap();
+        assert_eq!(
+            *calls.borrow(),
+            [
+                format!("read:{id}"),
+                format!("write:{id}:Some(1600):Some(4000)"),
+                format!("write:{id}:Some(800):Some(1000)"),
+            ]
+        );
+        assert!(automation.entries.is_empty());
+    }
+}
+
+#[test]
+fn a_setting_the_driver_cannot_read_is_still_applied_but_not_restored() {
+    let id = "Endgame Gear:3367:1964";
+    let calls = Calls::default();
+    let mut io = driver_io(Some((None, Some(1000))), &calls);
+    let mut automation = NativeAutomation::default();
+    automation
+        .reconcile(Some(&profile(id, Some(1600), Some(4000))), &mut io)
+        .unwrap();
+    automation.reconcile(None, &mut io).unwrap();
+    assert_eq!(
+        *calls.borrow(),
+        [
+            format!("read:{id}"),
+            format!("write:{id}:Some(1600):Some(4000)"),
+            format!("write:{id}:None:Some(1000)"),
+        ]
+    );
+}
+
+#[test]
+fn a_brand_without_any_driver_reports_no_driver_and_writes_nothing() {
+    let id = "NotARealBrand:Mouse";
+    let calls = Calls::default();
+    let mut io = driver_io(None, &calls);
+    let mut automation = NativeAutomation::default();
+    let error = automation
+        .reconcile(Some(&profile(id, Some(1600), None)), &mut io)
+        .unwrap_err()
+        .to_string();
+    assert_eq!(without_no_driver(&error), None, "{error}");
+    assert_eq!(*calls.borrow(), [format!("read:{id}")]);
 }

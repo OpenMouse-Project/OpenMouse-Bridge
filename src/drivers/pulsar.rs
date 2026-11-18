@@ -27,14 +27,37 @@ pub const BRAND: &str = "pulsar";
 /// to it. Called by `crate::drivers::apply_profile` once it has matched the
 /// profile's device to this brand.
 pub fn apply(profile: &ApplicationProfile) -> Result<()> {
+    apply_settings(profile.settings.dpi, profile.settings.polling_rate_hz)
+}
+
+/// Pushes a DPI and/or polling rate to the connected Pulsar mouse; `None`
+/// leaves that setting alone.
+pub(super) fn apply_settings(dpi: Option<u32>, polling_rate_hz: Option<u32>) -> Result<()> {
     let device = PulsarDevice::open()?;
-    if let Some(dpi) = profile.settings.dpi {
+    if let Some(dpi) = dpi {
         device.set_dpi(dpi)?;
     }
-    if let Some(rate) = profile.settings.polling_rate_hz {
+    if let Some(rate) = polling_rate_hz {
         device.set_polling_rate(rate)?;
     }
     Ok(())
+}
+
+/// The active DPI and polling rate in the connected Pulsar mouse's flash,
+/// battery or not (a wired mouse reports none). `None` for a value the mouse
+/// does not decode.
+pub(super) fn read_settings() -> Result<(Option<u32>, Option<u32>)> {
+    let device = PulsarDevice::open()?;
+    device.with_device_control(|| read_flash_settings(&device))
+}
+
+/// The same flash reads `set_dpi`/`set_polling_rate` confirm their writes
+/// with, so the decode paths are hardware-verified.
+fn read_flash_settings(device: &PulsarDevice) -> Result<(Option<u32>, Option<u32>)> {
+    let polling_rate_hz = decode_polling_rate(device.read_flash(flash::REPORT_RATE, 2)?[0]);
+    let stage = device.read_flash(flash::CURRENT_DPI, 2)?[0].min(7) as u16;
+    let dpi = decode_dpi(&device.read_flash(flash::DPI_VALUES + stage * 4, 4)?);
+    Ok((dpi, polling_rate_hz))
 }
 
 /// Opens the connected Pulsar mouse and reads its onboard-memory state —
@@ -46,11 +69,7 @@ pub fn apply(profile: &ApplicationProfile) -> Result<()> {
 pub fn read_status() -> Result<Option<NativeStatus>> {
     let device = PulsarDevice::open()?;
     device.with_device_control(|| {
-        // The same flash reads `set_dpi`/`set_polling_rate` confirm their
-        // writes with, so the decode paths are hardware-verified.
-        let polling_rate_hz = decode_polling_rate(device.read_flash(flash::REPORT_RATE, 2)?[0]);
-        let stage = device.read_flash(flash::CURRENT_DPI, 2)?[0].min(7) as u16;
-        let dpi = decode_dpi(&device.read_flash(flash::DPI_VALUES + stage * 4, 4)?);
+        let (dpi, polling_rate_hz) = read_flash_settings(&device)?;
         let response = device.query(command::BATTERY_LEVEL, &[])?;
         assert_accepted(&response, "battery query")?;
         let percent = response[5];

@@ -367,9 +367,50 @@ pub(crate) fn reconcile_automatic(
     }
     automation.reconcile(
         desired,
-        &mut automation::HelperIo(|request: &serde_json::Value| native_hid::run_helper(request)),
+        &mut automation::DriverIo {
+            helper: automation::HelperIo(|request: &serde_json::Value| {
+                native_hid::run_helper(request)
+            }),
+            read: read_settings_held,
+            write: write_settings_held,
+        },
     )?;
     Ok(Reconciled::Done)
+}
+
+/// The DPI and polling rate the mouse `device_id` names is running now, with
+/// [`device_access`] already held. `Ok(None)` when Bridge has no driver for
+/// its brand.
+fn read_settings_held(device_id: &str) -> Result<Option<automation::Readback>> {
+    let brand = device_id.split(':').next().unwrap_or_default();
+    if brand.eq_ignore_ascii_case(pulsar::BRAND) {
+        return pulsar::read_settings().map(Some);
+    }
+    native_hid::read_settings(brand, registry::devices_for(brand).as_ref())
+}
+
+/// Sets the DPI and/or polling rate of the mouse `device_id` names through
+/// the same drivers as [`apply_profile`], with [`device_access`] already
+/// held. `Ok(false)` when Bridge has no driver for its brand.
+fn write_settings_held(
+    device_id: &str,
+    dpi: Option<u32>,
+    polling_rate_hz: Option<u32>,
+) -> Result<bool> {
+    let brand = device_id.split(':').next().unwrap_or_default();
+    if brand.eq_ignore_ascii_case(pulsar::BRAND) {
+        pulsar::apply_settings(dpi, polling_rate_hz)?;
+        return Ok(true);
+    }
+    if brand.eq_ignore_ascii_case(delux::BRAND) && delux::apply_settings(dpi, polling_rate_hz)? {
+        return Ok(true);
+    }
+    native_hid::apply_settings(
+        brand,
+        dpi,
+        polling_rate_hz,
+        registry::devices_for(brand).as_ref(),
+    )
 }
 
 /// Reads the onboard-memory state of the mouse `device_id` names
