@@ -20,8 +20,10 @@ pub(crate) struct DeviceIdentity {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Baseline {
     pub identity: DeviceIdentity,
-    pub dpi: u32,
-    pub polling_rate_hz: u32,
+    /// `None` when the driver cannot read it back: Bridge still applies a
+    /// profile's value then, but has nothing to restore afterwards.
+    pub dpi: Option<u32>,
+    pub polling_rate_hz: Option<u32>,
 }
 
 pub(crate) trait AutomationIo {
@@ -32,12 +34,21 @@ pub(crate) trait AutomationIo {
         baseline: &Baseline,
         settings: &ProfileSettings,
     ) -> Result<()>;
+    /// What the mouse is running now, read just before a restore so a value
+    /// something else changed since Bridge set it is left alone. `None` when
+    /// this path does not check (Zaunkoenig's helper tracks manual intent
+    /// itself).
+    fn current(&mut self, _device_id: &str) -> Result<Option<Readback>> {
+        Ok(None)
+    }
 }
 
 struct Entry {
     baseline: Baseline,
     dpi: bool,
     polling: bool,
+    /// The values Bridge last wrote for the fields it owns.
+    applied: Readback,
     failed: bool,
     restore_after: Option<Instant>,
     restore_delay: Duration,
@@ -150,12 +161,22 @@ impl NativeAutomation {
                 ));
                 continue;
             }
-            let settings = ProfileSettings {
-                dpi: entry.dpi.then_some(entry.baseline.dpi),
-                polling_rate_hz: entry.polling.then_some(entry.baseline.polling_rate_hz),
-                snapshot: None,
-            };
-            match io.write(&id, &entry.baseline, &settings) {
+            let result = (|| {
+                // A DPI button, a stage switch, a manual change or another
+                // mouse since Bridge applied the profile: that value stays.
+                if let Some((dpi, polling_rate_hz)) = io.current(&id)? {
+                    entry.dpi &= dpi.is_some() && dpi == entry.applied.0;
+                    entry.polling &=
+                        polling_rate_hz.is_some() && polling_rate_hz == entry.applied.1;
+                }
+                let settings = ProfileSettings {
+                    dpi: entry.baseline.dpi.filter(|_| entry.dpi),
+                    polling_rate_hz: entry.baseline.polling_rate_hz.filter(|_| entry.polling),
+                    snapshot: None,
+                };
+                io.write(&id, &entry.baseline, &settings)
+            })();
+            match result {
                 Ok(()) => {
                     self.entries.remove(&id);
                 }
@@ -215,8 +236,8 @@ impl NativeAutomation {
             if acquire_dpi || acquire_polling {
                 let fresh = io.read(id)?;
                 if fresh.identity != entry.baseline.identity
-                    || fresh.dpi == 0
-                    || fresh.polling_rate_hz == 0
+                    || fresh.dpi == Some(0)
+                    || fresh.polling_rate_hz == Some(0)
                 {
                     anyhow::bail!("fresh native baseline identity/readback is missing or changed");
                 }
@@ -235,8 +256,8 @@ impl NativeAutomation {
                 );
             }
             let baseline = io.read(id)?;
-            if baseline.dpi == 0
-                || baseline.polling_rate_hz == 0
+            if baseline.dpi == Some(0)
+                || baseline.polling_rate_hz == Some(0)
                 || baseline.identity.path.is_empty()
                 || baseline.identity.path.len() > 2048
                 || baseline.identity.serial_number.is_empty()
@@ -261,6 +282,7 @@ impl NativeAutomation {
                     baseline,
                     dpi: false,
                     polling: false,
+                    applied: (None, None),
                     failed: false,
                     restore_after: None,
                     restore_delay: Duration::from_secs(1),
@@ -274,13 +296,16 @@ impl NativeAutomation {
             dpi: profile
                 .settings
                 .dpi
-                .or_else(|| entry.dpi.then_some(entry.baseline.dpi)),
+                .or_else(|| entry.baseline.dpi.filter(|_| entry.dpi)),
             polling_rate_hz: profile
                 .settings
                 .polling_rate_hz
-                .or_else(|| entry.polling.then_some(entry.baseline.polling_rate_hz)),
+                .or_else(|| entry.baseline.polling_rate_hz.filter(|_| entry.polling)),
             snapshot: None,
         };
+        // Recorded before the write, so a write that fails part-way still
+        // restores whichever value did land.
+        entry.applied = (settings.dpi, settings.polling_rate_hz);
         entry.failed = true;
         io.write(id, &entry.baseline, &settings)?;
         entry.failed = false;
@@ -328,10 +353,97 @@ impl<F: FnMut(&serde_json::Value) -> Result<Option<Vec<u8>>>> AutomationIo for H
     }
 }
 
-/// What a brand without native automation reports. It is not a failure: Bridge
-/// has no driver that can apply that mouse's settings, so the panel does not
+/// A mouse's DPI and polling rate as its driver read them back; `None` for a
+/// value the driver cannot read.
+pub(crate) type Readback = (Option<u32>, Option<u32>);
+
+/// Routes each mouse to its own driver. Zaunkoenig keeps the helper's
+/// identity-checked automatic path; every other brand uses the same driver
+/// Bridge reads its battery and applies manual changes with (`read` returns
+/// `Ok(None)` and `write` `Ok(false)` when there is no driver for the brand).
+pub(crate) struct DriverIo<H, R, W> {
+    pub helper: HelperIo<H>,
+    pub read: R,
+    pub write: W,
+}
+
+impl<H, R, W> AutomationIo for DriverIo<H, R, W>
+where
+    H: FnMut(&serde_json::Value) -> Result<Option<Vec<u8>>>,
+    R: FnMut(&str) -> Result<Option<Readback>>,
+    W: FnMut(&str, Option<u32>, Option<u32>) -> Result<bool>,
+{
+    fn read(&mut self, device_id: &str) -> Result<Baseline> {
+        if is_zaunkoenig(device_id)? {
+            return self.helper.read(device_id);
+        }
+        let (dpi, polling_rate_hz) = (self.read)(device_id)?.ok_or_else(|| no_driver(device_id))?;
+        Ok(Baseline {
+            identity: DeviceIdentity::of_profile(device_id),
+            dpi,
+            polling_rate_hz,
+        })
+    }
+
+    fn write(
+        &mut self,
+        device_id: &str,
+        baseline: &Baseline,
+        settings: &ProfileSettings,
+    ) -> Result<()> {
+        if is_zaunkoenig(device_id)? {
+            return self.helper.write(device_id, baseline, settings);
+        }
+        if settings.dpi.is_none() && settings.polling_rate_hz.is_none() {
+            return Ok(());
+        }
+        if !(self.write)(device_id, settings.dpi, settings.polling_rate_hz)? {
+            return Err(no_driver(device_id));
+        }
+        Ok(())
+    }
+
+    fn current(&mut self, device_id: &str) -> Result<Option<Readback>> {
+        if is_zaunkoenig(device_id)? {
+            return Ok(None);
+        }
+        // Without a driver nothing can be checked, so nothing is restored.
+        Ok(Some((self.read)(device_id)?.unwrap_or_default()))
+    }
+}
+
+impl DeviceIdentity {
+    /// These drivers find the mouse by its brand, so the profile's device id
+    /// is all that identifies it.
+    fn of_profile(device_id: &str) -> Self {
+        Self {
+            vendor_id: 0,
+            product_id: 0,
+            path: device_id.into(),
+            serial_number: device_id.into(),
+            interface: None,
+        }
+    }
+}
+
+fn is_zaunkoenig(device_id: &str) -> Result<bool> {
+    let (brand, name) = device_id
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("invalid native profile device identity {device_id}"))?;
+    if name.is_empty() || device_id.len() > 512 {
+        anyhow::bail!("invalid native profile device identity {device_id}");
+    }
+    Ok(brand.eq_ignore_ascii_case("Zaunkoenig"))
+}
+
+fn no_driver(device_id: &str) -> anyhow::Error {
+    anyhow::anyhow!("{NO_DRIVER} ({device_id})")
+}
+
+/// What a brand Bridge has no driver for reports. It is not a failure: the
+/// control panel applies that mouse's settings itself, so the panel does not
 /// show it.
-const NO_DRIVER: &str = "unsupported acknowledged native automation readback";
+const NO_DRIVER: &str = "Bridge has no driver for this mouse";
 
 /// What a pass reports for several devices, joined, minus the errors that only
 /// mean Bridge has no driver for a mouse. `None` when nothing else is left, so
@@ -349,7 +461,7 @@ fn supported_brand(device_id: &str) -> Result<&str> {
         .split_once(':')
         .ok_or_else(|| anyhow::anyhow!("invalid native profile device identity {device_id}"))?;
     if !brand.eq_ignore_ascii_case("Zaunkoenig") {
-        anyhow::bail!("{NO_DRIVER} for {device_id}");
+        return Err(no_driver(device_id));
     }
     // A Zaunkoenig profile that cannot be addressed is a real problem.
     if name.is_empty() || device_id.len() > 512 {

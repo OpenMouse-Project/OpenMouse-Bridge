@@ -47,6 +47,12 @@ const REPORT_ID_248A: u8 = 0x0c;
 /// or `Ok(false)` if no matching native device could be opened (allowing
 /// fallback to the Node.js native-hid helper).
 pub fn apply(profile: &ApplicationProfile) -> Result<bool> {
+    apply_settings(profile.settings.dpi, profile.settings.polling_rate_hz)
+}
+
+/// [`apply`] for an explicit DPI and/or polling rate; `None` leaves that
+/// setting alone.
+pub(super) fn apply_settings(dpi: Option<u32>, polling_rate_hz: Option<u32>) -> Result<bool> {
     let api = match crate::hid::new_api() {
         Ok(api) => api,
         Err(_) => return Ok(false),
@@ -54,11 +60,11 @@ pub fn apply(profile: &ApplicationProfile) -> Result<bool> {
 
     // Try finding and driving 0x1D57 first (the primary M800 Mini platform)
     if let Ok(device) = Delux1d57Device::open(&api) {
-        if let Some(dpi) = profile.settings.dpi {
+        if let Some(dpi) = dpi {
             device.set_dpi(dpi)?;
             std::thread::sleep(Duration::from_millis(150));
         }
-        if let Some(rate) = profile.settings.polling_rate_hz {
+        if let Some(rate) = polling_rate_hz {
             device.set_polling_rate(rate)?;
         }
         return Ok(true);
@@ -66,11 +72,11 @@ pub fn apply(profile: &ApplicationProfile) -> Result<bool> {
 
     // Next try 0x248A (M800 Pro / Mini variant)
     if let Ok(device) = Delux248aDevice::open(&api) {
-        if let Some(dpi) = profile.settings.dpi {
+        if let Some(dpi) = dpi {
             device.set_dpi(dpi)?;
             std::thread::sleep(Duration::from_millis(150));
         }
-        if let Some(rate) = profile.settings.polling_rate_hz {
+        if let Some(rate) = polling_rate_hz {
             device.set_polling_rate(rate)?;
         }
         return Ok(true);
