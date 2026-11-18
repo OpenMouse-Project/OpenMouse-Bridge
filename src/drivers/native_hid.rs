@@ -217,7 +217,13 @@ pub(super) fn read_settings(
     let reply: StatusReply = serde_json::from_slice(&stdout)
         .context("the native-hid helper returned an unreadable status")?;
     Ok(Some((
-        coerce_dpi(reply.dpi.as_ref()),
+        // Only a single DPI names the active stage; a per-stage list has no
+        // reliable marker, so it gives nothing to restore.
+        reply
+            .dpi
+            .as_ref()
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|dpi| u32::try_from(dpi).ok()),
         reply
             .polling_rate_hz
             .and_then(|rate| u32::try_from(rate.round() as i64).ok()),

@@ -542,35 +542,53 @@ fn an_unaddressable_zaunkoenig_profile_is_a_real_error() {
     }
 }
 
-type Calls = std::rc::Rc<std::cell::RefCell<Vec<String>>>;
+type Shared<T> = std::rc::Rc<std::cell::RefCell<T>>;
+
+/// A mouse behind a [`DriverIo`]: `None` when Bridge has no driver for its
+/// brand. Writes change what later reads return; every call is recorded.
+#[derive(Default)]
+struct FakeMouse {
+    settings: Option<Readback>,
+    calls: Vec<String>,
+}
 
 #[allow(clippy::type_complexity)]
-/// A [`DriverIo`] whose drivers read back `readback` (or have no driver for
-/// the brand when it is `None`) and record every call.
 fn driver_io(
-    readback: Option<Readback>,
-    calls: &Calls,
+    mouse: &Shared<FakeMouse>,
 ) -> DriverIo<
     impl FnMut(&serde_json::Value) -> Result<Option<Vec<u8>>>,
     impl FnMut(&str) -> Result<Option<Readback>>,
     impl FnMut(&str, Option<u32>, Option<u32>) -> Result<bool>,
 > {
-    let (reads, writes) = (calls.clone(), calls.clone());
+    let (reads, writes) = (mouse.clone(), mouse.clone());
     DriverIo {
         helper: HelperIo(|_: &serde_json::Value| -> Result<Option<Vec<u8>>> {
             panic!("only Zaunkoenig uses the automatic helper path");
         }),
         read: move |id: &str| {
-            reads.borrow_mut().push(format!("read:{id}"));
-            Ok(readback)
+            let mut mouse = reads.borrow_mut();
+            mouse.calls.push(format!("read:{id}"));
+            Ok(mouse.settings)
         },
         write: move |id: &str, dpi: Option<u32>, hz: Option<u32>| {
-            writes
-                .borrow_mut()
-                .push(format!("write:{id}:{dpi:?}:{hz:?}"));
-            Ok(readback.is_some())
+            let mut mouse = writes.borrow_mut();
+            mouse.calls.push(format!("write:{id}:{dpi:?}:{hz:?}"));
+            let Some(settings) = mouse.settings.as_mut() else {
+                return Ok(false);
+            };
+            // Like a real mouse: a value it cannot report stays unreadable.
+            settings.0 = settings.0.and(dpi.or(settings.0));
+            settings.1 = settings.1.and(hz.or(settings.1));
+            Ok(true)
         },
     }
+}
+
+fn mouse(settings: Option<Readback>) -> Shared<FakeMouse> {
+    Shared::new(std::cell::RefCell::new(FakeMouse {
+        settings,
+        calls: Vec::new(),
+    }))
 }
 
 #[test]
@@ -580,40 +598,62 @@ fn every_brand_with_a_driver_applies_and_restores_a_game_profile() {
         "Pulsar:X2",
         "Razer:Viper V3 Pro",
     ] {
-        let calls = Calls::default();
-        let mut io = driver_io(Some((Some(800), Some(1000))), &calls);
+        let mouse = mouse(Some((Some(800), Some(1000))));
+        let mut io = driver_io(&mouse);
         let mut automation = NativeAutomation::default();
         automation
             .reconcile(Some(&profile(id, Some(1600), Some(4000))), &mut io)
             .unwrap();
         automation.reconcile(None, &mut io).unwrap();
         assert_eq!(
-            *calls.borrow(),
+            mouse.borrow().calls,
             [
                 format!("read:{id}"),
                 format!("write:{id}:Some(1600):Some(4000)"),
+                format!("read:{id}"),
                 format!("write:{id}:Some(800):Some(1000)"),
             ]
         );
+        assert_eq!(mouse.borrow().settings, Some((Some(800), Some(1000))));
         assert!(automation.entries.is_empty());
     }
 }
 
 #[test]
+fn a_change_made_during_the_game_is_not_reverted_when_it_closes() {
+    let id = "Pulsar:X2";
+    let mouse = mouse(Some((Some(800), Some(1000))));
+    let mut io = driver_io(&mouse);
+    let mut automation = NativeAutomation::default();
+    automation
+        .reconcile(Some(&profile(id, Some(1600), Some(4000))), &mut io)
+        .unwrap();
+    // A DPI button or stage switch mid-game.
+    mouse.borrow_mut().settings = Some((Some(3200), Some(4000)));
+    automation.reconcile(None, &mut io).unwrap();
+    assert_eq!(
+        mouse.borrow().calls.last().unwrap(),
+        &format!("write:{id}:None:Some(1000)")
+    );
+    assert_eq!(mouse.borrow().settings, Some((Some(3200), Some(1000))));
+}
+
+#[test]
 fn a_setting_the_driver_cannot_read_is_still_applied_but_not_restored() {
     let id = "Endgame Gear:3367:1964";
-    let calls = Calls::default();
-    let mut io = driver_io(Some((None, Some(1000))), &calls);
+    let mouse = mouse(Some((None, Some(1000))));
+    let mut io = driver_io(&mouse);
     let mut automation = NativeAutomation::default();
     automation
         .reconcile(Some(&profile(id, Some(1600), Some(4000))), &mut io)
         .unwrap();
     automation.reconcile(None, &mut io).unwrap();
     assert_eq!(
-        *calls.borrow(),
+        mouse.borrow().calls,
         [
             format!("read:{id}"),
             format!("write:{id}:Some(1600):Some(4000)"),
+            format!("read:{id}"),
             format!("write:{id}:None:Some(1000)"),
         ]
     );
@@ -622,13 +662,13 @@ fn a_setting_the_driver_cannot_read_is_still_applied_but_not_restored() {
 #[test]
 fn a_brand_without_any_driver_reports_no_driver_and_writes_nothing() {
     let id = "NotARealBrand:Mouse";
-    let calls = Calls::default();
-    let mut io = driver_io(None, &calls);
+    let mouse = mouse(None);
+    let mut io = driver_io(&mouse);
     let mut automation = NativeAutomation::default();
     let error = automation
         .reconcile(Some(&profile(id, Some(1600), None)), &mut io)
         .unwrap_err()
         .to_string();
     assert_eq!(without_no_driver(&error), None, "{error}");
-    assert_eq!(*calls.borrow(), [format!("read:{id}")]);
+    assert_eq!(mouse.borrow().calls, [format!("read:{id}")]);
 }

@@ -34,12 +34,21 @@ pub(crate) trait AutomationIo {
         baseline: &Baseline,
         settings: &ProfileSettings,
     ) -> Result<()>;
+    /// What the mouse is running now, read just before a restore so a value
+    /// something else changed since Bridge set it is left alone. `None` when
+    /// this path does not check (Zaunkoenig's helper tracks manual intent
+    /// itself).
+    fn current(&mut self, _device_id: &str) -> Result<Option<Readback>> {
+        Ok(None)
+    }
 }
 
 struct Entry {
     baseline: Baseline,
     dpi: bool,
     polling: bool,
+    /// The values Bridge last wrote for the fields it owns.
+    applied: Readback,
     failed: bool,
     restore_after: Option<Instant>,
     restore_delay: Duration,
@@ -152,12 +161,22 @@ impl NativeAutomation {
                 ));
                 continue;
             }
-            let settings = ProfileSettings {
-                dpi: entry.baseline.dpi.filter(|_| entry.dpi),
-                polling_rate_hz: entry.baseline.polling_rate_hz.filter(|_| entry.polling),
-                snapshot: None,
-            };
-            match io.write(&id, &entry.baseline, &settings) {
+            let result = (|| {
+                // A DPI button, a stage switch, a manual change or another
+                // mouse since Bridge applied the profile: that value stays.
+                if let Some((dpi, polling_rate_hz)) = io.current(&id)? {
+                    entry.dpi &= dpi.is_some() && dpi == entry.applied.0;
+                    entry.polling &=
+                        polling_rate_hz.is_some() && polling_rate_hz == entry.applied.1;
+                }
+                let settings = ProfileSettings {
+                    dpi: entry.baseline.dpi.filter(|_| entry.dpi),
+                    polling_rate_hz: entry.baseline.polling_rate_hz.filter(|_| entry.polling),
+                    snapshot: None,
+                };
+                io.write(&id, &entry.baseline, &settings)
+            })();
+            match result {
                 Ok(()) => {
                     self.entries.remove(&id);
                 }
@@ -263,6 +282,7 @@ impl NativeAutomation {
                     baseline,
                     dpi: false,
                     polling: false,
+                    applied: (None, None),
                     failed: false,
                     restore_after: None,
                     restore_delay: Duration::from_secs(1),
@@ -283,6 +303,9 @@ impl NativeAutomation {
                 .or_else(|| entry.baseline.polling_rate_hz.filter(|_| entry.polling)),
             snapshot: None,
         };
+        // Recorded before the write, so a write that fails part-way still
+        // restores whichever value did land.
+        entry.applied = (settings.dpi, settings.polling_rate_hz);
         entry.failed = true;
         io.write(id, &entry.baseline, &settings)?;
         entry.failed = false;
@@ -378,6 +401,14 @@ where
             return Err(no_driver(device_id));
         }
         Ok(())
+    }
+
+    fn current(&mut self, device_id: &str) -> Result<Option<Readback>> {
+        if is_zaunkoenig(device_id)? {
+            return Ok(None);
+        }
+        // Without a driver nothing can be checked, so nothing is restored.
+        Ok(Some((self.read)(device_id)?.unwrap_or_default()))
     }
 }
 
