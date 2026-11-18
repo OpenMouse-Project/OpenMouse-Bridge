@@ -5,6 +5,17 @@ the version in `Cargo.toml` and the release tag. The release workflow
 publishes the entry as the release notes and in `latest.json` (what Bridge's
 update check shows), and refuses to release a version without one.
 
+## 1.0.2
+
+### New
+
+- Pick devices and drivers with OpenMouse's own registry.
+
+### Fixes
+
+- Bridge reads the Keychron battery itself, before OpenMouse connects.
+- Game profiles apply to every mouse Bridge can drive, not only Zaunkoenig.
+
 ## 1.0.1
 
 ### New
