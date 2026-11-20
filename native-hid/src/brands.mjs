@@ -1,6 +1,6 @@
 // The fallback dispatch table. Bridge normally sends the devices it described
 // and the protocol package's own registry picks the driver (registry.mjs); this
-// table is used only for a request without them — when the registry could not
+// table is used only for a request without them - when the registry could not
 // be loaded, and for Zaunkoenig's acknowledged automation (automation.mjs).
 //
 // Maps a MouseStatus `brand` string (mouse-protocol/src/drivers/mouse-types.ts)
@@ -8,11 +8,11 @@
 // try constructing against each interface found, in the same order
 // mouse-protocol/src/drivers/registry.ts's DEVICE_DRIVERS lists them for
 // that brand (first-match-wins there; here, first class whose open() +
-// readStatus() probe succeeds wins — see apply.mjs).
+// readStatus() probe succeeds wins - see apply.mjs).
 //
 // "Pulsar" is left out: Bridge has a dependency-free native Rust driver for it
 // (src/drivers/pulsar.rs) that claims the brand before this helper is ever
-// invoked — see src/drivers/mod.rs.
+// invoked - see src/drivers/mod.rs.
 //
 // Vendor ids are copied from mouse-protocol/src/drivers/vendors.ts and each
 // driver's own `isSupported()`; class import paths use the package's
@@ -91,7 +91,7 @@ export const BRAND_DRIVERS = {
   },
   ninjutso: {
     // NINJUTSO_VENDOR_ID (current) and NINJUTSO_LEGACY_VENDOR_ID (shared
-    // with Orbital) — see mouse-protocol/src/ninjutso/index.ts.
+    // with Orbital) - see mouse-protocol/src/ninjutso/index.ts.
     vendorIds: [0x093a, 0x1915],
     classes: [client("@openmouse/protocol/drivers/ninjutso/hid", "NinjutsoHidClient")],
   },

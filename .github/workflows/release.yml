@@ -71,7 +71,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           npm ci --prefix native-hid --omit=dev
-          # Trim node-hid's other-platform prebuilt bindings — this archive
+          # Trim node-hid's other-platform prebuilt bindings - this archive
           # only ever runs on win32-x64.
           Get-ChildItem native-hid/node_modules/node-hid/prebuilds -Directory |
             Where-Object { $_.Name -ne "HID-win32-x64" } |

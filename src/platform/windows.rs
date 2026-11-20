@@ -84,11 +84,11 @@ pub fn battery_glyph(percent: u8, charging: bool) -> u32 {
 }
 
 /// Renders the tray battery display as a square `size` × `size` RGBA
-/// buffer, tinted with `ink` — the Windows 11 taskbar only renders square
+/// buffer, tinted with `ink` - the Windows 11 taskbar only renders square
 /// tray icons faithfully. The `style` picks what fills the square: the
 /// Segoe Fluent battery glyph for the level (the charging variant with the
 /// bolt when `charging`), or the percentage number in bold UI text (the
-/// `%` is left off — at tray sizes it would shrink the digits to a
+/// `%` is left off - at tray sizes it would shrink the digits to a
 /// squint; the tooltip spells the full `NN%` out). Returns the buffer with
 /// its width and height. `Segoe Fluent Icons` ships with Windows 11;
 /// `Segoe MDL2 Assets` carries the same glyphs on Windows 10.
@@ -206,7 +206,7 @@ fn compose_battery_display(
     // Otherwise the digits fill it.
     if label.is_empty() {
         // A landscape glyph in a square icon: fitting its width to all but
-        // 1px of the canvas — the footprint the old square renderer used —
+        // 1px of the canvas - the footprint the old square renderer used -
         // is the largest it can be, and the height lands near half.
         let battery = fit_and_rasterize(
             dc,
@@ -231,7 +231,7 @@ fn compose_battery_display(
         return Ok((canvas.rgba, height, height));
     }
 
-    // The digits are drawn as tall as the square allows — a 2px margin —
+    // The digits are drawn as tall as the square allows - a 2px margin -
     // and squeezed proportionally when the string is wider than tall
     // ("100" is, at every size that matters).
     let mut target = height.saturating_sub(4).max(8);
@@ -267,7 +267,7 @@ struct LabelRaster {
 
 /// Rasterizes the label into one tight coverage bitmap in a bold UI face,
 /// sized so a digit stands `target` pixels tall. Characters are placed by
-/// the font's own advances and side bearings, top-aligned — digits and
+/// the font's own advances and side bearings, top-aligned - digits and
 /// `%` share the cap height, so the row lines up.
 fn rasterize_label(dc: HDC, label: &[u16], family: &[u16], target: u32) -> Option<LabelRaster> {
     if label.is_empty() {
@@ -399,8 +399,8 @@ impl Canvas {
 }
 
 /// Fits the font so the battery glyph's visible bounds span `target`
-/// pixels wide — the right fit for a landscape glyph in a square icon (the
-/// fit loop accepts within a pixel) — then rasterizes the glyph as an
+/// pixels wide - the right fit for a landscape glyph in a square icon (the
+/// fit loop accepts within a pixel) - then rasterizes the glyph as an
 /// 8-bit coverage bitmap. `None` when the font or glyph is missing.
 fn fit_and_rasterize(
     dc: HDC,
@@ -461,13 +461,13 @@ fn fit_and_rasterize(
 /// Rasterizes the glyph as an 8-bit grayscale coverage bitmap
 /// (`GGO_GRAY8_BITMAP`): GDI's own anti-aliased glyph raster, no drawing
 /// surface involved. GDI writes the bitmap's *actual* bounds back into
-/// `metrics` — which can come back a pixel wider than `GGO_METRICS`
+/// `metrics` - which can come back a pixel wider than `GGO_METRICS`
 /// reported (the anti-aliased edge column), so the caller must lay the
 /// buffer out by the written-back values or every row skews.
 fn glyph_bitmap(dc: HDC, codepoint: u32, metrics: &mut GLYPHMETRICS) -> Option<Vec<u8>> {
     // SAFETY: `dc` is a live DC with a font selected; the metrics and
     // matrix structs are valid for the call and the buffer is sized to hold
-    // the reported black box (rows are DWORD-aligned) plus slack — GDI
+    // the reported black box (rows are DWORD-aligned) plus slack - GDI
     // rejects an exact-size buffer for some glyphs, asking for a few bytes
     // more than stride × rows.
     unsafe {
@@ -627,7 +627,7 @@ mod tests {
             assert_eq!(rgba.len(), (size * size * 4) as usize);
             let coverage = |x: u32, y: u32| rgba[((y * size + x) * 4 + 3) as usize];
             // The glyph's visible bounds fill the canvas: across the
-            // middle row, the covered span (first to last covered pixel —
+            // middle row, the covered span (first to last covered pixel -
             // the battery's body-to-nub gap doesn't count against it) is
             // at most two blank columns short of the full width.
             let row = size / 2;

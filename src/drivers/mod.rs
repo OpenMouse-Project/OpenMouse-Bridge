@@ -4,7 +4,7 @@
 //!
 //! Each driver is a Rust port of the matching hardware-verified WebHID
 //! driver in the sibling `mouse-protocol` repo (`@openmouse/protocol`),
-//! scoped to DPI/polling-rate only — the only settings Bridge profiles
+//! scoped to DPI/polling-rate only - the only settings Bridge profiles
 //! store. Dispatch matches `ApplicationProfile.device.id`'s `"<brand>:"`
 //! prefix, the same convention the OpenMouse web app writes when it saves a
 //! profile (see `openmouse/src/app/InterfaceSettings.tsx`); brand strings
@@ -34,10 +34,10 @@ mod registry;
 pub use native_hid::{NativeBattery, NativeStatus, spawn_button_listener};
 
 /// A mouse Bridge discovered by itself, by scanning the HID bus for vendor
-/// ids its drivers recognize — no saved profile required.
+/// ids its drivers recognize - no saved profile required.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DetectedMouse {
-    /// Stable profile-style id, `"<Brand>:<serial or vid:pid>"` — the same
+    /// Stable profile-style id, `"<Brand>:<serial or vid:pid>"` - the same
     /// `"<brand>:"` prefix convention the OpenMouse web app writes.
     pub device_id: String,
     /// Human-readable product name from the HID descriptor.
@@ -53,8 +53,8 @@ pub struct DetectedMouse {
 /// (the same drivers the web panel drives, and the same normalization
 /// `apply.mjs` gives `device.id` prefixes: trim + lowercase). When several
 /// brands share a vendor id, the entry names the brand whose driver class
-/// list covers the most sibling hardware — Delux's list includes the Attack
-/// Shark and Lamzu clients — or `mouse-protocol`'s registry.ts first match;
+/// list covers the most sibling hardware - Delux's list includes the Attack
+/// Shark and Lamzu clients - or `mouse-protocol`'s registry.ts first match;
 /// the loser's devices merely fail their silent battery probe later.
 const KNOWN_BRANDS: &[(&str, &[u16])] = &[
     ("Delux", &[0x1d57, 0x248a, 0x373e]),
@@ -92,10 +92,10 @@ pub fn brand_in_name(name: &str) -> Option<&'static str> {
 
 /// Logitech is special: every Logitech-branded device (keyboards, headsets)
 /// shares vendor id 0x046d and the HID++ transport (`mouse-protocol`'s
-/// `drivers/logitech/hidpp.ts` has the same limitation — "whether it is a
+/// `drivers/logitech/hidpp.ts` has the same limitation - "whether it is a
 /// *mouse* cannot be told from descriptors"), so discovery keeps the HID++
-/// collections — short/long reports on usage page 0xFF00, Bluetooth on
-/// 0xFF43 — and a keyboard merely fails its battery probe silently later.
+/// collections - short/long reports on usage page 0xFF00, Bluetooth on
+/// 0xFF43 - and a keyboard merely fails its battery probe silently later.
 const LOGITECH_VENDOR_ID: u16 = 0x046d;
 const HIDPP_USAGE_PAGE: u16 = 0xff00;
 const HIDPP_BLUETOOTH_USAGE_PAGE: u16 = 0xff43;
@@ -414,7 +414,7 @@ fn write_settings_held(
 }
 
 /// Reads the onboard-memory state of the mouse `device_id` names
-/// (`"<brand>:<name>"`) over native HID — battery, and the current DPI /
+/// (`"<brand>:<name>"`) over native HID - battery, and the current DPI /
 /// polling rate / switch mode wherever the driver can read them.
 /// `Ok(None)` means Bridge has no reader for the brand or the mouse reports
 /// no battery; `Err` means a driver exists but the mouse did not answer
@@ -833,7 +833,7 @@ mod tests {
     }
 
     /// Exercises the real Rust -> Node.js round trip, so it needs Node.js on
-    /// PATH and the native-hid/ checkout present next to Cargo.toml — not
+    /// PATH and the native-hid/ checkout present next to Cargo.toml - not
     /// guaranteed in every CI environment, so it's opt-in rather than part
     /// of the default `cargo test` run. Run explicitly with
     /// `cargo test -- --ignored native_hid`.
@@ -856,7 +856,7 @@ mod tests {
 
     /// Discovery must see every vendor id the helper can drive, and every
     /// brand discovery writes into `device.id` must normalize to a helper
-    /// brand key — otherwise a mouse is discovered but its battery or
+    /// brand key - otherwise a mouse is discovered but its battery or
     /// settings can never be read. Parses `native-hid/src/brands.mjs` (the
     /// helper's own table) so the two cannot drift apart silently.
     #[test]
@@ -896,7 +896,7 @@ mod tests {
         }
         assert!(
             !helper_vendor_ids.is_empty(),
-            "parsed no vendor ids — did brands.mjs's format change?"
+            "parsed no vendor ids - did brands.mjs's format change?"
         );
         let discoverable = |id: u16| {
             // The special-cased vendor ids in `discovered_brand`: CompX's

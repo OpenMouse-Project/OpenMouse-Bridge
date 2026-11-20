@@ -1,7 +1,7 @@
 // Wraps one or more node-hid devices so together they satisfy the WebHID
 // `HIDDevice` interface mouse-protocol's driver classes are written against
 // (see mouse-protocol/src/drivers/webhid.ts, an ambient-type declaration
-// only — this file is the runtime implementation of that same shape for
+// only - this file is the runtime implementation of that same shape for
 // Node).
 //
 // This lets Bridge reuse OpenMouse's actual, hardware-verified driver
@@ -10,9 +10,9 @@
 //
 // One WebHID `HIDDevice` == one USB/BT *interface*, which can carry several
 // top-level HID collections (e.g. a short and a long report variant on the
-// same vendor interface — this is exactly Logitech's HID++ receiver shape:
+// same vendor interface - this is exactly Logitech's HID++ receiver shape:
 // report 0x10 in one collection, report 0x11 in another, same interface).
-// node-hid enumerates one entry *per collection*, not per interface — on
+// node-hid enumerates one entry *per collection*, not per interface - on
 // macOS in particular, IOHIDManager opens a separate IOHIDDevice service per
 // top-level collection it finds, each capable of receiving input reports
 // only for the report ids declared in *its own* collection. Opening only
@@ -43,7 +43,7 @@ export class HidDeviceAdapter {
     this.vendorId = primary.vendorId;
     this.productId = primary.productId;
     this.productName = primary.product ?? "";
-    // Real report-descriptor parsing isn't implemented here — callers must
+    // Real report-descriptor parsing isn't implemented here - callers must
     // not rely on collections-based `isSupported()` gating (see
     // native-hid/README.md); construct the known-correct driver class
     // directly instead.
@@ -115,7 +115,7 @@ export class HidDeviceAdapter {
   async sendReport(reportId, data) {
     this._requireOpen();
     const frame = this._frame(reportId, data);
-    // Any split for this interface can carry the write on real hardware —
+    // Any split for this interface can carry the write on real hardware -
     // the split is a macOS/IOHIDManager enumeration artifact per top-level
     // collection, not a hardware restriction on which handle can transmit
     // which report id. Writing through all of them costs little (these are
@@ -158,16 +158,16 @@ export class HidDeviceAdapter {
    * from the parsed report descriptor. Drivers here call this with the
    * length they themselves expect back baked into their own retry/parsing
    * logic, so a generous fixed buffer (the largest report any known driver
-   * here uses) is safe — short replies are simply the leading bytes of it.
+   * here uses) is safe - short replies are simply the leading bytes of it.
    *
    * Classic Razer's control protocol is the largest: 90-byte feature reports
    * on report id 0 (mouse-protocol/src/razer/codec.ts, RAZER_PACKET_LENGTH =
-   * 90; the Rust transport's per-vendor budget is 91 for it — see
+   * 90; the Rust transport's per-vendor budget is 91 for it - see
    * RAZER_FEATURE_BUFFER_LEN in src/hid.rs). Requesting the whole report one
    * byte at a time would be wrong; request the id byte plus the largest
    * payload up front: `getFeatureReport` fills its first byte with the
    * requested report id and returns that id prefix as part of the buffer
-   * (node-hid's HID.cc passes buf[0] on to hidapi, which counts it — the
+   * (node-hid's HID.cc passes buf[0] on to hidapi, which counts it - the
    * exact same shape the Rust transport's receive_feature_report() accounts
    * for with `data[1..size]`). Strip that id byte so the drivers see the
    * payload they get from WebHID. Some backends omit the id byte entirely;
@@ -224,7 +224,7 @@ export class HidDeviceAdapter {
   _onData(data) {
     // Some backends prefix numbered reports with the report id on read,
     // some don't (mirrors the same ambiguity the Rust Pulsar driver
-    // handles) — there is no fully reliable way to tell from the bytes
+    // handles) - there is no fully reliable way to tell from the bytes
     // alone, so report id 0 is assumed when in doubt; drivers here match
     // responses by their own payload content, not strictly by report id.
     const reportId = data.length > 0 ? data[0] : 0;
@@ -237,7 +237,7 @@ export class HidDeviceAdapter {
   /** @param {Error} error */
   _onError(error) {
     // Surfaced to whoever is waiting on a pending exchange via their own
-    // timeout, matching how a real device disconnect looks over WebHID —
+    // timeout, matching how a real device disconnect looks over WebHID -
     // there is no dedicated "error" WebHID event drivers here listen for.
     // Logged so it's not silently swallowed.
     console.error(`[native-hid] device error: ${error.message}`);
@@ -245,7 +245,7 @@ export class HidDeviceAdapter {
 }
 
 /**
- * Lists every HID *interface* for a vendor id, ready to be opened — one
+ * Lists every HID *interface* for a vendor id, ready to be opened - one
  * HidDeviceAdapter per interface, merging any node-hid entries that split
  * off the same interface into separate top-level collections (see module
  * docs above).
@@ -284,7 +284,7 @@ export function candidateDevices(vendorId, hints = {}, list = devices) {
     const infos = onPage.length > 0 ? onPage : group;
     // Several node-hid entries for one interface commonly share the same
     // underlying `path` (one physical device, listed once per top-level
-    // collection its descriptor declares) — open each distinct path once.
+    // collection its descriptor declares) - open each distinct path once.
     const seen = new Set();
     const unique = infos.filter((info) => (seen.has(info.path) ? false : seen.add(info.path)));
     return new HidDeviceAdapter(unique);
@@ -307,8 +307,8 @@ function isStandardOnly(path) {
 
 /**
  * One device as Bridge described it (src/hid.rs, `DescribedDevice`): the
- * WebHID view the control panel would get — the same grouping and the
- * collections parsed from the report descriptors — plus each collection's
+ * WebHID view the control panel would get - the same grouping and the
+ * collections parsed from the report descriptors - plus each collection's
  * path and the payload size of every report it declares.
  *
  * Unlike HidDeviceAdapter it sends a report down only the path whose

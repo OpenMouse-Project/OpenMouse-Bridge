@@ -1,5 +1,5 @@
 //! Native HID driver for real Pulsar-vendor (0x3710) mice, so Bridge can push
-//! DPI and polling-rate changes to the mouse on its own — without a browser
+//! DPI and polling-rate changes to the mouse on its own - without a browser
 //! tab open and holding a WebHID connection.
 //!
 //! The wire protocol here is ported byte-for-byte from
@@ -19,7 +19,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use super::{NativeBattery, NativeStatus};
 use crate::config::ApplicationProfile;
 
-/// This driver's slot in `crate::drivers`' brand registry — matches the
+/// This driver's slot in `crate::drivers`' brand registry - matches the
 /// `"Pulsar:"` prefix the OpenMouse web app writes into `device.id`.
 pub const BRAND: &str = "pulsar";
 
@@ -60,7 +60,7 @@ fn read_flash_settings(device: &PulsarDevice) -> Result<(Option<u32>, Option<u32
     Ok((dpi, polling_rate_hz))
 }
 
-/// Opens the connected Pulsar mouse and reads its onboard-memory state —
+/// Opens the connected Pulsar mouse and reads its onboard-memory state -
 /// the battery via the same `batteryLevel` query (command `0x04`, percent in
 /// response byte 5, charge flag in byte 6) the WebHID driver's `readStatus`
 /// uses, plus the active DPI stage and polling rate from flash, all inside
@@ -95,7 +95,7 @@ pub fn read_status() -> Result<Option<NativeStatus>> {
 
 /// Real Pulsar-branded mice and dongles. The Pulsar 4K Wireless Receiver
 /// shares a report-8 16-byte protocol but enumerates under a different,
-/// shared vendor id (0x3554) that other brands also use — out of scope here.
+/// shared vendor id (0x3554) that other brands also use - out of scope here.
 pub const VENDOR_ID: u16 = 0x3710;
 
 const CONFIG_REPORT_ID: u8 = 0x08;
@@ -155,7 +155,7 @@ fn encode_polling_rate(rate_hz: u32) -> Result<u8> {
 
 /// The 10-step low range plus a dpiEx-flagged high range real Pulsar-vendor
 /// flash mice (including the X2 CrazyLight, CID 0x57) use. Do not apply this
-/// to the Pulsar 4K Wireless Receiver (vendor 0x3554) — it uses a flat
+/// to the Pulsar 4K Wireless Receiver (vendor 0x3554) - it uses a flat
 /// 50-step encoding with no dpiEx branching (`pulsarVgn*` in the TS source).
 fn decode_dpi(data: &[u8]) -> Option<u32> {
     if data.len() < 4 {
@@ -225,7 +225,7 @@ pub struct PulsarDevice {
 
 impl PulsarDevice {
     /// Scans every HID interface reporting Pulsar's vendor id and opens the
-    /// first one that answers the identification query on report 8 — a mouse
+    /// first one that answers the identification query on report 8 - a mouse
     /// exposes several HID interfaces (boot mouse, consumer control, ...)
     /// sharing the same vendor id, and only one of them is this config
     /// channel, so wrong interfaces are expected to fail here and are
@@ -330,7 +330,7 @@ impl PulsarDevice {
     }
 
     /// Wraps a flash read/write in the receiver's host-control handshake:
-    /// entered before the operation, always exited afterward (best-effort —
+    /// entered before the operation, always exited afterward (best-effort -
     /// leaving the receiver stuck in host-control mode would also break its
     /// normal button/movement reporting).
     fn with_device_control<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -354,7 +354,7 @@ impl PulsarDevice {
             assert_accepted(&response, label)?;
             if response[9] != 1 {
                 if enabled && response[5] != 1 {
-                    bail!("the Pulsar mouse is offline — move it or click a button, then retry");
+                    bail!("the Pulsar mouse is offline - move it or click a button, then retry");
                 }
                 return Ok(());
             }
@@ -444,7 +444,7 @@ impl PulsarDevice {
             if read == 0 {
                 continue;
             }
-            // Some backends prefix the report id, some don't — accept both.
+            // Some backends prefix the report id, some don't - accept both.
             let body = if read == buffer.len() && buffer[0] == CONFIG_REPORT_ID {
                 &buffer[1..read]
             } else {
@@ -516,7 +516,7 @@ mod tests {
     #[test]
     fn packet_checksum_matches_the_hardware_verified_pulsar_formula() {
         // 0x55 - (CONFIG_REPORT_ID + sum(bytes[0..14])) & 0xff, over a
-        // deviceOnline(true) packet — mirrors pulsarPacketChecksum in
+        // deviceOnline(true) packet - mirrors pulsarPacketChecksum in
         // mouse-protocol/src/pulsar/index.ts.
         let mut packet = [0u8; PACKET_LENGTH];
         packet[0] = command::DEVICE_ONLINE;

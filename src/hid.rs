@@ -109,7 +109,7 @@ fn note_session_ended(session_id: u64) {
 }
 
 /// The devices the control panel currently holds open over native HID, most
-/// recently opened first. Empty when no HID session has a device open — e.g.
+/// recently opened first. Empty when no HID session has a device open - e.g.
 /// a wired mouse that was never opened still leaves no trace here, which is
 /// why callers fall back to the battery list and the active profile.
 pub fn active_devices() -> Vec<ActiveDeviceInfo> {
@@ -382,7 +382,7 @@ impl ReaderHandle {
             // The handle is shared with send_report, and std's Mutex is not
             // fair: a reader that blocks in read_timeout while holding the
             // lock, then immediately re-locks, can starve a writer for many
-            // seconds — and the writer holds the session lock meanwhile, so
+            // seconds - and the writer holds the session lock meanwhile, so
             // every other command (even `list`) stalls behind it. Read without
             // blocking under the lock and idle with it released instead.
             #[cfg(not(target_os = "windows"))]

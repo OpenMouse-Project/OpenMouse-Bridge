@@ -146,7 +146,7 @@ class ManagedDevice {
       this.batteryAt = Date.now();
       console.log(`[Bridge] 🔋 Battery update for ${this.productName}: ${pct}%`);
       // Forward the raw battery input report to all connected WebSocket clients
-      // using type:'report' — the format bridge-hid.ts's #receive handler
+      // using type:'report' - the format bridge-hid.ts's #receive handler
       // already understands and routes to device.deliver() → AttackShark
       // driver's onInputReport → x11RuntimeStates cache update.
       // Payload mirrors the real HID packet: [0x55, 0x40, 0x01, pct]
@@ -426,7 +426,7 @@ wss.on('connection', (ws) => {
         dev.adapter.removeEventListener('inputreport', dev._bridgeListener);
         delete dev._bridgeListener;
       }
-      // Do NOT stop the battery monitor — keep it running so the passive
+      // Do NOT stop the battery monitor - keep it running so the passive
       // push updates continue for all connected clients.
       ws.send(JSON.stringify({ id, ok: true }));
       return;
