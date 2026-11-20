@@ -5,7 +5,7 @@
 //
 // Usage: node apply.mjs < request.json
 //   stdin: {"brand": "Razer", "dpi": 800, "pollingRateHz": 1000}
-//   (dpi / pollingRateHz are each optional — omit to leave that setting alone)
+//   (dpi / pollingRateHz are each optional - omit to leave that setting alone)
 //   stdin: {"brand": "Razer", "dpi": 800, "settings": {"lightforceSwitchMode": "Optical"}}
 //   (settings carries the panel's stored MouseStatus fields; ones the driver
 //   supports are applied, the rest are reported and skipped)
@@ -16,21 +16,21 @@
 //    "switchMode": "Optical"}  (settings fields null when unreadable)
 //
 // Exit codes (Bridge's src/drivers/native_hid.rs depends on this contract):
-//   0  — a device was found and the requested settings were applied (or, in
+//   0  - a device was found and the requested settings were applied (or, in
 //        status mode, its status was read and printed).
-//   3  — no native driver is registered for this brand (not an error: most
+//   3  - no native driver is registered for this brand (not an error: most
 //        devices are still driven by the OpenMouse web app over WebHID).
-//   1  — a driver is registered for this brand, but no matching device
+//   1  - a driver is registered for this brand, but no matching device
 //        answered, or applying the settings failed. Details on stderr.
 // mouse-protocol's driver classes were written for a browser and several of
 // them (17 of ~18 brands as of this writing) time their HID++/vendor
 // request-response waits with `window.setTimeout`/`window.clearTimeout`.
 // `window` doesn't exist in Node, so that throws a ReferenceError inside the
-// Promise executor — which JS silently turns into an instant rejection, not
+// Promise executor - which JS silently turns into an instant rejection, not
 // a timeout, before any real reply can arrive. Concretely, this made
 // LogitechHidppClient misread that instant non-timeout rejection as "the
 // receiver answered but this slot has no sensor" on every pairing slot, so
-// it reported a connected mouse as "not a mouse" — nothing to do with HID
+// it reported a connected mouse as "not a mouse" - nothing to do with HID
 // permissions or the mouse being asleep. `window` aliased to `globalThis`
 // fixes every driver relying on this pattern at once. Must run before any
 // `@openmouse/protocol` driver module is imported, including the dynamic
@@ -76,7 +76,7 @@ async function probe(device, candidate) {
   try {
     await withTimeout(client.open(), PROBE_TIMEOUT_MS, `${candidate.exportName}.open()`);
     // Every SupportedClient implements readStatus() (mouse-protocol's
-    // shared client contract) — a cheap, read-only way to confirm this is
+    // shared client contract) - a cheap, read-only way to confirm this is
     // really the right class for this interface before writing anything.
     const status = await withTimeout(client.readStatus(), PROBE_TIMEOUT_MS, `${candidate.exportName}.readStatus()`);
     if (candidate.requireBrand !== undefined && brandKey(status?.brand ?? "") !== candidate.requireBrand) {
@@ -164,7 +164,7 @@ async function main() {
       JSON.stringify({
         batteryPercent: status?.batteryPercent ?? null,
         batteryState: status?.batteryState ?? null,
-        // The driver's own model name (MouseStatus.name) — better than the
+        // The driver's own model name (MouseStatus.name) - better than the
         // receiver-level name Bridge's discovery gets from the HID
         // descriptor (a LIGHTSPEED receiver reports "USB Receiver").
         deviceName: status?.name ?? null,
@@ -182,7 +182,7 @@ async function main() {
 
   // ── Wooting 60HE+ ───────────────────────────────────────────────────
   // RAM-only switch needs no confirm; flash saves require confirmed: true
-  // in stdin (headless gate — no modal possible), else exit 1 unsent.
+  // in stdin (headless gate - no modal possible), else exit 1 unsent.
   if (input.action === "switch-profile") {
     if (!Number.isInteger(input.slot)) {
       console.error("[native-hid] switch-profile needs an integer slot.");
@@ -274,7 +274,7 @@ async function main() {
       }
     }
     if (skipped.length > 0) {
-      console.error(`[native-hid] no native support for: ${skipped.join(", ")} — skipped.`);
+      console.error(`[native-hid] no native support for: ${skipped.join(", ")} - skipped.`);
     }
   }
 

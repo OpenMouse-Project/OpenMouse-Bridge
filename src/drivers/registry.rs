@@ -1,6 +1,6 @@
 //! Which devices on the bus are mice Bridge can drive, and which brand each
-//! is, decided by `@openmouse/protocol`'s own driver registry — the same
-//! `supports()` checks the control panel runs in the browser — rather than a
+//! is, decided by `@openmouse/protocol`'s own driver registry - the same
+//! `supports()` checks the control panel runs in the browser - rather than a
 //! vendor-id table of Bridge's own.
 //!
 //! Bridge describes the bus (`hid::describe_devices`: grouped devices with
@@ -168,9 +168,9 @@ fn brands_by_key(reply: IdentifyReply) -> HashMap<String, String> {
 }
 
 /// The devices a `brand` request may use: those the registry gives that
-/// brand. When none has it — a profile saved under the brand the driver
+/// brand. When none has it - a profile saved under the brand the driver
 /// reports (`Attack Shark`) for hardware the registry files under another
-/// (`Delux`) — every supported device is offered and the helper keeps the one
+/// (`Delux`) - every supported device is offered and the helper keeps the one
 /// whose own status reports `brand`. `None` when the registry is unavailable.
 pub(super) fn devices_for(brand: &str) -> Option<native_hid::Devices> {
     let devices = devices()?;

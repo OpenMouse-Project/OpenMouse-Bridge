@@ -7,19 +7,19 @@ battery, without a browser tab open holding a WebHID connection.
 ## Why Node, in a Rust project
 
 Bridge has a dependency-free native Rust driver for the one protocol that's
-been hardware-verified in this workspace (Pulsar — see `src/drivers/pulsar.rs`
+been hardware-verified in this workspace (Pulsar - see `src/drivers/pulsar.rs`
 in the parent crate). Every other brand OpenMouse supports is implemented in
 `@openmouse/protocol` (the sibling `mouse-protocol` repo) as a WebHID driver
 class, hardware-tested there, not here. Reimplementing all of those in Rust
 would mean re-deriving and re-verifying ~15,000 lines of vendor-specific wire
-protocol with no hardware in hand to test most of it against — real risk of
+protocol with no hardware in hand to test most of it against - real risk of
 silently writing wrong values to someone's mouse.
 
 Instead, this package makes those exact same driver classes runnable outside
 a browser: `hid-device-adapter.mjs` wraps `node-hid` so it satisfies the
 `HIDDevice` interface the drivers are written against (see
 `mouse-protocol/src/drivers/webhid.ts`), and `apply.mjs` constructs the
-already-verified class for a given brand directly — no protocol code is
+already-verified class for a given brand directly - no protocol code is
 duplicated or reimplemented here.
 
 ## How dispatch works
@@ -49,8 +49,8 @@ described devices with each request:
    collection whose descriptor declares it, padded to the declared size as
    Chrome does (Windows refuses a feature report of any other length), and
    reads feature reports at their declared size. `client.open()` then
-   `client.readStatus()` — a cheap, read-only call every `SupportedClient`
-   implements — probe it before anything is written. When a profile's brand
+   `client.readStatus()` - a cheap, read-only call every `SupportedClient`
+   implements - probe it before anything is written. When a profile's brand
    is not the one the registry files its mouse under (`"Attack Shark"` saved
    for hardware filed as `"Delux"`), Bridge sends `"matchStatusBrand": true`
    and every supported device, and the helper keeps the one whose status
@@ -89,14 +89,14 @@ on an onboard one, turns the mouse's button events on, and prints
 stdin stops it: the events go off and the mouse returns to the mode it was in.
 It needs an `@openmouse/protocol` release that has `startButtonListener`.
 
-## Exit code contract (Bridge depends on this — see `src/drivers/native_hid.rs`)
+## Exit code contract (Bridge depends on this - see `src/drivers/native_hid.rs`)
 
-- `0` — a device was found and the requested settings were applied. In
+- `0` - a device was found and the requested settings were applied. In
   status mode (`{"brand": "…", "action": "status"}` on stdin) the device's
   status was read instead, and its battery is printed on stdout as
   `{"batteryPercent": 41, "batteryState": "Discharging"}`.
-- `3` — no driver is registered for this brand. Not an error.
-- `1` — a driver exists for this brand, but no device answered, or applying
+- `3` - no driver is registered for this brand. Not an error.
+- `1` - a driver exists for this brand, but no device answered, or applying
   failed. Details on stderr.
 
 ## Setup
@@ -106,17 +106,17 @@ npm install
 ```
 
 `@openmouse/protocol` is a normal git dependency pinned to a specific commit
-(`package.json`), matching how `openmouse` itself depends on it — not a
+(`package.json`), matching how `openmouse` itself depends on it - not a
 local `file:`/symlink reference to the sibling `../../mouse-protocol`
 checkout, deliberately: that checkout can have local work in progress (it
-did when this package was created — untracked G-Wolves driver files that
+did when this package was created - untracked G-Wolves driver files that
 briefly broke its own build), and a `file:` dependency would rebuild it as a
 side effect of `npm install` here. Bump the pinned commit by hand when you
 want a newer `mouse-protocol`.
 
 Both dependencies have install scripts (`node-hid` needs to select its
 prebuilt native binding; `@openmouse/protocol` needs to compile its
-TypeScript) — this environment's npm requires approving those explicitly:
+TypeScript) - this environment's npm requires approving those explicitly:
 
 ```sh
 npm approve-scripts node-hid "@openmouse/protocol"
@@ -127,7 +127,7 @@ npm install   # re-run once scripts are approved, so they actually execute
 
 Bridge's release packaging (`.github/workflows/release.yml`) bundles this
 whole directory next to the `openmouse-bridge` executable, plus a
-standalone Node.js runtime under `native-hid/node/` — end users don't need
+standalone Node.js runtime under `native-hid/node/` - end users don't need
 Node.js installed. `src/drivers/native_hid.rs` looks for that bundled
 runtime first and falls back to `node` on `PATH`, so local development
 (this README's setup above) works without it.

@@ -4,9 +4,13 @@
 //!
 //! Linux uses StatusNotifierItem over D-Bus, without a GTK event loop.
 
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    mpsc,
+use std::{
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    time::{Duration, Instant},
 };
 
 #[cfg(any(target_os = "macos", windows))]
@@ -27,6 +31,57 @@ pub struct Anchor {
     pub top: f64,
     pub right: f64,
     pub bottom: f64,
+}
+
+#[cfg(any(windows, test))]
+fn corner_x(icon_left: f64, icon_right: f64, work_left: f64, work_right: f64, width: f64) -> f64 {
+    if (icon_left + icon_right) / 2.0 >= (work_left + work_right) / 2.0 {
+        work_right - width
+    } else {
+        work_left
+    }
+}
+
+#[cfg(any(windows, test))]
+fn inside_area(anchor: &Anchor, left: f64, top: f64, right: f64, bottom: f64) -> bool {
+    anchor.left >= left && anchor.right <= right && anchor.top >= top && anchor.bottom <= bottom
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::{Anchor, corner_x, inside_area};
+
+    #[test]
+    fn the_panel_sits_in_the_corner_on_the_side_of_the_tray() {
+        assert_eq!(corner_x(1560.0, 1584.0, 0.0, 1920.0, 360.0), 1560.0);
+        assert_eq!(corner_x(30.0, 54.0, 0.0, 1920.0, 360.0), 0.0);
+    }
+
+    fn icon(left: f64, top: f64) -> Anchor {
+        Anchor {
+            left,
+            top,
+            right: left + 24.0,
+            bottom: top + 24.0,
+        }
+    }
+
+    #[test]
+    fn an_icon_in_the_hidden_icons_flyout_is_inside_the_work_area() {
+        assert!(inside_area(&icon(1100.0, 590.0), 0.0, 0.0, 1920.0, 1032.0));
+    }
+
+    #[test]
+    fn an_icon_on_the_taskbar_is_outside_the_work_area() {
+        assert!(!inside_area(
+            &icon(1700.0, 1040.0),
+            0.0,
+            0.0,
+            1920.0,
+            1032.0
+        ));
+        assert!(!inside_area(&icon(1900.0, 600.0), 0.0, 0.0, 1920.0, 1032.0));
+    }
 }
 
 /// The tray icon, kept by the poll loop so it can show the battery on it.
@@ -135,6 +190,18 @@ mod platform {
         }
     }
 
+    /// NSFloatingWindowLevel (3) keeps the panel above normal windows;
+    /// NSNormalWindowLevel is 0.
+    pub fn set_topmost(window: &Window, on: bool) {
+        if let Some(window) = ns_window(window) {
+            window.setLevel(if on { 3 } else { 0 });
+        }
+    }
+
+    pub fn supports_topmost(_window: &Window) -> bool {
+        true
+    }
+
     pub fn show_window(window: &mut Window) -> bool {
         if let Some(window) = ns_window(window) {
             window.makeKeyAndOrderFront(None);
@@ -201,14 +268,73 @@ mod platform {
     use windows_sys::Win32::{
         Foundation::{POINT, RECT},
         Graphics::Gdi::{
-            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
-            MonitorFromPoint, MonitorFromRect,
+            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
+            MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, MonitorFromRect,
         },
+        System::Threading::{AttachThreadInput, GetCurrentThreadId},
         UI::WindowsAndMessaging::{
-            GetWindowRect, SW_HIDE, SW_RESTORE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
-            SetForegroundWindow, SetWindowPos, ShowWindow,
+            BringWindowToTop, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId,
+            HWND_NOTOPMOST, HWND_TOPMOST, SW_HIDE, SW_RESTORE, SWP_NOACTIVATE, SWP_NOMOVE,
+            SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow,
         },
     };
+
+    use super::{corner_x, inside_area};
+
+    pub fn bottom_edge(window: &Window) -> Option<i32> {
+        let hwnd = hwnd_of(window)?;
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+            return None;
+        }
+        let scale = f64::from(window.scale_factor());
+        let client = (f64::from(window.viewport_size().height.as_f32()) * scale).round() as i32;
+        let frame = (rect.bottom - rect.top - client).max(0);
+        Some(rect.bottom - frame)
+    }
+
+    pub fn set_bottom_edge(window: &Window, bottom: i32, height: f32) {
+        let Some(hwnd) = hwnd_of(window) else {
+            return;
+        };
+        let height = (f64::from(height) * f64::from(window.scale_factor())).ceil() as i32;
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+            return;
+        }
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let monitor = unsafe { MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST) };
+        if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
+            return;
+        }
+        let y = (bottom - height).max(info.rcWork.top + MARGIN as i32);
+        if y != rect.top {
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    rect.left,
+                    y,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+        }
+    }
 
     /// Slides the panel up when a window of `height` logical points, growing
     /// down from where it is now, would run past the work area's bottom edge.
@@ -253,7 +379,7 @@ mod platform {
     }
 
     /// Distance kept from the work area's edges and from the icon, in pixels.
-    const MARGIN: f64 = 8.0;
+    const MARGIN: f64 = 24.0;
 
     fn hwnd_of(window: &Window) -> Option<windows_sys::Win32::Foundation::HWND> {
         match HasWindowHandle::window_handle(window).map(|handle| handle.as_raw()) {
@@ -275,7 +401,17 @@ mod platform {
         if let Some(hwnd) = hwnd_of(window) {
             unsafe {
                 ShowWindow(hwnd, SW_RESTORE);
+                let foreground =
+                    GetWindowThreadProcessId(GetForegroundWindow(), std::ptr::null_mut());
+                let current = GetCurrentThreadId();
+                let attached = foreground != 0
+                    && foreground != current
+                    && AttachThreadInput(current, foreground, 1) != 0;
+                BringWindowToTop(hwnd);
                 SetForegroundWindow(hwnd);
+                if attached {
+                    AttachThreadInput(current, foreground, 0);
+                }
             }
         }
         false
@@ -290,14 +426,104 @@ mod platform {
         }
     }
 
+    pub fn supports_topmost(_window: &Window) -> bool {
+        true
+    }
+
+    pub fn set_topmost(window: &Window, on: bool) {
+        if let Some(hwnd) = hwnd_of(window) {
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    if on { HWND_TOPMOST } else { HWND_NOTOPMOST },
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+    }
+
+    pub fn position(window: &Window) -> Option<(i32, i32)> {
+        let hwnd = hwnd_of(window)?;
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        (unsafe { GetWindowRect(hwnd, &mut rect) } != 0).then_some((rect.left, rect.top))
+    }
+
+    /// Where to put the panel. Moving a window onto a screen with another scale
+    /// sends it messages that re-enter GPUI, so the move is made by [`apply`]
+    /// outside any GPUI update, not while the panel is being placed.
+    pub struct Move {
+        pub hwnd: isize,
+        pub x: i32,
+        pub y: i32,
+    }
+
+    pub fn apply(target: &Move) {
+        unsafe {
+            SetWindowPos(
+                target.hwnd as _,
+                std::ptr::null_mut(),
+                target.x,
+                target.y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    /// Where the panel goes when that spot is still on a screen, pulling it
+    /// inside the work area. False when no screen has that spot any more.
+    pub fn plan_restore(window: &Window, x: i32, y: i32) -> Option<Move> {
+        let hwnd = hwnd_of(window)?;
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+            return None;
+        }
+        let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
+        let target = RECT {
+            left: x,
+            top: y,
+            right: x + width,
+            bottom: y + height,
+        };
+        let monitor = unsafe { MonitorFromRect(&target, MONITOR_DEFAULTTONULL) };
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if monitor.is_null() || unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
+            return None;
+        }
+        let work = info.rcWork;
+        let x = x.min(work.right - width).max(work.left);
+        let y = y.min(work.bottom - height).max(work.top);
+        Some(Move {
+            hwnd: hwnd as isize,
+            x,
+            y,
+        })
+    }
+
     /// Puts the panel's right edge on the icon's, above it when the icon is in
     /// the lower half of its screen (a bottom taskbar) and below it otherwise,
     /// kept inside the work area. With no click to go by it goes to the primary
     /// screen's bottom-right corner.
-    pub fn place_near_tray(window: &Window, anchor: Option<Anchor>) {
-        let Some(hwnd) = hwnd_of(window) else {
-            return;
-        };
+    pub fn plan_near_tray(window: &Window, anchor: Option<Anchor>) -> Option<Move> {
+        let hwnd = hwnd_of(window)?;
         let scale = f64::from(window.scale_factor());
         let size = window.bounds().size;
         let (width, height) = (
@@ -323,18 +549,21 @@ mod platform {
             }
         };
         if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
-            return;
+            return None;
         }
         let work = info.rcWork;
         let (work_left, work_top) = (f64::from(work.left), f64::from(work.top));
         let (work_right, work_bottom) = (f64::from(work.right), f64::from(work.bottom));
-        let icon = anchor.unwrap_or(Anchor {
+        let in_flyout = anchor
+            .as_ref()
+            .is_some_and(|icon| inside_area(icon, work_left, work_top, work_right, work_bottom));
+        let icon = anchor.filter(|_| !in_flyout).unwrap_or(Anchor {
             left: work_right,
             top: work_bottom,
             right: work_right,
             bottom: work_bottom,
         });
-        let x = icon.right - width;
+        let x = corner_x(icon.left, icon.right, work_left, work_right, width);
         let y = if (icon.top + icon.bottom) / 2.0 > (work_top + work_bottom) / 2.0 {
             icon.top - height - MARGIN
         } else {
@@ -343,17 +572,11 @@ mod platform {
         let clamp = |value: f64, low: f64, high: f64| value.clamp(low, high.max(low));
         let x = clamp(x, work_left + MARGIN, work_right - width - MARGIN);
         let y = clamp(y, work_top + MARGIN, work_bottom - height - MARGIN);
-        unsafe {
-            SetWindowPos(
-                hwnd,
-                std::ptr::null_mut(),
-                x as i32,
-                y as i32,
-                0,
-                0,
-                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-        }
+        Some(Move {
+            hwnd: hwnd as isize,
+            x: x as i32,
+            y: y as i32,
+        })
     }
 }
 
@@ -408,6 +631,29 @@ mod platform {
             }
         }
     }
+    /// A layer-shell panel is already on the compositor's top layer; an X11
+    /// window asks its window manager. A plain Wayland window cannot.
+    pub fn supports_topmost(window: &Window) -> bool {
+        super::layer_panel()
+            || matches!(
+                HasWindowHandle::window_handle(window).map(|handle| handle.as_raw()),
+                Ok(raw_window_handle::RawWindowHandle::Xcb(_))
+            )
+    }
+
+    pub fn set_topmost(window: &Window, on: bool) {
+        if super::layer_panel() {
+            return;
+        }
+        let Ok(handle) = HasWindowHandle::window_handle(window).map(|handle| handle.as_raw())
+        else {
+            return;
+        };
+        if let Err(error) = super::linux::set_x11_above(handle, on) {
+            tracing::warn!(%error, "Could not change whether the panel stays on top");
+        }
+    }
+
     // Wayland compositors control top-level placement; do not interpret the
     // host's coordinate hints as portable window positions.
     pub fn place_near_tray(_window: &Window, _anchor: Option<Anchor>) {}
@@ -424,11 +670,20 @@ mod platform {
         false
     }
     pub fn place_near_tray(_window: &Window, _anchor: Option<Anchor>) {}
+    pub fn set_topmost(_window: &Window, _on: bool) {}
+    pub fn supports_topmost(_window: &Window) -> bool {
+        false
+    }
 }
 
 /// Whether the panel is on screen. While it is hidden in the tray nothing
 /// repaints it. Stays true where there is no tray to hide it to.
 static VISIBLE: AtomicBool = AtomicBool::new(true);
+
+/// Set once the panel has been put somewhere on purpose, so the spot it first
+/// opened at (hidden at start, centred by the system) is never remembered.
+#[cfg(windows)]
+static PLACED: AtomicBool = AtomicBool::new(false);
 
 /// Whether the panel was last shown rather than hidden through [`show`] and
 /// [`hide`], which is what a click on the icon toggles. Unlike [`is_visible`]
@@ -572,7 +827,57 @@ pub fn can_hide() -> bool {
     cfg!(any(target_os = "macos", windows))
 }
 
+/// When the panel last hid itself because it lost focus.
+static HIDDEN_ON_BLUR_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// How soon after the panel hides on losing focus a click on the icon counts
+/// as the click that took the focus: pressing the icon takes focus from the
+/// panel before the click arrives, and that click should leave it closed.
+const BLUR_CLICK_WINDOW: Duration = Duration::from_millis(500);
+
+/// Whether the panel hides when it loses focus, like a popup: where it sits by
+/// the tray and the icon brings it back. Not for a normal Linux window (no
+/// layer-shell), which has a taskbar entry and stays where it was put.
+pub fn hides_on_blur() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        layer_panel() && can_hide()
+    }
+    #[cfg(not(target_os = "linux"))]
+    can_hide()
+}
+
+/// Hides the panel because a click elsewhere took its focus.
+pub fn hide_on_blur(window: &mut Window) {
+    if !shown() {
+        return;
+    }
+    hide(window);
+    if let Ok(mut at) = HIDDEN_ON_BLUR_AT.lock() {
+        *at = Some(Instant::now());
+    }
+}
+
+/// What a click on the icon sends: a toggle, or nothing when the panel has
+/// just hidden because pressing the icon took its focus.
+pub fn click_command(anchor: Option<Anchor>) -> Option<Command> {
+    let just_hidden = HIDDEN_ON_BLUR_AT
+        .lock()
+        .ok()
+        .and_then(|mut at| at.take())
+        .is_some_and(|at| at.elapsed() < BLUR_CLICK_WINDOW);
+    (!just_hidden).then_some(Command::Toggle(anchor))
+}
+
 pub fn hide(window: &mut Window) {
+    #[cfg(windows)]
+    if let Some((x, y)) = PLACED
+        .load(Ordering::Relaxed)
+        .then(|| platform::position(window))
+        .flatten()
+    {
+        save_position(x, y);
+    }
     platform::hide_window(window);
     #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
     VISIBLE.store(false, Ordering::Relaxed);
@@ -581,8 +886,26 @@ pub fn hide(window: &mut Window) {
 /// Moves the panel beside the tray icon (see [`Anchor`]); without an anchor,
 /// to the tray's usual corner of the main screen.
 #[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg(not(windows))]
 pub fn place(window: &Window, anchor: Option<Anchor>) {
     platform::place_near_tray(window, anchor);
+}
+
+/// Where the panel goes on Windows: where it was left, else beside the tray.
+/// The move itself is made by [`apply_move`], called outside any GPUI update.
+#[cfg(windows)]
+pub fn plan_place(window: &Window, anchor: Option<Anchor>) -> Option<platform::Move> {
+    PLACED.store(true, Ordering::Relaxed);
+    saved_position()
+        .and_then(|(x, y)| platform::plan_restore(window, x, y))
+        .or_else(|| platform::plan_near_tray(window, anchor))
+}
+
+#[cfg(windows)]
+pub fn apply_move(target: Option<platform::Move>) {
+    if let Some(target) = target {
+        platform::apply(&target);
+    }
 }
 
 /// After the panel grows (opening Settings), keeps its bottom edge on screen.
@@ -594,8 +917,97 @@ pub fn keep_on_screen(window: &Window, height: f32) {
     let _ = (window, height);
 }
 
+pub fn bottom_edge(window: &Window) -> Option<i32> {
+    #[cfg(windows)]
+    {
+        platform::bottom_edge(window)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = window;
+        None
+    }
+}
+
+pub fn set_bottom_edge(window: &Window, bottom: i32, height: f32) {
+    #[cfg(windows)]
+    platform::set_bottom_edge(window, bottom, height);
+    #[cfg(not(windows))]
+    let _ = (window, bottom, height);
+}
+
+static ALWAYS_ON_TOP: AtomicBool = AtomicBool::new(false);
+
+fn always_on_top_file() -> Option<std::path::PathBuf> {
+    Some(
+        crate::config::config_path()
+            .ok()?
+            .parent()?
+            .join("always-on-top.txt"),
+    )
+}
+
+/// Reads the saved "always on top" choice; the panel does this once at start.
+pub fn load_always_on_top() -> bool {
+    let on = always_on_top_file()
+        .and_then(|file| std::fs::read_to_string(file).ok())
+        .is_some_and(|text| text.trim() == "1");
+    ALWAYS_ON_TOP.store(on, Ordering::Relaxed);
+    on
+}
+
+/// Whether the panel stays above other windows; it then also stays open when
+/// it loses focus.
+pub fn always_on_top() -> bool {
+    ALWAYS_ON_TOP.load(Ordering::Relaxed)
+}
+
+pub fn set_always_on_top(window: &Window, on: bool) {
+    ALWAYS_ON_TOP.store(on, Ordering::Relaxed);
+    if let Some(file) = always_on_top_file() {
+        let _ = std::fs::write(file, if on { "1" } else { "0" });
+    }
+    platform::set_topmost(window, on);
+}
+
+/// Whether the panel can stay above other windows here, which decides if
+/// Settings offers the switch.
+pub fn always_on_top_supported(window: &Window) -> bool {
+    platform::supports_topmost(window)
+}
+
+#[cfg(windows)]
+fn position_file() -> Option<std::path::PathBuf> {
+    Some(
+        crate::config::config_path()
+            .ok()?
+            .parent()?
+            .join("window-position.txt"),
+    )
+}
+
+#[cfg(windows)]
+fn save_position(x: i32, y: i32) {
+    if let Some(file) = position_file() {
+        let _ = std::fs::write(file, format!("{x} {y}"));
+    }
+}
+
+#[cfg(windows)]
+fn saved_position() -> Option<(i32, i32)> {
+    let text = std::fs::read_to_string(position_file()?).ok()?;
+    let (x, y) = text.trim().split_once(' ')?;
+    Some((x.parse().ok()?, y.parse().ok()?))
+}
+
 pub fn show(window: &mut Window, anchor: Option<Anchor>) {
-    platform::place_near_tray(window, anchor);
+    #[cfg(not(windows))]
+    place(window, anchor);
+    #[cfg(windows)]
+    let _ = anchor;
+    if cfg!(windows) || always_on_top() {
+        platform::set_topmost(window, always_on_top());
+    }
     if !platform::show_window(window) {
         window.activate_window();
     }
@@ -631,6 +1043,32 @@ fn build_icon() -> Option<tray_icon::TrayIcon> {
     builder.build().ok()
 }
 
+/// Moves the icon out of the hidden-icons flyout once per executable, so putting
+/// it back there in Windows settings is not undone at the next start.
+#[cfg(windows)]
+fn promote_icon_once() {
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    let executable = executable.to_string_lossy().to_lowercase();
+    let Some(marker) = crate::config::config_path()
+        .ok()
+        .and_then(|path| Some(path.parent()?.join("tray-icon-promoted.txt")))
+    else {
+        return;
+    };
+    if std::fs::read_to_string(&marker).is_ok_and(|done| done.trim() == executable) {
+        return;
+    }
+    for _ in 0..20 {
+        if openmouse_bridge::platform::promote_tray_icon() {
+            let _ = std::fs::write(&marker, &executable);
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
 /// Creates the tray icon and makes closing `window` hide it. Returns the
 /// channel its clicks and menu items arrive on and the icon itself, or `None`
 /// when there is no tray (then closing the window still quits).
@@ -644,6 +1082,8 @@ pub fn install(
     use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
 
     let tray = build_icon()?;
+    #[cfg(windows)]
+    std::thread::spawn(promote_icon_once);
 
     // The handlers run on the main thread inside the platform's event
     // dispatch; they only queue a command for the poll loop in `run`.
@@ -721,11 +1161,14 @@ pub fn install(
                 _ => return,
             };
             let anchor = Some(anchor);
-            let _ = sender.send(if double_click {
-                Command::Show(anchor)
+            let command = if double_click {
+                Some(Command::Show(anchor))
             } else {
-                Command::Toggle(anchor)
-            });
+                click_command(anchor)
+            };
+            if let Some(command) = command {
+                let _ = sender.send(command);
+            }
         }
     }));
 

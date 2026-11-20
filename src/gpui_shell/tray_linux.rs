@@ -44,6 +44,51 @@ pub(super) fn restore_x11_window(handle: raw_window_handle::RawWindowHandle) -> 
     Ok(())
 }
 
+/// Asks the window manager to keep the X11 panel above other windows, or to
+/// stop, with a `_NET_WM_STATE` request for `_NET_WM_STATE_ABOVE`.
+pub(super) fn set_x11_above(handle: raw_window_handle::RawWindowHandle, on: bool) -> Result<()> {
+    use raw_window_handle::RawWindowHandle;
+    use x11rb::{
+        connection::Connection as _,
+        protocol::xproto::{ClientMessageEvent, ConnectionExt as _, EventMask},
+    };
+
+    let RawWindowHandle::Xcb(handle) = handle else {
+        return Ok(());
+    };
+    let (connection, screen) = x11rb::connect(None).context("could not open the X display")?;
+    let root = connection
+        .setup()
+        .roots
+        .get(screen)
+        .context("the X display has no screen")?
+        .root;
+    let state = connection
+        .intern_atom(false, b"_NET_WM_STATE")?
+        .reply()?
+        .atom;
+    let above = connection
+        .intern_atom(false, b"_NET_WM_STATE_ABOVE")?
+        .reply()?
+        .atom;
+    let event = ClientMessageEvent::new(
+        32,
+        handle.window.get(),
+        state,
+        [u32::from(on), above, 0, 1, 0],
+    );
+    connection
+        .send_event(
+            false,
+            root,
+            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+            event,
+        )?
+        .check()
+        .context("could not ask the window manager to change the stacking")?;
+    Ok(())
+}
+
 /// The XDG activation token the tray host sent with the last click, kept until
 /// the panel is shown. On Wayland only a token from the user's click lets the
 /// compositor raise (and un-minimize) the panel.
@@ -290,7 +335,9 @@ impl Tray for LinuxTray {
             right: f64::from(x),
             bottom: f64::from(y),
         });
-        let _ = self.sender.send(Command::Toggle(anchor));
+        if let Some(command) = super::click_command(anchor) {
+            let _ = self.sender.send(command);
+        }
     }
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         use ksni::menu::StandardItem;

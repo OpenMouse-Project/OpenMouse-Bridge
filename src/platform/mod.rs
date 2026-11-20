@@ -17,7 +17,7 @@ mod portable;
 #[cfg(target_os = "windows")]
 pub use windows::{
     autostart_enabled, battery_icon_rgba, light_tray_theme, linux_distribution, platform_name,
-    set_autostart, tray_icon_size,
+    promote_tray_icon, set_autostart, tray_icon_size,
 };
 
 #[cfg(target_os = "macos")]

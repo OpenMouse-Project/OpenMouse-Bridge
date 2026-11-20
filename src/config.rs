@@ -34,9 +34,9 @@ pub struct BridgeConfig {
     #[serde(default = "default_tray_battery_style")]
     pub tray_battery_style: String,
     /// Hybrid device mode: while the OpenMouse web panel is disconnected,
-    /// Bridge drives the mouse itself — the active profile's stored settings
+    /// Bridge drives the mouse itself - the active profile's stored settings
     /// (DPI, polling rate, switch mode) go to the onboard memory and the
-    /// battery is read natively — and hands the mouse over to the panel the
+    /// battery is read natively - and hands the mouse over to the panel the
     /// moment it connects, applying the stored settings again on disconnect.
     #[serde(default = "enabled_by_default")]
     pub hybrid_mode: bool,

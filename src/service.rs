@@ -142,7 +142,7 @@ const BATTERY_TREND_WINDOW: Duration = Duration::from_secs(6 * 60 * 60);
 const BATTERY_MIN_TREND_SPAN: Duration = Duration::from_secs(30 * 60);
 
 /// The smallest drift (percent per minute) that counts as a trend, about 1%
-/// per 3 hours — the pace a mouse battery actually moves at.
+/// per 3 hours - the pace a mouse battery actually moves at.
 const BATTERY_TREND_EPSILON: f64 = 0.005;
 
 /// Estimates beyond this are noise for a mouse battery, not a plan.
@@ -455,13 +455,13 @@ fn switch_message(
         match outcome {
             Some(ApplyOutcome::Failed) => {
                 switch.detail = if current.is_none() {
-                    "Couldn't restore original mouse settings — check Bridge status".into()
+                    "Couldn't restore original mouse settings - check Bridge status".into()
                 } else {
-                    "Couldn't reach the mouse — open OpenMouse to apply".into()
+                    "Couldn't reach the mouse - open OpenMouse to apply".into()
                 };
             }
             Some(ApplyOutcome::NoDriver) => {
-                switch.detail = "Bridge can't drive this mouse — open OpenMouse to apply".into();
+                switch.detail = "Bridge can't drive this mouse - open OpenMouse to apply".into();
             }
             _ => {}
         }
@@ -519,7 +519,7 @@ struct BridgeState {
     active_games: Vec<String>,
     processes: Vec<crate::games::RunningProcess>,
     applications: Vec<ApplicationInfo>,
-    // Every visible application, registered game or not — what a control
+    // Every visible application, registered game or not - what a control
     // panel offers when someone requests a new game or app be added.
     running_applications: Vec<ApplicationInfo>,
     application_icons: HashMap<String, Option<Vec<u8>>>,
@@ -573,7 +573,7 @@ pub struct BatteryReading {
     #[serde(default)]
     pub charging: bool,
     /// The settings currently in the mouse's onboard memory, when the
-    /// reader could see them — native reads report them; a control panel's
+    /// reader could see them - native reads report them; a control panel's
     /// `PUT /v1/battery` may not.
     #[serde(default)]
     pub dpi: Option<u32>,
@@ -607,7 +607,7 @@ struct BatteryState {
 /// Estimates the minutes left until the battery is empty (discharging) or
 /// full (charging) from the percent history: the level's drift across the
 /// samples inside the trend window. `None` while there is no confident
-/// trend yet — too little history, or the level is holding still.
+/// trend yet - too little history, or the level is holding still.
 fn estimate_minutes_remaining(
     history: &VecDeque<(Instant, u8)>,
     percent: u8,
@@ -660,8 +660,8 @@ pub struct DeviceBattery {
 }
 
 /// A mouse the control panel currently holds open over native HID, most
-/// recently opened first. Unlike the battery list — which accumulates every
-/// device that ever reported a charge level — this reflects the live HID
+/// recently opened first. Unlike the battery list - which accumulates every
+/// device that ever reported a charge level - this reflects the live HID
 /// session, so the status view can follow device switches (including wired
 /// mice that never report battery).
 #[derive(Clone, Debug, Serialize)]
@@ -1635,10 +1635,10 @@ impl BridgeService {
                 }
                 match mode {
                     DeviceMode::Live => {
-                        tracing::info!("the web panel connected — it drives the mouse live now");
+                        tracing::info!("the web panel connected - it drives the mouse live now");
                     }
                     DeviceMode::Onboard => {
-                        tracing::info!("the web panel disconnected — resuming onboard memory mode");
+                        tracing::info!("the web panel disconnected - resuming onboard memory mode");
                         let hybrid = service.inner.read().await.config.hybrid_mode;
                         if !hybrid {
                             continue;
@@ -1800,7 +1800,7 @@ impl BridgeService {
                 )> = None;
                 if !state.profile_seeded {
                     // Adopt the initial profile silently so startup is quiet,
-                    // but still push it to the mouse — Bridge should reflect
+                    // but still push it to the mouse - Bridge should reflect
                     // the right settings from a cold start, not only switches.
                     state.active_profile_key = current_key;
                     state.applied_profile = current.clone();
@@ -1862,7 +1862,7 @@ impl BridgeService {
 /// One battery-polling pass: covers every device named by the saved profiles
 /// plus every mouse Bridge discovered on the HID bus whose brand no profile
 /// already names, reads each mouse's battery natively (skipped while the web
-/// panel holds the session — it reports the battery itself over
+/// panel holds the session - it reports the battery itself over
 /// `PUT /v1/battery`) and records it. Used by the five-minute monitor and by
 /// onboard-mode handovers.
 /// Writes devices.json; a failure is logged and never stops Bridge.
@@ -2140,7 +2140,7 @@ fn canonical_battery_identity(device_id: &str, reported_name: &str) -> String {
 }
 
 /// The devices battery polling should cover: the saved profiles' devices plus
-/// discovered mice whose brand no profile already names — discovery fills the
+/// discovered mice whose brand no profile already names - discovery fills the
 /// gap before the panel has ever saved a profile, without double-reporting a
 /// mouse a profile already covers (profile and discovery ids for the same
 /// physical mouse differ, so brand-level dedup keeps one battery entry).
@@ -2163,7 +2163,7 @@ fn merge_detected_mice(
 }
 
 /// Enters onboard memory mode: pushes the stored settings to the mouse's
-/// onboard memory (when a default profile exists — without one, the device
+/// onboard memory (when a default profile exists - without one, the device
 /// simply keeps the memory it already has) and reads the battery right away.
 /// Shared by the startup seed and the panel-disconnect handover.
 async fn resume_onboard(service: &BridgeService) {
@@ -2953,13 +2953,13 @@ mod tests {
             switch_message(Some(&game), None, None, Some(ApplyOutcome::Failed), false).unwrap();
         assert_eq!(
             notice.detail,
-            "Couldn't restore original mouse settings — check Bridge status"
+            "Couldn't restore original mouse settings - check Bridge status"
         );
         let unsupported =
             switch_message(None, Some(&game), None, Some(ApplyOutcome::NoDriver), false).unwrap();
         assert_eq!(
             unsupported.detail,
-            "Bridge can't drive this mouse — open OpenMouse to apply"
+            "Bridge can't drive this mouse - open OpenMouse to apply"
         );
     }
 
@@ -3010,7 +3010,7 @@ mod tests {
             switch_message(None, Some(&game), None, failed, false)
                 .unwrap()
                 .detail,
-            "Couldn't reach the mouse — open OpenMouse to apply"
+            "Couldn't reach the mouse - open OpenMouse to apply"
         );
         assert_eq!(
             switch_message(None, Some(&game), None, failed, true)
