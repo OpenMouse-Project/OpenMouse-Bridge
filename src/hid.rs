@@ -140,6 +140,8 @@ enum Command {
     List {
         #[serde(rename = "vendorIds")]
         vendor_ids: Vec<u16>,
+        #[serde(default)]
+        usages: Vec<UsageFilter>,
     },
     Open {
         device: String,
@@ -464,15 +466,17 @@ impl HidSession {
         let id = message.id;
         let command = message.command.kind();
         let vendor_count = match &message.command {
-            Command::List { vendor_ids } => Some(vendor_ids.len()),
+            Command::List { vendor_ids, .. } => Some(vendor_ids.len()),
             _ => None,
         };
         let started = Instant::now();
         let outcome = match message.command {
-            Command::List { vendor_ids } => self.list(vendor_ids).map(|devices| Reply {
-                devices: Some(devices),
-                ..Reply::ok(id)
-            }),
+            Command::List { vendor_ids, usages } => {
+                self.list(vendor_ids, usages).map(|devices| Reply {
+                    devices: Some(devices),
+                    ..Reply::ok(id)
+                })
+            }
             Command::Open { device } => self.open(&device).map(|()| Reply::ok(id)),
             Command::Close { device } => self.close(&device).map(|()| Reply::ok(id)),
             Command::Listen { device } => self.listen(&device).map(|()| Reply::ok(id)),
@@ -568,11 +572,19 @@ impl HidSession {
         reply
     }
 
-    fn list(&mut self, vendor_ids: Vec<u16>) -> Result<Vec<DeviceSummary>, String> {
-        if vendor_ids.len() > 256 {
+    fn list(
+        &mut self,
+        vendor_ids: Vec<u16>,
+        usages: Vec<UsageFilter>,
+    ) -> Result<Vec<DeviceSummary>, String> {
+        if vendor_ids.len() > 256 || usages.len() > 16 {
             return Err("too many HID vendor ids were requested".into());
         }
         let vendors: HashSet<u16> = vendor_ids.into_iter().collect();
+        let usages: Vec<UsageFilter> = usages
+            .into_iter()
+            .filter(|usage| usage.usage_page >= VENDOR_DEFINED_USAGE_PAGE)
+            .collect();
         refresh_api(&mut self.api)
             .map_err(|error| format!("could not refresh HID devices: {error}"))?;
 
@@ -581,7 +593,7 @@ impl HidSession {
         let present = self.api.device_list().map(device_group_key).collect();
         self.reconcile_inventory(&present)?;
 
-        if vendors.is_empty() {
+        if vendors.is_empty() && usages.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -589,7 +601,10 @@ impl HidSession {
         let mut by_device = std::collections::BTreeMap::<Vec<u8>, Vec<hidapi::DeviceInfo>>::new();
         let blocked = security_key_paths(&self.api);
         for info in self.api.device_list() {
-            if vendors.contains(&info.vendor_id())
+            if (vendors.contains(&info.vendor_id())
+                || usages
+                    .iter()
+                    .any(|usage| usage.matches(info.usage_page(), info.usage())))
                 && !blocked.contains(info.path())
                 && !is_receiver_child(info.path())
             {
@@ -1455,6 +1470,21 @@ fn enumerated_collections(infos: &[hidapi::DeviceInfo], path: &CString) -> Vec<C
         .collect()
 }
 
+const VENDOR_DEFINED_USAGE_PAGE: u16 = 0xff00;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UsageFilter {
+    pub usage_page: u16,
+    pub usage: Option<u16>,
+}
+
+impl UsageFilter {
+    fn matches(&self, usage_page: u16, usage: u16) -> bool {
+        self.usage_page == usage_page && self.usage.is_none_or(|id| id == usage)
+    }
+}
+
 /// A device filter in the shape OpenMouse passes to
 /// `navigator.hid.requestDevice` (`SUPPORTED_HID_FILTERS`): a device matches
 /// when its vendor and product match and one of its top-level collections has
@@ -1462,7 +1492,7 @@ fn enumerated_collections(infos: &[hidapi::DeviceInfo], path: &CString) -> Vec<C
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct HidFilter {
-    pub vendor_id: u16,
+    pub vendor_id: Option<u16>,
     pub product_id: Option<u16>,
     pub usage_page: Option<u16>,
     pub usage: Option<u16>,
@@ -1470,7 +1500,8 @@ pub(crate) struct HidFilter {
 
 impl HidFilter {
     fn matches_product(&self, vendor_id: u16, product_id: u16) -> bool {
-        self.vendor_id == vendor_id && self.product_id.is_none_or(|id| id == product_id)
+        self.vendor_id.is_none_or(|id| id == vendor_id)
+            && self.product_id.is_none_or(|id| id == product_id)
     }
 
     fn matches_usage(&self, usage_page: u16, usage: u16) -> bool {
@@ -2036,7 +2067,7 @@ mod tests {
     fn a_filter_matches_a_device_by_product_and_any_collection_usage() {
         use super::{DescribedDevice, HidFilter};
         let filter = |product_id, usage_page, usage| HidFilter {
-            vendor_id: 0x3434,
+            vendor_id: Some(0x3434),
             product_id,
             usage_page,
             usage,
@@ -2050,6 +2081,60 @@ mod tests {
         assert!(!filter(None, Some(0xff0a), None).matches_device(&receiver));
         // The usage page and usage must be one collection's.
         assert!(!filter(None, Some(0xffc1), Some(0x02)).matches_device(&receiver));
+    }
+
+    #[test]
+    fn a_list_request_may_carry_usages_and_older_ones_without_still_parse() {
+        use super::{Command, UsageFilter};
+        let with: Command = serde_json::from_str(
+            r#"{"type":"list","vendorIds":[],"usages":[{"usagePage":65376,"usage":97}]}"#,
+        )
+        .expect("parses");
+        let Command::List { usages, .. } = with else {
+            panic!("a list command");
+        };
+        assert_eq!(
+            usages,
+            vec![UsageFilter {
+                usage_page: 0xff60,
+                usage: Some(0x61)
+            }]
+        );
+        let without: Command =
+            serde_json::from_str(r#"{"type":"list","vendorIds":[1]}"#).expect("parses");
+        let Command::List { usages, .. } = without else {
+            panic!("a list command");
+        };
+        assert!(usages.is_empty());
+    }
+
+    #[test]
+    fn a_usage_filter_matches_its_page_and_usage_only() {
+        use super::UsageFilter;
+        let via = UsageFilter {
+            usage_page: 0xff60,
+            usage: Some(0x61),
+        };
+        assert!(via.matches(0xff60, 0x61));
+        assert!(!via.matches(0xff60, 0x62));
+        assert!(!via.matches(0x01, 0x06));
+        let page = UsageFilter {
+            usage_page: 0xff60,
+            usage: None,
+        };
+        assert!(page.matches(0xff60, 0x01));
+    }
+
+    #[test]
+    fn a_filter_without_a_vendor_matches_any_vendors_collection() {
+        use super::{DescribedDevice, HidFilter};
+        let via: HidFilter =
+            serde_json::from_str(r#"{"usagePage":65376,"usage":97}"#).expect("parses");
+        let board =
+            DescribedDevice::for_test("k", 0x7470, 0x0002, "", &[(0x01, 0x06), (0xff60, 0x61)]);
+        let plain = DescribedDevice::for_test("m", 0x7470, 0x0002, "", &[(0x01, 0x06)]);
+        assert!(via.matches_device(&board));
+        assert!(!via.matches_device(&plain));
     }
 
     #[test]
@@ -2412,7 +2497,7 @@ mod tests {
         }
         // Even an empty vendor filter must refresh the inventory and retire
         // the remaining synthetic device, while returning no devices.
-        assert!(session.list(Vec::new()).unwrap().is_empty());
+        assert!(session.list(Vec::new(), Vec::new()).unwrap().is_empty());
         assert!(
             !active_device_registry()
                 .lock()

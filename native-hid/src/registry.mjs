@@ -22,7 +22,19 @@ export async function loadRegistry() {
     import("@openmouse/protocol/drivers/registry"),
     import("@openmouse/protocol/drivers/vendors"),
   ]);
-  return { drivers: DEVICE_DRIVERS, filters: SUPPORTED_HID_FILTERS };
+  try {
+    const [keyboards, keyboardVendors] = await Promise.all([
+      import("@openmouse/keyboard-protocol/drivers/registry"),
+      import("@openmouse/keyboard-protocol/drivers/vendors"),
+    ]);
+    return {
+      drivers: [...DEVICE_DRIVERS, ...keyboards.DEVICE_DRIVERS],
+      filters: [...SUPPORTED_HID_FILTERS, ...keyboardVendors.SUPPORTED_HID_FILTERS],
+    };
+  } catch (error) {
+    console.error(`[native-hid] keyboard registry unavailable: ${error?.message ?? error}`);
+    return { drivers: DEVICE_DRIVERS, filters: SUPPORTED_HID_FILTERS };
+  }
 }
 
 export function brandKey(brand) {

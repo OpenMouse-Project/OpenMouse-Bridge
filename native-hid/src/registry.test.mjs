@@ -66,6 +66,36 @@ test("only paths that declare input reports are listened on", async () => {
   assert.deepEqual(listening, ["notify"]);
 });
 
+test("a path with only unnumbered input keeps its first byte; numbered input still drops the id", async () => {
+  const handles = [];
+  class Handle extends EventEmitter {
+    constructor(path) {
+      super();
+      handles.push([path, this]);
+    }
+    close() {}
+  }
+  const raw = collection(0xff60, 0x61);
+  const device = new DescribedDeviceAdapter(
+    described({
+      paths: [
+        { path: "via", collections: [raw], inputReports: { 0: 32 }, outputReports: { 0: 32 }, featureReports: {} },
+        { path: "notify", collections: [collection(0xff02)], inputReports: { 9: 15 }, outputReports: {}, featureReports: {} },
+      ],
+    }),
+    { Handle },
+  );
+  await device.open();
+  const seen = [];
+  device.addEventListener("inputreport", (event) => seen.push([event.reportId, [...new Uint8Array(event.data.buffer)]]));
+  handles.find(([path]) => path === "via")[1].emit("data", Buffer.from([1, 0, 11, 0]));
+  handles.find(([path]) => path === "notify")[1].emit("data", Buffer.from([9, 5, 6]));
+  assert.deepEqual(seen, [
+    [0, [1, 0, 11, 0]],
+    [9, [5, 6]],
+  ]);
+});
+
 test("a feature report goes only down the path that declares it, padded to its size", async () => {
   const { Handle, log } = fakeHandles();
   const device = new DescribedDeviceAdapter(described(), { Handle });

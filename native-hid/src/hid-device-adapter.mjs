@@ -221,16 +221,17 @@ export class HidDeviceAdapter {
   }
 
   /** @param {Buffer} data */
-  _onData(data) {
+  _onData(data, unnumbered = false) {
     // Some backends prefix numbered reports with the report id on read,
     // some don't (mirrors the same ambiguity the Rust Pulsar driver
     // handles) — there is no fully reliable way to tell from the bytes
     // alone, so report id 0 is assumed when in doubt; drivers here match
     // responses by their own payload content, not strictly by report id.
-    const reportId = data.length > 0 ? data[0] : 0;
-    const payload = data.length > 0 ? data.subarray(1) : data;
+    const withId = !unnumbered && data.length > 0;
+    const reportId = withId ? data[0] : 0;
+    const payload = withId ? data.subarray(1) : data;
     const view = new DataView(Uint8Array.from(payload).buffer);
-    const event = { reportId, data: view };
+    const event = { device: this, reportId, data: view };
     for (const listener of this._listeners) listener(event);
   }
 
@@ -294,6 +295,11 @@ export function candidateDevices(vendorId, hints = {}, list = devices) {
 /** Whether Bridge parsed the path's descriptor: it declares some report. */
 function declaresReports(path) {
   return ["inputReports", "outputReports", "featureReports"].some((kind) => Object.keys(path[kind] ?? {}).length > 0);
+}
+
+function declaresOnlyUnnumberedInput(path) {
+  const ids = Object.keys(path.inputReports ?? {});
+  return ids.length === 1 && ids[0] === "0";
 }
 
 /** A collection only the operating system may read: a standard mouse or
@@ -363,7 +369,7 @@ export class DescribedDeviceAdapter extends HidDeviceAdapter {
         // collection) Windows fails every read, and node-hid gives up on the
         // handle, taking the feature reports down with it.
         if (!declaresReports(path) || Object.keys(path.inputReports ?? {}).length > 0) {
-          device.on("data", this._onData);
+          device.on("data", declaresOnlyUnnumberedInput(path) ? (data) => this._onData(data, true) : this._onData);
         }
         device.on("error", this._onError);
         this._open.push({ path, device });
