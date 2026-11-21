@@ -5,6 +5,13 @@ the version in `Cargo.toml` and the release tag. The release workflow
 publishes the entry as the release notes and in `latest.json` (what Bridge's
 update check shows), and refuses to release a version without one.
 
+## 1.0.3
+
+### New
+
+- Detect VIA keyboards through keyboard-protocol's registry.
+- Welcome screen, better tray placement and installer prompts.
+
 ## 1.0.2
 
 ### New
