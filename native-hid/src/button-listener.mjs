@@ -9,7 +9,7 @@
 //   to the mode it was in, if this helper changed it.
 // stdout: one JSON object per line.
 //   {"event": "ready", "priorMode": "Onboard", "buttons": [1, 2, 3, 4, 5]}
-//   {"event": "buttons", "mask": 16}   — the buttons held right now
+//   {"event": "buttons", "mask": 16}   - the buttons held right now
 //   {"event": "error", "message": "..."}
 //   {"event": "stopped"}
 //

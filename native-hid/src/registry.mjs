@@ -4,8 +4,8 @@
 //
 // Bridge only describes devices matching the registry's SUPPORTED_HID_FILTERS
 // (the filters the panel requests devices with), and a driver is only used on
-// a device its own `supports()` accepts — the same product-id and descriptor
-// checks as in the browser — so nothing outside what OpenMouse itself would
+// a device its own `supports()` accepts - the same product-id and descriptor
+// checks as in the browser - so nothing outside what OpenMouse itself would
 // open is ever written to.
 //
 // The modules are imported lazily: loading the registry pulls in every driver,

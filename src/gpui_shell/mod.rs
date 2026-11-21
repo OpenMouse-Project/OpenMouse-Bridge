@@ -153,6 +153,7 @@ pub fn run() -> Result<()> {
             // environment.
             let show_panel =
                 show_panel || std::env::var_os("OPENMOUSE_BRIDGE_SHOW_WINDOW").is_some();
+            hide_when_unfocused(cx, handle, &view);
             let (tray_commands, mut tray_handle) = match tray::install(cx, handle) {
                 Some((commands, tray)) => (Some(commands), Some(tray)),
                 None => (None, None),
@@ -202,7 +203,23 @@ pub fn run() -> Result<()> {
             } else {
                 // Shown at launch (the first run): beside the tray, not mid-screen.
                 if tray_commands.is_some() {
-                    let _ = cx.update_window(handle, |_, window, _| tray::place(window, None));
+                    // Moving the window sends it messages that re-enter GPUI, so it
+                    // is done from a task once this startup callback has returned.
+                    cx.spawn(async move |cx| {
+                        #[cfg(windows)]
+                        {
+                            let plan = cx
+                                .update_window(handle, |_, window, _| {
+                                    tray::plan_place(window, None)
+                                })
+                                .ok()
+                                .flatten();
+                            tray::apply_move(plan);
+                        }
+                        #[cfg(not(windows))]
+                        let _ = cx.update_window(handle, |_, window, _| tray::place(window, None));
+                    })
+                    .detach();
                 }
                 cx.activate(true);
             }
@@ -312,6 +329,16 @@ pub fn run() -> Result<()> {
                                 cx.background_executor().timer(LAYER_MAP_DELAY).await;
                             }
                         }
+                        #[cfg(windows)]
+                        {
+                            let plan = cx
+                                .update_window(handle, |_, window, _| {
+                                    tray::plan_place(window, anchor)
+                                })
+                                .ok()
+                                .flatten();
+                            tray::apply_move(plan);
+                        }
                         let _ = cx.update_window(handle, |_, window, _| tray::show(window, anchor));
                     }
                     for command in tray_requests {
@@ -376,6 +403,26 @@ fn panel_wanted_after(shown: bool, api_request: bool, commands: &[tray::Command]
     wanted
 }
 
+/// Hides the panel to the tray when a click elsewhere takes its focus, where it
+/// is a popup by the tray (see [`tray::hides_on_blur`]).
+fn hide_when_unfocused(cx: &mut App, handle: AnyWindowHandle, view: &Entity<PanelView>) {
+    let _ = cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |_, cx| {
+            cx.observe_window_activation(window, |panel, window, _| {
+                if !window.is_window_active()
+                    && tray::hides_on_blur()
+                    && !panel.stays_open()
+                    && !tray::always_on_top()
+                {
+                    tracing::debug!("hiding the panel after it lost focus");
+                    tray::hide_on_blur(window);
+                }
+            })
+            .detach();
+        });
+    });
+}
+
 /// Makes the window's close button hide the panel to the tray, or quit when
 /// there is no tray to bring it back from.
 #[cfg(target_os = "linux")]
@@ -431,8 +478,9 @@ fn open_layer_panel(
     };
     let view = view.clone();
     match open_window(options, cx, move |_, _| view) {
-        Ok((handle, _)) => {
+        Ok((handle, view)) => {
             close_hides_or_quits(cx, handle, exit);
+            hide_when_unfocused(cx, handle, &view);
             Some(handle)
         }
         Err(error) => {

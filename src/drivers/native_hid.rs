@@ -2,7 +2,7 @@
 //! that doesn't have a dependency-free native Rust driver. The helper reuses
 //! OpenMouse's own hardware-verified `@openmouse/protocol` WebHID driver
 //! classes through a small adapter, instead of Bridge reimplementing every
-//! vendor's wire protocol from scratch — see `native-hid/README.md`.
+//! vendor's wire protocol from scratch - see `native-hid/README.md`.
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -93,7 +93,7 @@ struct StatusReply {
     battery_percent: Option<f64>,
     battery_state: Option<String>,
     /// The driver's own model name (`MouseStatus.name`), when the driver
-    /// reports one — better than the receiver-level name discovery gets from
+    /// reports one - better than the receiver-level name discovery gets from
     /// the HID descriptor.
     device_name: Option<String>,
     /// The settings currently in the device's onboard memory, when the
@@ -126,7 +126,7 @@ pub struct NativeStatus {
 
 /// `MouseStatus.dpi` is either one number or a per-stage list; the stages
 /// have no reliable "active" marker, so a list collapses to its first
-/// stage — the one most drivers treat as the default.
+/// stage - the one most drivers treat as the default.
 fn coerce_dpi(value: Option<&serde_json::Value>) -> Option<u32> {
     match value? {
         serde_json::Value::Number(number) => number.as_u64().map(|dpi| dpi as u32),
@@ -316,7 +316,7 @@ pub(super) fn run_helper(request: &impl Serialize) -> Result<Option<Vec<u8>>> {
             bundled.display()
         ),
         None => format!(
-            "could not start Node.js to run {} — is Node.js installed and on PATH?",
+            "could not start Node.js to run {} - is Node.js installed and on PATH?",
             script.display()
         ),
     })?;
@@ -352,8 +352,8 @@ pub fn spawn_button_listener(brand: &str) -> Result<Child> {
     })
 }
 
-/// Finds `native-hid/src/apply.mjs` next to the running executable — how a
-/// packaged Bridge release is expected to ship it — falling back to the
+/// Finds `native-hid/src/apply.mjs` next to the running executable - how a
+/// packaged Bridge release is expected to ship it - falling back to the
 /// checkout's own source tree so `cargo run`/`cargo test` work without a
 /// packaging step.
 fn locate_apply_script() -> Result<PathBuf> {
@@ -395,7 +395,7 @@ fn runs_inside(checkout: &Path) -> bool {
 /// Finds the Node.js runtime a packaged Bridge release bundles at
 /// `native-hid/node/` next to the executable (see `.github/workflows/release.yml`).
 /// `None` means no bundled runtime was found, so the caller should fall back
-/// to `node` on `PATH` — the normal case for `cargo run`/`cargo test`, which
+/// to `node` on `PATH` - the normal case for `cargo run`/`cargo test`, which
 /// don't produce a packaged layout.
 fn locate_node_binary() -> Option<PathBuf> {
     let dir = installed_native_hid_dir()?.join("node");

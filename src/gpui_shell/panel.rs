@@ -1,6 +1,11 @@
 //! The tray panel's views: Home, Settings and the Bridge info page.
 
-use std::{sync::mpsc, time::Duration};
+use std::cell::Cell;
+use std::rc::Rc;
+use std::{
+    sync::mpsc,
+    time::{Duration, Instant},
+};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -21,11 +26,107 @@ use tokio::sync::mpsc as tokio_mpsc;
 use super::{ExitFlags, ascii};
 use crate::overlay::Overlay;
 use crate::runtime::{
-    BridgeCommand, UpdateEvent, WINDOW_HEIGHT, WINDOW_WIDTH, notify_natively, open_logs,
-    service_label,
+    BridgeCommand, UpdateEvent, WINDOW_WIDTH, notify_natively, open_logs, service_label,
 };
 
-const OPENMOUSE_URL: &str = "https://control.openmouse.app";
+const OPENMOUSE_URL: &str = "https://control.openmouse.app/?from=bridge";
+
+const SITE_CONNECT_GRACE: Duration = Duration::from_secs(20);
+
+const WELCOME_STEPS: [(&str, &str); 3] = [
+    (
+        "Open OpenMouse",
+        "Click the button below. It opens in your browser.",
+    ),
+    (
+        "Allow the connection",
+        "When your browser asks to connect to Bridge on this computer, choose Forever so it only asks once.",
+    ),
+    (
+        "Plug in your mouse",
+        "It shows up in OpenMouse. Bridge keeps running in the tray, so you can close this window.",
+    ),
+];
+
+const WELCOME_DONE: [&str; 3] = [
+    "Opened in your browser.",
+    "Your browser is connected to Bridge.",
+    "Mouse detected.",
+];
+
+const WELCOME_AUTO_CLOSE: Duration = Duration::from_millis(2500);
+
+const WELCOME_FAILED: &str = "Not connected. In your browser: lock icon, Site settings, Local network access, Allow. Then try again.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StepStatus {
+    Done,
+    Current,
+    Failed,
+    Pending,
+}
+
+fn welcome_progress(
+    opened: bool,
+    page_connected: bool,
+    mouse_present: bool,
+    failed: bool,
+) -> [StepStatus; 3] {
+    let finished = [
+        opened || page_connected,
+        page_connected,
+        page_connected && mouse_present,
+    ];
+    let mut current_found = false;
+    let mut index = 0;
+    finished.map(|done| {
+        let status = if done {
+            StepStatus::Done
+        } else if !current_found {
+            current_found = true;
+            if failed && index == 1 {
+                StepStatus::Failed
+            } else {
+                StepStatus::Current
+            }
+        } else {
+            StepStatus::Pending
+        };
+        index += 1;
+        status
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SiteWait {
+    Idle,
+    Waiting,
+    Connected,
+    TimedOut,
+}
+
+fn opening_notice(connected: bool) -> Option<Notice> {
+    if connected {
+        return None;
+    }
+    Some(Notice {
+        title: "Allow the connection".into(),
+        detail: "Choose Forever when your browser asks.".into(),
+    })
+}
+
+fn site_wait(opened_at: Option<Instant>, connected: bool, now: Instant) -> SiteWait {
+    let Some(opened_at) = opened_at else {
+        return SiteWait::Idle;
+    };
+    if connected {
+        SiteWait::Connected
+    } else if now.duration_since(opened_at) >= SITE_CONNECT_GRACE {
+        SiteWait::TimedOut
+    } else {
+        SiteWait::Waiting
+    }
+}
 
 /// The low-battery alert levels on offer.
 const BATTERY_THRESHOLDS: [u8; 7] = [10, 15, 20, 25, 30, 40, 50];
@@ -55,6 +156,9 @@ fn step_volume(current: u8, up: bool) -> u8 {
 
 /// How many remembered mice Home lists before summarising the rest.
 const HOME_DEVICE_ROWS: usize = 3;
+/// The window never gets smaller or taller than this, in logical points.
+const MIN_HEIGHT: f32 = 200.0;
+const MAX_HEIGHT: f32 = 900.0;
 
 /// Installing the udev rule that lets Bridge open plugged-in mice (Linux).
 enum UdevFix {
@@ -81,29 +185,8 @@ enum View {
     Settings,
     Info,
     WhatsNew,
+    Welcome,
 }
-
-impl View {
-    /// The panel's base height in logical points.
-    fn base_height(self) -> f32 {
-        match self {
-            View::Home => WINDOW_HEIGHT,
-            View::Settings => 600.0,
-            View::Info => 420.0,
-            View::WhatsNew => 480.0,
-        }
-    }
-}
-
-/// Extra height for one more line of content, in logical points.
-const ROW_HEIGHT: f32 = 24.0;
-const NOTE_HEIGHT: f32 = 22.0;
-/// The update card on Home.
-const NOTICE_HEIGHT: f32 = 58.0;
-/// The progress bar under the update card's headline, with its gap.
-const BAR_HEIGHT: f32 = 14.0;
-/// Home's "Updated to …" line after an update.
-const WHATS_NEW_HEIGHT: f32 = 34.0;
 
 pub struct PanelView {
     snapshots: mpsc::Receiver<BridgeSnapshot>,
@@ -113,8 +196,16 @@ pub struct PanelView {
     panel_requests: mpsc::Receiver<()>,
     exit: ExitFlags,
     snapshot: Option<BridgeSnapshot>,
+    site_opened_at: Option<Instant>,
+    resize_bottom: Option<i32>,
+    content_height: Rc<Cell<Option<f32>>>,
+    welcome_opened: bool,
+    welcome_failed: bool,
+    welcome_done_at: Option<Instant>,
     view: View,
     autostart: bool,
+    always_on_top: bool,
+    always_on_top_supported: bool,
     automatic_updates: bool,
     hybrid_mode: bool,
     tray_style: TrayBatteryStyle,
@@ -192,18 +283,6 @@ impl UpdateState {
         matches!(
             self,
             Self::Checking | Self::Downloading(_) | Self::Restarting(_)
-        )
-    }
-
-    /// Worth a card on Home, not only a line in Settings.
-    fn is_notice(&self) -> bool {
-        matches!(
-            self,
-            Self::Available(_)
-                | Self::Downloading(_)
-                | Self::Ready(_)
-                | Self::Restarting(_)
-                | Self::Failed(_)
         )
     }
 
@@ -346,15 +425,25 @@ impl PanelView {
             panel_requests,
             exit,
             snapshot: None,
+            site_opened_at: None,
+            resize_bottom: None,
+            content_height: Rc::new(Cell::new(None)),
+            welcome_opened: false,
+            welcome_failed: false,
+            welcome_done_at: None,
             // A development aid: OPENMOUSE_BRIDGE_START_VIEW=settings|info opens
             // straight onto that view.
             view: match std::env::var("OPENMOUSE_BRIDGE_START_VIEW").as_deref() {
                 Ok("settings") => View::Settings,
                 Ok("info") => View::Info,
                 Ok("whats-new") => View::WhatsNew,
+                Ok("welcome") => View::Welcome,
+                _ if first_run => View::Welcome,
                 _ => View::Home,
             },
             autostart: platform::autostart_enabled(),
+            always_on_top: super::tray::load_always_on_top(),
+            always_on_top_supported: false,
             automatic_updates: false,
             hybrid_mode: true,
             tray_style: TrayBatteryStyle::Glyph,
@@ -443,6 +532,46 @@ impl PanelView {
         } else if self.progress.take().is_some() {
             changed = true;
         }
+        let connected = self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.client_connected);
+        match site_wait(self.site_opened_at, connected, Instant::now()) {
+            SiteWait::Idle | SiteWait::Waiting => {}
+            SiteWait::Connected => {
+                self.site_opened_at = None;
+                self.welcome_failed = false;
+            }
+            SiteWait::TimedOut => {
+                self.site_opened_at = None;
+                if self.view == View::Welcome {
+                    self.welcome_failed = true;
+                    changed = true;
+                } else {
+                    self.present(&Notice {
+                        title: "OpenMouse did not connect".into(),
+                        detail: "Allow local network access in your browser's site settings, then reload.".into(),
+                    });
+                }
+            }
+        }
+        if self.view == View::Welcome {
+            let all_done = self
+                .welcome_statuses()
+                .iter()
+                .all(|status| *status == StepStatus::Done);
+            if !all_done {
+                self.welcome_done_at = None;
+            } else {
+                let since = *self.welcome_done_at.get_or_insert_with(Instant::now);
+                changed = true;
+                if since.elapsed() >= WELCOME_AUTO_CLOSE {
+                    self.view = View::Home;
+                    self.error = None;
+                    self.welcome_done_at = None;
+                }
+            }
+        }
         while let Ok(notice) = self.notices.try_recv() {
             self.present(&notice);
         }
@@ -485,10 +614,49 @@ impl PanelView {
         }
     }
 
+    /// The Welcome screen sends the user to the browser and watches for the
+    /// connection, so it stays up when the panel loses focus.
+    pub fn stays_open(&self) -> bool {
+        self.view == View::Welcome
+    }
+
     fn show_view(&mut self, view: View, cx: &mut Context<Self>) {
         self.view = view;
+        self.content_height.set(None);
         self.error = None;
         cx.notify();
+    }
+
+    fn welcome_statuses(&self) -> [StepStatus; 3] {
+        let snapshot = self.snapshot.as_ref();
+        let connected = snapshot.is_some_and(|snapshot| snapshot.client_connected);
+        let mouse_present = snapshot.is_some_and(|snapshot| {
+            snapshot.known_devices.iter().any(|device| {
+                matches!(
+                    device.state,
+                    KnownDeviceState::Connected | KnownDeviceState::Asleep
+                )
+            })
+        });
+        welcome_progress(
+            self.welcome_opened,
+            connected,
+            mouse_present,
+            self.welcome_failed,
+        )
+    }
+
+    fn open_site(&mut self, announce: bool, cx: &mut Context<Self>) {
+        cx.open_url(OPENMOUSE_URL);
+        self.welcome_failed = false;
+        self.site_opened_at = Some(Instant::now());
+        let connected = self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.client_connected);
+        if announce && let Some(notice) = opening_notice(connected) {
+            self.present(&notice);
+        }
     }
 
     /// Home offers this version's notes: Bridge was updated and they have not
@@ -518,50 +686,6 @@ impl PanelView {
         self.show_view(View::WhatsNew, cx);
     }
 
-    /// The height the current view needs: the base height plus a line for each
-    /// extra remembered mouse, the "more" note, and the update status text.
-    fn desired_height(&self) -> f32 {
-        let mut height = self.view.base_height();
-        match self.view {
-            View::Home => {
-                let known = self
-                    .snapshot
-                    .as_ref()
-                    .map_or(0, |snapshot| snapshot.known_devices.len());
-                height += ROW_HEIGHT * known.min(HOME_DEVICE_ROWS).saturating_sub(1) as f32;
-                if known > HOME_DEVICE_ROWS {
-                    height += NOTE_HEIGHT;
-                }
-                if self.update.is_notice() {
-                    height += NOTICE_HEIGHT;
-                    if self.update.shows_bar() {
-                        height += BAR_HEIGHT;
-                    }
-                    if matches!(self.update, UpdateState::Failed(_)) {
-                        height += NOTE_HEIGHT * 2.0;
-                    }
-                }
-                if native_problem(self.snapshot.as_ref()).is_some() {
-                    height += NOTE_HEIGHT * 2.0;
-                }
-                if hid_blocked(self.snapshot.as_ref()) {
-                    height += NOTICE_HEIGHT + NOTE_HEIGHT * 2.0;
-                    if matches!(self.udev_fix, UdevFix::Failed { .. }) {
-                        height += NOTE_HEIGHT * 2.0;
-                    }
-                }
-                if self.first_run_hint {
-                    height += NOTE_HEIGHT * 2.0;
-                }
-                if self.offers_whats_new() {
-                    height += WHATS_NEW_HEIGHT;
-                }
-            }
-            View::Settings | View::Info | View::WhatsNew => {}
-        }
-        height
-    }
-
     /// Installs the udev rule through `pkexec` on a thread of its own: the
     /// password prompt blocks until the user answers it.
     fn fix_hid_permissions(&mut self, cx: &mut Context<Self>) {
@@ -581,6 +705,12 @@ impl PanelView {
             }
             Err(error) => self.error = Some(error.to_string()),
         }
+        cx.notify();
+    }
+
+    fn set_always_on_top(&mut self, enabled: bool, window: &Window, cx: &mut Context<Self>) {
+        self.always_on_top = enabled;
+        super::tray::set_always_on_top(window, enabled);
         cx.notify();
     }
 
@@ -823,6 +953,9 @@ fn known_device_text(device: &KnownDeviceStatus) -> String {
         if let Some(dpi) = device.dpi {
             parts.push(format!("{dpi} DPI"));
         }
+        if let Some(rate) = device.polling_rate_hz {
+            parts.push(format!("{rate} Hz"));
+        }
     } else {
         parts.push(format!(
             "Last seen {}",
@@ -873,6 +1006,7 @@ impl PanelView {
                     .items_center()
                     .gap_2()
                     .py_1()
+                    .window_control_area(WindowControlArea::Drag)
                     .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
                     .child(div().size(px(8.)).flex_none().rounded_full().bg(accent))
                     .child(
@@ -1141,9 +1275,7 @@ impl PanelView {
                         .primary()
                         .compact()
                         .label("Open OpenMouse")
-                        .on_click(cx.listener(|_, _, _, cx| {
-                            cx.open_url(OPENMOUSE_URL);
-                        })),
+                        .on_click(cx.listener(|this, _, _, cx| this.open_site(true, cx))),
                 )
                 .child(
                     Button::new("restart")
@@ -1264,6 +1396,16 @@ impl PanelView {
                                 this.set_autostart(*enabled, cx);
                             })),
                     ))
+                    .children(self.always_on_top_supported.then(|| {
+                        switch_row(
+                            "Always on top",
+                            Switch::new("always-on-top")
+                                .checked(self.always_on_top)
+                                .on_change(cx.listener(|this, enabled: &bool, window, cx| {
+                                    this.set_always_on_top(*enabled, window, cx);
+                                })),
+                        )
+                    }))
                     .child(switch_row(
                         "Hybrid mode",
                         Switch::new("hybrid-mode")
@@ -1567,6 +1709,183 @@ impl PanelView {
             .child(self.title_bar("What's new", true, false, accent, muted, cx))
             .child(notes)
     }
+
+    fn welcome(&self, muted: Hsla, accent: Hsla, cx: &mut Context<Self>) -> Div {
+        let on_accent = cx.theme().primary_foreground;
+        let danger = cx.theme().danger;
+        let foreground = cx.theme().foreground;
+        let line = Hsla { a: 0.35, ..muted };
+        let statuses = self.welcome_statuses();
+        let all_done = statuses.iter().all(|status| *status == StepStatus::Done);
+        let failed = statuses.contains(&StepStatus::Failed);
+        let mut steps = div().flex().flex_col();
+        for (index, ((heading, detail), status)) in WELCOME_STEPS.iter().zip(statuses).enumerate() {
+            let last = index + 1 == WELCOME_STEPS.len();
+            let badge = div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD);
+            let marker = div()
+                .size_6()
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center();
+            let marker = match status {
+                StepStatus::Done => marker.child(
+                    badge
+                        .bg(accent)
+                        .text_color(on_accent)
+                        .child("\u{2713}")
+                        .with_animation(
+                            SharedString::from(format!("welcome-done-{index}")),
+                            Animation::new(Duration::from_millis(420)),
+                            |badge, delta| {
+                                let size = if delta < 0.6 {
+                                    14.0 + delta / 0.6 * 13.0
+                                } else {
+                                    27.0 - (delta - 0.6) / 0.4 * 3.0
+                                };
+                                badge.size(px(size)).opacity((0.4 + delta).min(1.0))
+                            },
+                        ),
+                ),
+                StepStatus::Current => marker.child(
+                    badge
+                        .size_6()
+                        .bg(accent)
+                        .text_color(on_accent)
+                        .child(format!("{}", index + 1))
+                        .with_animation(
+                            SharedString::from(format!("welcome-current-{index}")),
+                            Animation::new(Duration::from_millis(1400)).repeat(),
+                            |badge, delta| {
+                                let wave = if delta < 0.5 {
+                                    delta * 2.0
+                                } else {
+                                    2.0 - delta * 2.0
+                                };
+                                badge.opacity(0.55 + 0.45 * wave)
+                            },
+                        ),
+                ),
+                StepStatus::Failed => {
+                    marker.child(badge.size_6().bg(danger).text_color(on_accent).child("!"))
+                }
+                StepStatus::Pending => marker.child(
+                    badge
+                        .size_6()
+                        .border_1()
+                        .border_color(muted)
+                        .text_color(muted)
+                        .child(format!("{}", index + 1)),
+                ),
+            };
+            let mut rail = div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .w_6()
+                .flex_none()
+                .child(marker);
+            if !last {
+                rail = rail.child(
+                    div()
+                        .w(px(2.0))
+                        .flex_1()
+                        .min_h(px(10.0))
+                        .mt_1()
+                        .rounded_full()
+                        .bg(if status == StepStatus::Done {
+                            accent
+                        } else {
+                            line
+                        }),
+                );
+            }
+            let (heading_color, text_color, text) = match status {
+                StepStatus::Done => (foreground, muted, WELCOME_DONE[index]),
+                StepStatus::Current => (accent, muted, *detail),
+                StepStatus::Failed => (danger, danger, WELCOME_FAILED),
+                StepStatus::Pending => (muted, muted, *detail),
+            };
+            let mut row = div()
+                .flex()
+                .flex_row()
+                .items_stretch()
+                .gap_3()
+                .child(rail)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(heading_color)
+                                .child(*heading),
+                        )
+                        .child(div().text_xs().text_color(text_color).child(text)),
+                );
+            if !last {
+                row = row.pb_4();
+            }
+            steps = steps.child(row);
+        }
+        let intro = if all_done {
+            "All set. Bridge is connected and sees your mouse."
+        } else {
+            "Bridge lets OpenMouse in your browser talk to your mouse. Three quick steps:"
+        };
+        let mut buttons = div().flex().flex_row().gap_2();
+        buttons = if all_done {
+            buttons.child(
+                Button::new("welcome-done")
+                    .primary()
+                    .label("Done")
+                    .on_click(cx.listener(|this, _, _, cx| this.show_view(View::Home, cx))),
+            )
+        } else {
+            buttons
+                .child(
+                    Button::new("welcome-open")
+                        .primary()
+                        .label(if failed {
+                            "Try again"
+                        } else {
+                            "Open OpenMouse"
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.welcome_opened = true;
+                            this.open_site(false, cx);
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("welcome-skip")
+                        .label("Skip")
+                        .on_click(cx.listener(|this, _, _, cx| this.show_view(View::Home, cx))),
+                )
+        };
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .p_4()
+            .gap_4()
+            .child(self.title_bar("Welcome to Bridge", false, false, accent, muted, cx))
+            .child(div().text_sm().text_color(muted).child(intro))
+            .child(steps)
+            .child(div().flex_1())
+            .child(buttons)
+    }
 }
 
 impl Render for PanelView {
@@ -1586,18 +1905,33 @@ impl Render for PanelView {
             a: 0.35,
             ..theme.sidebar
         };
-        // Keep the window as tall as its content so nothing is clipped.
-        let desired = self.desired_height();
+        // Fit the window to its content: the height measured while drawing the
+        // last frame, so nothing is clipped and nothing is left empty.
+        self.always_on_top_supported = super::tray::always_on_top_supported(window);
+        let current = window.viewport_size().height.as_f32();
+        let desired = self.content_height.get().map_or(current, |height| {
+            height.ceil().clamp(MIN_HEIGHT, MAX_HEIGHT)
+        });
         if (window.viewport_size().height.as_f32() - desired).abs() > 1.0 {
+            if self.resize_bottom.is_none() {
+                self.resize_bottom = super::tray::bottom_edge(window);
+            }
             window.resize(size(px(WINDOW_WIDTH), px(desired)));
+            if let Some(bottom) = self.resize_bottom {
+                super::tray::set_bottom_edge(window, bottom, desired);
+            }
             super::tray::keep_on_screen(window, desired);
+        } else {
+            self.resize_bottom = None;
         }
         let field = self.field.element(window, cx);
+        let measured = self.content_height.clone();
         let content = match self.view {
             View::Home => self.home(muted, accent, line, fill, cx),
             View::Settings => self.settings(muted, accent, line, fill, danger, cx),
             View::Info => self.info(muted, accent, line, fill, cx),
             View::WhatsNew => self.whats_new(muted, accent, cx),
+            View::Welcome => self.welcome(muted, accent, cx),
         };
         // The ASCII field sits behind the content; the window's own Root paints
         // the background, so this shell stays clear.
@@ -1617,7 +1951,25 @@ impl Render for PanelView {
                 }
             }))
             .child(field)
-            .child(content)
+            .child(
+                div().relative().w_full().child(content).child(
+                    canvas(
+                        move |bounds, window, _| {
+                            let height = bounds.size.height.as_f32();
+                            measured.set(Some(height));
+                            if (window.viewport_size().height.as_f32() - height.ceil()).abs() > 1.0
+                            {
+                                window.request_animation_frame();
+                            }
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full(),
+                ),
+            )
     }
 }
 
@@ -1625,8 +1977,100 @@ impl Render for PanelView {
 mod tests {
     // Not `use super::*`: that pulls in GPUI's own `test` macro, which shadows
     // `#[test]`.
-    use super::{UpdateState, offered_notes, step_threshold, step_volume};
+    use super::{
+        SITE_CONNECT_GRACE, SiteWait, StepStatus, UpdateState, known_device_text, offered_notes,
+        opening_notice, site_wait, step_threshold, step_volume, welcome_progress,
+    };
     use crate::runtime::UpdateEvent;
+    use openmouse_bridge::service::{KnownDeviceState, KnownDeviceStatus};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_page_that_never_connects_is_reported_after_the_grace_period() {
+        let opened = Instant::now();
+        assert_eq!(site_wait(None, false, opened), SiteWait::Idle);
+        assert_eq!(site_wait(Some(opened), false, opened), SiteWait::Waiting);
+        let almost = opened + SITE_CONNECT_GRACE - Duration::from_secs(1);
+        assert_eq!(site_wait(Some(opened), false, almost), SiteWait::Waiting);
+        let late = opened + SITE_CONNECT_GRACE;
+        assert_eq!(site_wait(Some(opened), false, late), SiteWait::TimedOut);
+    }
+
+    #[test]
+    fn the_welcome_checklist_advances_one_step_at_a_time() {
+        use StepStatus::{Current, Done, Pending};
+        assert_eq!(
+            welcome_progress(false, false, true, false),
+            [Current, Pending, Pending]
+        );
+        assert_eq!(
+            welcome_progress(true, false, true, false),
+            [Done, Current, Pending]
+        );
+        assert_eq!(
+            welcome_progress(true, true, false, false),
+            [Done, Done, Current]
+        );
+        assert_eq!(
+            welcome_progress(true, true, true, false),
+            [Done, Done, Done]
+        );
+    }
+
+    #[test]
+    fn a_page_that_connects_completes_the_first_two_steps_even_if_the_button_was_not_used() {
+        use StepStatus::{Current, Done};
+        assert_eq!(
+            welcome_progress(false, true, false, false),
+            [Done, Done, Current]
+        );
+    }
+
+    #[test]
+    fn a_timeout_fails_the_connection_step_only_while_it_is_the_current_one() {
+        use StepStatus::{Current, Done, Failed, Pending};
+        assert_eq!(
+            welcome_progress(true, false, false, true),
+            [Done, Failed, Pending]
+        );
+        assert_eq!(
+            welcome_progress(false, false, false, true),
+            [Current, Pending, Pending]
+        );
+        assert_eq!(
+            welcome_progress(true, true, false, true),
+            [Done, Done, Current]
+        );
+    }
+
+    #[test]
+    fn the_welcome_steps_cover_opening_the_site_and_the_permission() {
+        let text: String = super::WELCOME_STEPS
+            .iter()
+            .map(|(heading, detail)| format!("{heading} {detail}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("Open OpenMouse"));
+        assert!(text.contains("Forever"));
+    }
+
+    #[test]
+    fn opening_the_site_for_the_first_time_says_to_choose_forever() {
+        let notice = opening_notice(false).expect("a notice before any page has connected");
+        assert!(notice.detail.contains("Forever"));
+        assert!(
+            opening_notice(true).is_none(),
+            "nothing to say once a page is connected"
+        );
+    }
+
+    #[test]
+    fn a_page_that_connects_in_time_cancels_the_wait() {
+        let opened = Instant::now();
+        assert_eq!(site_wait(Some(opened), true, opened), SiteWait::Connected);
+        let late = opened + SITE_CONNECT_GRACE * 2;
+        assert_eq!(site_wait(Some(opened), true, late), SiteWait::Connected);
+    }
 
     #[test]
     fn the_alert_level_steps_along_the_offered_list() {
@@ -1674,6 +2118,25 @@ mod tests {
     }
 
     #[test]
+    fn a_connected_mouse_shows_battery_dpi_and_polling_rate() {
+        let mut device = KnownDeviceStatus {
+            id: "Logitech:PRO X3 SUPERSTRIKE".into(),
+            name: "PRO X3 SUPERSTRIKE".into(),
+            connected: true,
+            state: KnownDeviceState::Connected,
+            last_seen_seconds_ago: 0,
+            percent: Some(73),
+            charging: Some(false),
+            dpi: Some(1600),
+            polling_rate_hz: Some(4000),
+            switch_mode: None,
+        };
+        assert_eq!(known_device_text(&device), "73% · 1600 DPI · 4000 Hz");
+        device.polling_rate_hz = None;
+        assert_eq!(known_device_text(&device), "73% · 1600 DPI");
+    }
+
+    #[test]
     fn only_work_in_progress_is_busy() {
         assert!(state(UpdateEvent::Checking).busy());
         assert!(state(UpdateEvent::Downloading("2.0.0".into())).busy());
@@ -1684,15 +2147,9 @@ mod tests {
     }
 
     #[test]
-    fn home_gets_a_card_for_updates_that_need_attention_only() {
-        assert!(!UpdateState::Idle.is_notice());
-        assert!(!state(UpdateEvent::Checking).is_notice());
-        assert!(!state(UpdateEvent::UpToDate).is_notice());
-        assert!(state(UpdateEvent::Downloading("2.0.0".into())).is_notice());
-        assert!(state(UpdateEvent::Restarting("2.0.0".into())).is_notice());
-        assert!(state(UpdateEvent::Failed("no network".into())).is_notice());
+    fn a_ready_update_is_not_busy_and_has_no_bar() {
         let ready = state(UpdateEvent::Ready("2.0.0".into()));
-        assert!(ready.is_notice() && !ready.busy() && !ready.shows_bar());
+        assert!(!ready.busy() && !ready.shows_bar());
         assert_eq!(
             ready.headline(None).as_deref(),
             Some("Update 2.0.0 is ready")

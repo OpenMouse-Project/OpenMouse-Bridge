@@ -107,7 +107,7 @@ pub fn remaining_text(minutes: u32) -> String {
     }
 }
 
-/// `Device — 87% · Charging · full in 45 m`.
+/// `Device - 87% · Charging · full in 45 m`.
 pub fn tooltip(battery: &TrayBattery) -> String {
     let status = match (battery.charging, battery.stale) {
         (true, _) => " · Charging",
@@ -123,10 +123,10 @@ pub fn tooltip(battery: &TrayBattery) -> String {
     });
     let text = match estimate {
         Some(estimate) => format!(
-            "{} — {}%{status} · {estimate}",
+            "{} - {}%{status} · {estimate}",
             battery.device_name, battery.percent
         ),
-        None => format!("{} — {}%{status}", battery.device_name, battery.percent),
+        None => format!("{} - {}%{status}", battery.device_name, battery.percent),
     };
     text.chars().take(TOOLTIP_CHARS).collect()
 }
@@ -201,18 +201,18 @@ mod tests {
 
     #[test]
     fn the_tooltip_spells_out_the_state() {
-        assert_eq!(tooltip(&tray(87, false, false, None)), "Mouse — 87%");
+        assert_eq!(tooltip(&tray(87, false, false, None)), "Mouse - 87%");
         assert_eq!(
             tooltip(&tray(87, true, false, Some(45))),
-            "Mouse — 87% · Charging · full in 45 m"
+            "Mouse - 87% · Charging · full in 45 m"
         );
         assert_eq!(
             tooltip(&tray(40, false, false, Some(150))),
-            "Mouse — 40% · 2 h 30 m left"
+            "Mouse - 40% · 2 h 30 m left"
         );
         assert_eq!(
             tooltip(&tray(40, false, true, None)),
-            "Mouse — 40% · Not updating"
+            "Mouse - 40% · Not updating"
         );
     }
 

@@ -10,8 +10,9 @@ use windows_sys::Win32::{
         OUT_TT_PRECIS, SelectObject,
     },
     System::Registry::{
-        HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegDeleteKeyValueW,
-        RegGetValueW, RegSetKeyValueW,
+        HKEY_CURRENT_USER, KEY_READ, REG_DWORD, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
+        RegCloseKey, RegDeleteKeyValueW, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW,
+        RegSetKeyValueW,
     },
     UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON},
 };
@@ -84,11 +85,11 @@ pub fn battery_glyph(percent: u8, charging: bool) -> u32 {
 }
 
 /// Renders the tray battery display as a square `size` × `size` RGBA
-/// buffer, tinted with `ink` — the Windows 11 taskbar only renders square
+/// buffer, tinted with `ink` - the Windows 11 taskbar only renders square
 /// tray icons faithfully. The `style` picks what fills the square: the
 /// Segoe Fluent battery glyph for the level (the charging variant with the
 /// bolt when `charging`), or the percentage number in bold UI text (the
-/// `%` is left off — at tray sizes it would shrink the digits to a
+/// `%` is left off - at tray sizes it would shrink the digits to a
 /// squint; the tooltip spells the full `NN%` out). Returns the buffer with
 /// its width and height. `Segoe Fluent Icons` ships with Windows 11;
 /// `Segoe MDL2 Assets` carries the same glyphs on Windows 10.
@@ -206,7 +207,7 @@ fn compose_battery_display(
     // Otherwise the digits fill it.
     if label.is_empty() {
         // A landscape glyph in a square icon: fitting its width to all but
-        // 1px of the canvas — the footprint the old square renderer used —
+        // 1px of the canvas - the footprint the old square renderer used -
         // is the largest it can be, and the height lands near half.
         let battery = fit_and_rasterize(
             dc,
@@ -231,7 +232,7 @@ fn compose_battery_display(
         return Ok((canvas.rgba, height, height));
     }
 
-    // The digits are drawn as tall as the square allows — a 2px margin —
+    // The digits are drawn as tall as the square allows - a 2px margin -
     // and squeezed proportionally when the string is wider than tall
     // ("100" is, at every size that matters).
     let mut target = height.saturating_sub(4).max(8);
@@ -267,7 +268,7 @@ struct LabelRaster {
 
 /// Rasterizes the label into one tight coverage bitmap in a bold UI face,
 /// sized so a digit stands `target` pixels tall. Characters are placed by
-/// the font's own advances and side bearings, top-aligned — digits and
+/// the font's own advances and side bearings, top-aligned - digits and
 /// `%` share the cap height, so the row lines up.
 fn rasterize_label(dc: HDC, label: &[u16], family: &[u16], target: u32) -> Option<LabelRaster> {
     if label.is_empty() {
@@ -399,8 +400,8 @@ impl Canvas {
 }
 
 /// Fits the font so the battery glyph's visible bounds span `target`
-/// pixels wide — the right fit for a landscape glyph in a square icon (the
-/// fit loop accepts within a pixel) — then rasterizes the glyph as an
+/// pixels wide - the right fit for a landscape glyph in a square icon (the
+/// fit loop accepts within a pixel) - then rasterizes the glyph as an
 /// 8-bit coverage bitmap. `None` when the font or glyph is missing.
 fn fit_and_rasterize(
     dc: HDC,
@@ -461,13 +462,13 @@ fn fit_and_rasterize(
 /// Rasterizes the glyph as an 8-bit grayscale coverage bitmap
 /// (`GGO_GRAY8_BITMAP`): GDI's own anti-aliased glyph raster, no drawing
 /// surface involved. GDI writes the bitmap's *actual* bounds back into
-/// `metrics` — which can come back a pixel wider than `GGO_METRICS`
+/// `metrics` - which can come back a pixel wider than `GGO_METRICS`
 /// reported (the anti-aliased edge column), so the caller must lay the
 /// buffer out by the written-back values or every row skews.
 fn glyph_bitmap(dc: HDC, codepoint: u32, metrics: &mut GLYPHMETRICS) -> Option<Vec<u8>> {
     // SAFETY: `dc` is a live DC with a font selected; the metrics and
     // matrix structs are valid for the call and the buffer is sized to hold
-    // the reported black box (rows are DWORD-aligned) plus slack — GDI
+    // the reported black box (rows are DWORD-aligned) plus slack - GDI
     // rejects an exact-size buffer for some glyphs, asking for a few bytes
     // more than stride × rows.
     unsafe {
@@ -585,6 +586,93 @@ pub fn set_autostart(enabled: bool) -> Result<()> {
     Err(registry_error(result)).context("Windows rejected the autostart change")
 }
 
+const NOTIFY_ICONS_SUBKEY: &str = r"Control Panel\NotifyIconSettings";
+
+/// Asks Windows 11 to show Bridge's tray icon on the taskbar instead of in the
+/// hidden-icons flyout. True once the icon's entry has been found, false while
+/// Windows has not listed it yet. The caller does this once per executable so a
+/// later choice in Settings sticks.
+pub fn promote_tray_icon() -> bool {
+    let Ok(executable) = env::current_exe() else {
+        return true;
+    };
+    let executable = executable.to_string_lossy().to_lowercase();
+    let root = wide(NOTIFY_ICONS_SUBKEY);
+    let mut key = null_mut();
+    if unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, root.as_ptr(), 0, KEY_READ, &mut key) }
+        != ERROR_SUCCESS
+    {
+        return true;
+    }
+    let mut found = false;
+    let mut index = 0;
+    loop {
+        let mut name = [0u16; 256];
+        let mut length = name.len() as u32;
+        let status = unsafe {
+            RegEnumKeyExW(
+                key,
+                index,
+                name.as_mut_ptr(),
+                &mut length,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+            )
+        };
+        if status != ERROR_SUCCESS {
+            break;
+        }
+        index += 1;
+        let entry = format!(
+            "{NOTIFY_ICONS_SUBKEY}\\{}",
+            String::from_utf16_lossy(&name[..length as usize])
+        );
+        if notify_icon_path(&entry).is_some_and(|path| path.to_lowercase() == executable) {
+            found = true;
+            let subkey = wide(&entry);
+            let value_name = wide("IsPromoted");
+            let promoted = 1u32;
+            unsafe {
+                RegSetKeyValueW(
+                    HKEY_CURRENT_USER,
+                    subkey.as_ptr(),
+                    value_name.as_ptr(),
+                    REG_DWORD,
+                    (&promoted as *const u32).cast(),
+                    size_of::<u32>() as u32,
+                );
+            }
+        }
+    }
+    unsafe { RegCloseKey(key) };
+    found
+}
+
+fn notify_icon_path(entry: &str) -> Option<String> {
+    let subkey = wide(entry);
+    let value_name = wide("ExecutablePath");
+    let mut buffer = [0u16; 1024];
+    let mut byte_count = std::mem::size_of_val(&buffer) as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            value_name.as_ptr(),
+            RRF_RT_REG_SZ,
+            null_mut(),
+            buffer.as_mut_ptr().cast(),
+            &mut byte_count,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return None;
+    }
+    let length = (byte_count as usize / size_of::<u16>()).saturating_sub(1);
+    Some(String::from_utf16_lossy(&buffer[..length]))
+}
+
 fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
     value.as_ref().encode_wide().chain(Some(0)).collect()
 }
@@ -627,7 +715,7 @@ mod tests {
             assert_eq!(rgba.len(), (size * size * 4) as usize);
             let coverage = |x: u32, y: u32| rgba[((y * size + x) * 4 + 3) as usize];
             // The glyph's visible bounds fill the canvas: across the
-            // middle row, the covered span (first to last covered pixel —
+            // middle row, the covered span (first to last covered pixel -
             // the battery's body-to-nub gap doesn't count against it) is
             // at most two blank columns short of the full width.
             let row = size / 2;
