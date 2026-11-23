@@ -2006,22 +2006,34 @@ impl Drop for PollGuard {
 /// One battery poll at a time: a scan-triggered poll skips when the timed one
 /// is already running, and the reverse.
 async fn poll_batteries(service: BridgeService) {
-    if service.battery_polling.swap(true, Ordering::AcqRel) {
+    let flag = Arc::clone(&service.battery_polling);
+    run_one_poll(&flag, BATTERY_POLL_TIMEOUT, poll_batteries_once(service)).await;
+}
+
+/// Runs `poll` unless one is already running, for at most `limit`. A read
+/// that never returns would otherwise leave the flag set for the life of the
+/// process and every later poll would skip silently. Dropping the poll here
+/// clears the flag through the guard, so the next one runs.
+async fn run_one_poll(
+    flag: &Arc<AtomicBool>,
+    limit: Duration,
+    poll: impl std::future::Future<Output = ()>,
+) {
+    if flag.swap(true, Ordering::AcqRel) {
         return;
     }
-    let _guard = PollGuard(Arc::clone(&service.battery_polling));
-    // A read that never returns would otherwise leave the flag set for the
-    // life of the process and every later poll would skip silently. Dropping
-    // the poll here clears the flag through the guard, so the next one runs.
-    if tokio::time::timeout(BATTERY_POLL_TIMEOUT, poll_batteries_once(service))
-        .await
-        .is_err()
-    {
+    let _guard = PollGuard(Arc::clone(flag));
+    if !finishes_within(limit, poll).await {
         tracing::warn!(
-            timeout_secs = BATTERY_POLL_TIMEOUT.as_secs(),
+            timeout_secs = limit.as_secs(),
             "The battery poll did not finish in time and was abandoned"
         );
     }
+}
+
+/// Runs `poll` for at most `limit`; false when it was abandoned.
+async fn finishes_within(limit: Duration, poll: impl std::future::Future<Output = ()>) -> bool {
+    tokio::time::timeout(limit, poll).await.is_ok()
 }
 
 async fn poll_batteries_once(service: BridgeService) {
@@ -2345,6 +2357,46 @@ mod tests {
         drop(session);
         assert_eq!(snapshot.native_automation_error, None);
         assert_eq!(snapshot.pending_native_restores, 0);
+    }
+
+    #[tokio::test]
+    async fn a_poll_that_never_returns_is_abandoned_and_the_next_poll_runs() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let limit = Duration::from_millis(50);
+        run_one_poll(&flag, limit, std::future::pending()).await;
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "an abandoned poll must clear the flag"
+        );
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let marker = Arc::clone(&ran);
+        run_one_poll(&flag, limit, async move {
+            marker.store(true, Ordering::Release);
+        })
+        .await;
+        assert!(ran.load(Ordering::Acquire), "the next poll must run");
+        assert!(!flag.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn a_poll_is_skipped_while_another_is_running() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let ran = Arc::new(AtomicBool::new(false));
+        let marker = Arc::clone(&ran);
+        run_one_poll(&flag, Duration::from_millis(50), async move {
+            marker.store(true, Ordering::Release);
+        })
+        .await;
+        assert!(!ran.load(Ordering::Acquire));
+        // The running poll's flag is not the skipped poll's to clear.
+        assert!(flag.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn a_poll_inside_the_limit_reports_that_it_finished() {
+        assert!(finishes_within(Duration::from_secs(5), async {}).await);
+        assert!(!finishes_within(Duration::from_millis(30), std::future::pending()).await);
     }
 
     #[tokio::test]
