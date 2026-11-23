@@ -2110,6 +2110,40 @@ impl DescribedDevice {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_new_session_waits_for_an_in_flight_descriptor_read() {
+        use std::sync::atomic::AtomicBool;
+        let _serial = crate::drivers::TEST_NATIVE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let read = super::SESSION_GATE.read().unwrap();
+        let started = std::sync::Arc::new(AtomicBool::new(false));
+        let registered = std::sync::Arc::new(AtomicBool::new(false));
+        let session = {
+            let (started, registered) = (started.clone(), registered.clone());
+            std::thread::spawn(move || {
+                started.store(true, super::Ordering::Release);
+                let guard = super::ActiveSessionGuard::new();
+                registered.store(true, super::Ordering::Release);
+                guard
+            })
+        };
+        while !started.load(super::Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        // The read is still in flight, so the session has not registered and
+        // a reader that checks now would still be allowed to open.
+        assert!(!registered.load(super::Ordering::Acquire));
+        assert!(!super::client_session_active());
+        drop(read);
+        let guard = session.join().unwrap();
+        assert!(registered.load(super::Ordering::Acquire));
+        assert!(super::client_session_active());
+        drop(guard);
+        assert!(!super::client_session_active());
+    }
+
+    #[test]
     fn a_filter_matches_a_device_by_product_and_any_collection_usage() {
         use super::{DescribedDevice, HidFilter};
         let filter = |product_id, usage_page, usage| HidFilter {

@@ -351,7 +351,7 @@ pub fn apply_profile(profile: &ApplicationProfile) -> Result<bool> {
         .next()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let mut access = device_access();
+    let mut access = device_access_within(DEVICE_ACCESS_WAIT)?;
     ensure_native_ownership()?;
     access.invalidate(
         &brand,
@@ -392,7 +392,12 @@ pub(crate) fn reconcile_automatic(
     automation: &mut automation::NativeAutomation,
     desired: Option<&ApplicationProfile>,
 ) -> Result<Reconciled> {
-    let access = device_access();
+    let access = match device_access_within(DEVICE_ACCESS_WAIT) {
+        Ok(access) => access,
+        // A stuck native call holds the lock: leave the automation state
+        // alone and try again on the next pass.
+        Err(_) => return Ok(Reconciled::Deferred),
+    };
     automation.observe_manual_intent(&access);
     if crate::hid::client_session_active() {
         return Ok(Reconciled::Deferred);
@@ -453,7 +458,7 @@ fn write_settings_held(
 /// (e.g. asleep or disconnected).
 pub fn read_status(device_id: &str) -> Result<Option<NativeStatus>> {
     let brand = device_id.split(':').next().unwrap_or_default();
-    let _access = device_access();
+    let _access = device_access_within(DEVICE_ACCESS_WAIT)?;
     ensure_native_ownership()?;
     if brand.eq_ignore_ascii_case(pulsar::BRAND) {
         return pulsar::read_status();
@@ -472,7 +477,7 @@ pub fn read_status(device_id: &str) -> Result<Option<NativeStatus>> {
 /// local Bridge. Native-only devices use this path when WebHID cannot access
 /// their protected configuration interface.
 pub fn apply_settings(brand: &str, dpi: Option<u32>, polling_rate_hz: Option<u32>) -> Result<bool> {
-    let mut access = device_access();
+    let mut access = device_access_within(DEVICE_ACCESS_WAIT)?;
     ensure_native_ownership()?;
     access.invalidate(brand, dpi.is_some(), polling_rate_hz.is_some())?;
     native_hid::apply_settings(
@@ -578,6 +583,36 @@ mod tests {
                 )?))
             }),
         )
+    }
+
+    #[test]
+    fn a_bounded_wait_for_device_access_gives_up_while_it_is_held() {
+        let _serial = TEST_NATIVE.lock().unwrap_or_else(|e| e.into_inner());
+        let wait = std::time::Duration::from_millis(120);
+        {
+            let _held = device_access();
+            let error = device_access_within(wait).err().expect("the lock is held");
+            let kind = error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind);
+            // WouldBlock reads as busy, so the poll does not mark the mouse asleep.
+            assert_eq!(kind, Some(std::io::ErrorKind::WouldBlock));
+        }
+        assert!(device_access_within(wait).is_ok());
+    }
+
+    #[test]
+    fn a_bounded_wait_gets_the_lock_when_it_is_released_in_time() {
+        let _serial = TEST_NATIVE.lock().unwrap_or_else(|e| e.into_inner());
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let releaser = std::thread::spawn(move || {
+            let _held = device_access();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        });
+        locked_rx.recv().unwrap();
+        assert!(device_access_within(std::time::Duration::from_secs(5)).is_ok());
+        releaser.join().unwrap();
     }
 
     #[test]
