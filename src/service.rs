@@ -108,6 +108,10 @@ const BATTERY_POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// How often the HID bus is listed to see which mice are plugged in. One scan
 /// is about 5 ms and opens no device, so this costs well under 0.1% of a core.
+/// How long one battery poll may run before it is abandoned. A poll covers
+/// every remembered mouse at up to the helper's own timeout each, so this is
+/// well past any healthy poll.
+const BATTERY_POLL_TIMEOUT: Duration = BATTERY_POLL_INTERVAL;
 const DEVICE_SCAN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How often an asleep mouse is read again, so it shows as connected soon
@@ -1540,6 +1544,9 @@ impl BridgeService {
     /// low-battery notification. Polling pauses while the control panel holds
     /// a HID session, so Bridge never talks to a mouse mid-session.
     pub fn start_battery_monitor(&self) {
+        // The resume watch used to start with the first panel session, so a
+        // Bridge nobody had opened the panel on never noticed it had slept.
+        crate::hid::start_resume_watch();
         let service = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(BATTERY_POLL_INTERVAL);
@@ -1562,8 +1569,13 @@ impl BridgeService {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut previous: Option<HashSet<String>> = None;
             let mut last_recheck = Instant::now();
+            let mut resume_seen = crate::hid::resume_generation();
             loop {
                 interval.tick().await;
+                // After a suspend the mice re-enumerate and their readings
+                // are stale, so read again instead of waiting for the timer.
+                let resume_generation = crate::hid::resume_generation();
+                let resumed = resume_generation != resume_seen;
                 let detected = tokio::task::spawn_blocking(drivers::detect_mice)
                     .await
                     .unwrap_or_default();
@@ -1594,7 +1606,8 @@ impl BridgeService {
                 if service.battery_polling.load(Ordering::Acquire) {
                     continue;
                 }
-                if scan_wants_read(previous.as_ref(), &ids, have_reading) || recheck {
+                if scan_wants_read(previous.as_ref(), &ids, have_reading) || recheck || resumed {
+                    resume_seen = resume_generation;
                     last_recheck = Instant::now();
                     tokio::spawn(poll_batteries(service.clone()));
                 }
@@ -1997,10 +2010,35 @@ async fn poll_batteries(service: BridgeService) {
         return;
     }
     let _guard = PollGuard(Arc::clone(&service.battery_polling));
-    poll_batteries_once(service).await;
+    // A read that never returns would otherwise leave the flag set for the
+    // life of the process and every later poll would skip silently. Dropping
+    // the poll here clears the flag through the guard, so the next one runs.
+    if tokio::time::timeout(BATTERY_POLL_TIMEOUT, poll_batteries_once(service))
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            timeout_secs = BATTERY_POLL_TIMEOUT.as_secs(),
+            "The battery poll did not finish in time and was abandoned"
+        );
+    }
 }
 
 async fn poll_batteries_once(service: BridgeService) {
+    let started = Instant::now();
+    let mut recorded = 0usize;
+    let mut failed = 0usize;
+    poll_devices(&service, &mut recorded, &mut failed).await;
+    tracing::info!(
+        recorded,
+        failed,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "Battery poll finished"
+    );
+}
+
+async fn poll_devices(service: &BridgeService, recorded: &mut usize, failed: &mut usize) {
+    let service = service.clone();
     let profiled = profile_devices(&service.inner.read().await.config);
     let discovered = tokio::task::spawn_blocking(drivers::detect_mice)
         .await
@@ -2055,6 +2093,8 @@ async fn poll_batteries_once(service: BridgeService) {
                 };
                 if let Err(error) = service.record_battery(reading).await {
                     tracing::warn!(%error, "Could not record the mouse battery");
+                } else {
+                    *recorded += 1;
                 }
             }
             Ok(Ok(None)) => {
@@ -2068,6 +2108,7 @@ async fn poll_batteries_once(service: BridgeService) {
                     .downcast_ref::<std::io::Error>()
                     .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock);
                 if !deferred {
+                    *failed += 1;
                     let through = read_through(&device_id, &discovered);
                     mark_unanswered(&service, &device_id, through.as_deref()).await;
                 }
