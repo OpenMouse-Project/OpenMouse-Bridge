@@ -2049,12 +2049,48 @@ async fn poll_batteries_once(service: BridgeService) {
     );
 }
 
+/// The blocking worker of a battery poll's discovery, and of its reads. A poll
+/// that times out is dropped, but its worker keeps running on the blocking
+/// pool; admitting another before it returns would add a thread per poll for
+/// as long as a native call stays stuck.
+static DISCOVERY_WORKER: AtomicBool = AtomicBool::new(false);
+static STATUS_WORKER: AtomicBool = AtomicBool::new(false);
+
+/// Clears its slot when the blocking worker exits, by return or by panic.
+struct WorkerSlot(&'static AtomicBool);
+
+impl Drop for WorkerSlot {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// `spawn_blocking(work)` unless the previous worker for `slot` is still
+/// running. The slot is released when the worker finishes, not when whoever
+/// awaited it gave up, so a stuck native call holds at most one thread.
+fn spawn_exclusive<T: Send + 'static>(
+    slot: &'static AtomicBool,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<tokio::task::JoinHandle<T>> {
+    if slot.swap(true, Ordering::AcqRel) {
+        return None;
+    }
+    let held = WorkerSlot(slot);
+    Some(tokio::task::spawn_blocking(move || {
+        let _held = held;
+        work()
+    }))
+}
+
 async fn poll_devices(service: &BridgeService, recorded: &mut usize, failed: &mut usize) {
     let service = service.clone();
     let profiled = profile_devices(&service.inner.read().await.config);
-    let discovered = tokio::task::spawn_blocking(drivers::detect_mice)
-        .await
-        .unwrap_or_default();
+    let Some(discovery) = spawn_exclusive(&DISCOVERY_WORKER, drivers::detect_mice) else {
+        tracing::warn!("A previous device discovery is still running; skipping this battery poll");
+        *failed += 1;
+        return;
+    };
+    let discovered = discovery.await.unwrap_or_default();
     let devices = merge_detected_mice(profiled, &discovered);
     {
         // Pruning the live readings is in-memory only, so it runs even while
@@ -2068,7 +2104,13 @@ async fn poll_devices(service: &BridgeService, recorded: &mut usize, failed: &mu
     }
     for (device_id, device_name) in devices {
         let id = device_id.clone();
-        let outcome = tokio::task::spawn_blocking(move || crate::drivers::read_status(&id)).await;
+        let Some(read) = spawn_exclusive(&STATUS_WORKER, move || crate::drivers::read_status(&id))
+        else {
+            tracing::warn!(%device_id, "A previous battery read is still running; skipping the rest of this poll");
+            *failed += 1;
+            break;
+        };
+        let outcome = read.await;
         match outcome {
             Ok(Ok(Some(status))) => {
                 // The web panel reports batteries as `<brand>:<model>` (the
@@ -2357,6 +2399,31 @@ mod tests {
         drop(session);
         assert_eq!(snapshot.native_automation_error, None);
         assert_eq!(snapshot.pending_native_restores, 0);
+    }
+
+    #[tokio::test]
+    async fn a_second_worker_is_refused_until_the_first_one_exits() {
+        static SLOT: AtomicBool = AtomicBool::new(false);
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let first = spawn_exclusive(&SLOT, move || {
+            let _ = hold.recv();
+            1
+        })
+        .expect("the slot starts free");
+        // Whoever awaited the first worker may give up; the worker still runs.
+        assert!(spawn_exclusive(&SLOT, || 2).is_none());
+        release.send(()).unwrap();
+        assert_eq!(first.await.unwrap(), 1);
+        assert!(!SLOT.load(Ordering::Acquire));
+        assert_eq!(spawn_exclusive(&SLOT, || 3).unwrap().await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_worker_still_frees_its_slot() {
+        static SLOT: AtomicBool = AtomicBool::new(false);
+        let worker = spawn_exclusive(&SLOT, || -> u8 { panic!("native call failed") }).unwrap();
+        assert!(worker.await.is_err());
+        assert!(!SLOT.load(Ordering::Acquire));
     }
 
     #[tokio::test]
