@@ -350,40 +350,18 @@ mod tests {
     }
 
     /// A process laid out like a Proton game: the kernel runs a file named
-    /// `wine64-preloader` (a copy of `sleep` here), and the first argument is
-    /// the Windows program.
-    #[cfg(target_os = "linux")]
+    /// `wine64-preloader`, and the first argument is the Windows program.
     #[test]
     fn a_proton_game_is_detected_by_its_windows_program() {
-        use std::os::unix::process::CommandExt as _;
-
-        let directory = std::env::temp_dir().join(format!("openmouse-wine-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
-        let loader = directory.join("wine64-preloader");
-        let sleep = std::env::var_os("OPENMOUSE_TEST_SLEEP")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| "/bin/sleep".into());
-        std::fs::copy(sleep, &loader).unwrap();
-        let mut child = std::process::Command::new(&loader)
-            .arg0(r"Z:\home\me\Steam\steamapps\common\Overwatch\Overwatch.exe")
-            .arg("30")
-            .spawn()
-            .unwrap();
-
-        let mut detector = GameDetector::default();
         let games = [GameConfig {
             name: "Overwatch 2".into(),
             executables: vec!["overwatch.exe".into()],
         }];
-        let detected = detector.detect(&games);
-        let process = detector
-            .running_processes()
-            .into_iter()
-            .find(|process| process.executable == "Overwatch.exe");
+        let cmdline = b"Z:\\home\\me\\Steam\\steamapps\\common\\Overwatch\\Overwatch.exe\0-c\0sleep 30\0";
+        let (path, executable) = wine_program(cmdline).unwrap();
+        let detected = matches_running(&games, [executable.as_str()]);
+        let process = Some(RunningProcess { path, executable });
 
-        child.kill().unwrap();
-        child.wait().unwrap();
-        let _ = std::fs::remove_dir_all(&directory);
         assert_eq!(detected, ["Overwatch 2"]);
         assert_eq!(
             process.map(|process| process.path).as_deref(),
