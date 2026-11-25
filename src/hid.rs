@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::CString,
     sync::{
-        Arc, Mutex, Once, OnceLock, PoisonError,
+        Arc, Mutex, Once, OnceLock, PoisonError, RwLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
@@ -1415,7 +1415,8 @@ fn inspect_candidate(
     let mut collections = Vec::new();
     let mut paths = Vec::with_capacity(unique_paths.len());
     for path in unique_paths {
-        let (mut path_collections, layout) = inspect_path(api, &path, infos, inspect_descriptors);
+        let (mut path_collections, layout, _) =
+            inspect_path(api, &path, infos, inspect_descriptors);
         collections.append(&mut path_collections);
         paths.push(CandidatePath { path, layout });
     }
@@ -1439,13 +1440,14 @@ fn inspect_candidate(
 /// The collections and report layout of one path, parsed from its report
 /// descriptor. When the descriptor is not read (`read_descriptor` false, as
 /// for Razer) or cannot be, each collection the platform enumerated for the
-/// path stands in with its usage page and usage only.
+/// path stands in with its usage page and usage only. The flag is whether the
+/// descriptor was actually parsed.
 fn inspect_path(
     api: &HidApi,
     path: &CString,
     infos: &[hidapi::DeviceInfo],
     read_descriptor: bool,
-) -> (Vec<CollectionInfo>, ReportLayout) {
+) -> (Vec<CollectionInfo>, ReportLayout, bool) {
     let parsed = read_descriptor
         .then(|| {
             api.open_path(path).ok().and_then(|device| {
@@ -1455,7 +1457,14 @@ fn inspect_path(
             })
         })
         .flatten();
-    parsed.unwrap_or_else(|| (enumerated_collections(infos, path), ReportLayout::default()))
+    match parsed {
+        Some((collections, layout)) => (collections, layout, true),
+        None => (
+            enumerated_collections(infos, path),
+            ReportLayout::default(),
+            false,
+        ),
+    }
 }
 
 fn enumerated_collections(infos: &[hidapi::DeviceInfo], path: &CString) -> Vec<CollectionInfo> {
@@ -1574,6 +1583,22 @@ fn report_bytes(bits: &HashMap<u8, usize>) -> std::collections::BTreeMap<u8, usi
 /// scan.
 static DESCRIBED: Mutex<Option<HashMap<Vec<u8>, DescribedDevice>>> = Mutex::new(None);
 
+/// Orders descriptor reads against the start of a control-panel session.
+/// `describe_devices` holds it shared from the moment it decides it may open
+/// a device until it has finished opening them; a new session takes it
+/// exclusively while it registers itself. So a session waits for in-flight
+/// descriptor reads, and a read that starts afterwards sees the session and
+/// stays off the hardware, instead of the two opening the same interfaces at
+/// once (which Windows answers with `Access is denied`).
+static SESSION_GATE: RwLock<()> = RwLock::new(());
+
+/// Forgets every cached description. A mouse that slept through a suspend
+/// comes back with new paths, and a description taken before it is not
+/// worth trusting.
+fn forget_described() {
+    *DESCRIBED.lock().unwrap_or_else(PoisonError::into_inner) = None;
+}
+
 /// Every device on the bus that one of `filters` matches, described for the
 /// native helper. Only matching collections' devices are opened, and only to
 /// read their report descriptors; security keys and Logitech receiver child
@@ -1583,6 +1608,7 @@ static DESCRIBED: Mutex<Option<HashMap<Vec<u8>, DescribedDevice>>> = Mutex::new(
 /// not been described yet is listed from enumeration alone (usage pages, no
 /// reports) and described properly once the session ends.
 pub(crate) fn describe_devices(filters: &[HidFilter]) -> Result<Vec<DescribedDevice>, String> {
+    let _gate = SESSION_GATE.read().unwrap_or_else(PoisonError::into_inner);
     let api = new_api().map_err(|error| error.to_string())?;
     let blocked = security_key_paths(&api);
     let mut wanted = HashSet::new();
@@ -1617,7 +1643,10 @@ pub(crate) fn describe_devices(filters: &[HidFilter]) -> Result<Vec<DescribedDev
             Some(device) => device.clone(),
             None => {
                 let device = describe_group(&api, &group, &infos, may_open);
-                if may_open {
+                // Only a description whose descriptors were really read is
+                // remembered; one that fell back to enumeration (a mouse that
+                // was asleep, a path that was busy) is retried on the next scan.
+                if device.complete {
                     cache.insert(group, device.clone());
                 }
                 device
@@ -1641,12 +1670,16 @@ fn describe_group(
     let mut seen = HashSet::new();
     let mut collections = Vec::new();
     let mut paths = Vec::new();
+    let mut complete = open;
     for info in infos {
         let path = info.path().to_owned();
         if !seen.insert(path.clone()) {
             continue;
         }
-        let (path_collections, layout) = inspect_path(api, &path, infos, read_descriptor);
+        let (path_collections, layout, parsed) = inspect_path(api, &path, infos, read_descriptor);
+        // A descriptor that was meant to be read and was not leaves the
+        // description incomplete, whatever the session state was.
+        complete &= parsed || !read_descriptor;
         collections.extend(path_collections.iter().cloned());
         paths.push(DescribedPath {
             path: path.to_string_lossy().into_owned(),
@@ -1672,7 +1705,7 @@ fn describe_group(
             .find_map(|info| info.serial_number().filter(|serial| !serial.is_empty()))
             .unwrap_or_default()
             .to_owned(),
-        complete: open,
+        complete,
     }
 }
 
@@ -1867,7 +1900,7 @@ static RESUME_WATCH: Once = Once::new();
 /// A thread that sleeps in short steps can only wake late if the whole machine
 /// was suspended, so a wall-clock jump well past the step means a resume. This
 /// works the same on every platform without a hidden window or suspend hook.
-fn start_resume_watch() {
+pub(crate) fn start_resume_watch() {
     RESUME_WATCH.call_once(|| {
         let spawned = thread::Builder::new()
             .name("openmouse-resume-watch".into())
@@ -1881,6 +1914,7 @@ fn start_resume_watch() {
                         .is_ok_and(|gap| gap >= RESUME_GAP_THRESHOLD)
                     {
                         tracing::info!("System resume detected; HID handles will be reopened");
+                        forget_described();
                         RESUME_GENERATION.fetch_add(1, Ordering::AcqRel);
                     }
                     last = now;
@@ -1890,6 +1924,12 @@ fn start_resume_watch() {
             tracing::warn!(%error, "could not start the resume watcher");
         }
     });
+}
+
+/// Counts the resumes seen so far, for background work that has no session
+/// of its own to carry the news.
+pub(crate) fn resume_generation() -> u64 {
+    RESUME_GENERATION.load(Ordering::Acquire)
 }
 
 /// Whether the control panel currently has a HID websocket open. Bridge treats
@@ -1903,7 +1943,13 @@ struct ActiveSessionGuard;
 
 impl ActiveSessionGuard {
     fn new() -> Self {
+        // `device_access` covers native reads and writes; the gate covers
+        // descriptor reads. Both are released once the count is final, which
+        // is all a later reader needs to see before it stays away. Holding
+        // either for the whole session would stall every native call that
+        // should simply report the panel as the owner.
         let _access = crate::drivers::device_access();
+        let _gate = SESSION_GATE.write().unwrap_or_else(PoisonError::into_inner);
         ACTIVE_SESSIONS.fetch_add(1, Ordering::AcqRel);
         Self
     }
@@ -2063,6 +2109,40 @@ impl DescribedDevice {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_new_session_waits_for_an_in_flight_descriptor_read() {
+        use std::sync::atomic::AtomicBool;
+        let _serial = crate::drivers::TEST_NATIVE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let read = super::SESSION_GATE.read().unwrap();
+        let started = std::sync::Arc::new(AtomicBool::new(false));
+        let registered = std::sync::Arc::new(AtomicBool::new(false));
+        let session = {
+            let (started, registered) = (started.clone(), registered.clone());
+            std::thread::spawn(move || {
+                started.store(true, super::Ordering::Release);
+                let guard = super::ActiveSessionGuard::new();
+                registered.store(true, super::Ordering::Release);
+                guard
+            })
+        };
+        while !started.load(super::Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        // The read is still in flight, so the session has not registered and
+        // a reader that checks now would still be allowed to open.
+        assert!(!registered.load(super::Ordering::Acquire));
+        assert!(!super::client_session_active());
+        drop(read);
+        let guard = session.join().unwrap();
+        assert!(registered.load(super::Ordering::Acquire));
+        assert!(super::client_session_active());
+        drop(guard);
+        assert!(!super::client_session_active());
+    }
+
     #[test]
     fn a_filter_matches_a_device_by_product_and_any_collection_usage() {
         use super::{DescribedDevice, HidFilter};
