@@ -150,20 +150,21 @@ fn discovered_brand(info: &hidapi::DeviceInfo) -> Option<&'static str> {
 /// Which devices are mice, and their brands, comes from the control panel's
 /// own driver registry (see `registry`). A device is opened only the first
 /// time it appears, to read its report descriptors, and only if it matches
-/// the registry's filters. When the registry cannot be reached (no Node.js),
-/// discovery falls back to Bridge's vendor-id table.
+/// the registry's filters. Devices the registry does not claim, and every
+/// device when it cannot be reached (no Node.js), come from Bridge's
+/// vendor-id table.
 pub fn detect_mice() -> Vec<DetectedMouse> {
     let Some(devices) = registry::devices() else {
         return detect_by_vendor();
     };
     let mut mice = mice_from_registry(devices);
-    // Pulsar has a Rust driver of its own, which reads models the registry
-    // may not list; those are still found by vendor id.
+    // Discovery is additive: a mouse the registry does not claim (or whose
+    // descriptors could not be read) is still listed by vendor id, so it
+    // never vanishes from Bridge. Its battery read just fails softly.
     for mouse in detect_by_vendor() {
-        if mouse.vendor_id == pulsar::VENDOR_ID
-            && !mice.iter().any(|known| {
-                known.vendor_id == mouse.vendor_id && known.product_id == mouse.product_id
-            })
+        if !mice
+            .iter()
+            .any(|known| known.vendor_id == mouse.vendor_id && known.product_id == mouse.product_id)
         {
             mice.push(mouse);
         }
