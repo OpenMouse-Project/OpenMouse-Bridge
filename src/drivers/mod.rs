@@ -150,25 +150,37 @@ fn discovered_brand(info: &hidapi::DeviceInfo) -> Option<&'static str> {
 /// Which devices are mice, and their brands, comes from the control panel's
 /// own driver registry (see `registry`). A device is opened only the first
 /// time it appears, to read its report descriptors, and only if it matches
-/// the registry's filters. When the registry cannot be reached (no Node.js),
-/// discovery falls back to Bridge's vendor-id table.
+/// the registry's filters. Devices the registry does not claim, and every
+/// device when it cannot be reached (no Node.js), come from Bridge's
+/// vendor-id table.
 pub fn detect_mice() -> Vec<DetectedMouse> {
     let Some(devices) = registry::devices() else {
         return detect_by_vendor();
     };
     let mut mice = mice_from_registry(devices);
-    // Pulsar has a Rust driver of its own, which reads models the registry
-    // may not list; those are still found by vendor id.
-    for mouse in detect_by_vendor() {
-        if mouse.vendor_id == pulsar::VENDOR_ID
-            && !mice.iter().any(|known| {
-                known.vendor_id == mouse.vendor_id && known.product_id == mouse.product_id
-            })
+    // Discovery is additive: a mouse the registry does not claim (or whose
+    // descriptors could not be read) is still listed by vendor id, so it
+    // never vanishes from Bridge. Its battery read just fails softly.
+    backfill(&mut mice, detect_by_vendor());
+    mice
+}
+
+/// Adds the vendor-found mice the registry did not list. The brand prefix of
+/// a device id can differ between the two sources, so a physical mouse is
+/// compared by the id tail (serial, else `vid:pid`): two mice of one model
+/// with different serials stay two.
+fn backfill(mice: &mut Vec<DetectedMouse>, found: Vec<DetectedMouse>) {
+    fn tail(id: &str) -> &str {
+        id.split_once(':').map_or(id, |(_, tail)| tail)
+    }
+    for mouse in found {
+        if !mice
+            .iter()
+            .any(|known| tail(&known.device_id) == tail(&mouse.device_id))
         {
             mice.push(mouse);
         }
     }
-    mice
 }
 
 fn mice_from_registry(devices: Vec<(crate::hid::DescribedDevice, String)>) -> Vec<DetectedMouse> {
@@ -493,6 +505,31 @@ mod tests {
     use super::*;
     use crate::config::{ProfileApplication, ProfileDevice, ProfileSettings};
     use crate::hid::DescribedDevice;
+
+    fn mouse(id: &str) -> DetectedMouse {
+        DetectedMouse {
+            device_id: id.into(),
+            name: "m".into(),
+            vendor_id: 1,
+            product_id: 2,
+        }
+    }
+
+    #[test]
+    fn backfill_adds_unclaimed_mice_but_not_ones_already_listed() {
+        let mut mice = vec![mouse("Razer:AAA")];
+        backfill(
+            &mut mice,
+            vec![
+                mouse("Razer:AAA"),
+                mouse("Razer:BBB"),
+                mouse("Acme:0001:0002"),
+            ],
+        );
+        let ids: Vec<_> = mice.iter().map(|m| m.device_id.as_str()).collect();
+        // Same model, different serial: kept. Same serial: not repeated.
+        assert_eq!(ids, ["Razer:AAA", "Razer:BBB", "Acme:0001:0002"]);
+    }
 
     #[test]
     fn registry_mice_keep_the_device_id_shape_and_merge_a_mouses_interfaces() {
